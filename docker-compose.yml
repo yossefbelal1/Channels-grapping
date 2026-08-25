@@ -1,0 +1,144 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: leadhunter_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-leadhunter_db}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-leadhunter_pass}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Automatically initializes the schema on first container startup
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:alpine
+    container_name: leadhunter_redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  worker_scavenger:
+    build: .
+    container_name: worker_scavenger
+    restart: unless-stopped
+    command: python scavenger.py
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - sessions_data:/app/sessions
+
+  worker_radar:
+    build: .
+    container_name: worker_radar
+    restart: unless-stopped
+    command: python radar.py
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - sessions_data:/app/sessions
+
+  worker_validator:
+    build: .
+    container_name: worker_validator
+    restart: unless-stopped
+    command: python validator.py
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - sessions_data:/app/sessions
+
+  worker_web_scraper:
+    build: .
+    container_name: worker_web_scraper
+    restart: unless-stopped
+    command: python web_scraper.py
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+
+  worker_graph_expander:
+    build: .
+    container_name: worker_graph_expander
+    restart: unless-stopped
+    command: python graph_expander.py
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - sessions_data:/app/sessions
+
+  worker_seed_intake:
+    build: .
+    container_name: worker_seed_intake
+    restart: unless-stopped
+    command: python seed_intake_worker.py
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+
+  dashboard:
+    build: .
+    container_name: leadhunter_dashboard
+    restart: unless-stopped
+    command: python dashboard.py
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+
+volumes:
+  pgdata:
+  redisdata:
+  sessions_data:

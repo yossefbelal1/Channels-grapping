@@ -1,0 +1,29 @@
+test_01_removed_ai_dependencies (scratch.test_runtime_logic.TestRuntimeLogic)
+Verify that requirements.txt and code files contain no generative AI imports or packages. ... ok
+test_02_graph_edge_creation (scratch.test_runtime_logic.TestRuntimeLogic)
+Verify that mentions, links, and advertisements are parsed to create graph edges. ... ok
+test_03_keyword_frequency_updates (scratch.test_runtime_logic.TestRuntimeLogic)
+Verify that KeywordFrequencyService counts tracked keywords and pushes to DB. ... ok
+test_04_marketplace_score_calculation (scratch.test_runtime_logic.TestRuntimeLogic)
+Verify score formula using unique promoters, scanned messages, links, mentions, and member count. ... ok
+test_05_group_metrics_records (scratch.test_runtime_logic.TestRuntimeLogic)
+Verify that database helper generates the correct SQL upsert query for group_metrics. ... ok
+test_06_group_scan_logic (scratch.test_runtime_logic.TestRuntimeLogic)
+Verify that a group scan resolves group entity, calculates marketplace score, ... ok
+test_07_early_graph_edge_population (scratch.test_runtime_logic.TestRuntimeLogic)
+Verify that early graph edge creation runs automatically during channel scan ... ok
+test_08_get_session_path_resolution (scratch.test_runtime_logic.TestRuntimeLogic)
+Verify that get_session_path prioritizes the sessions subdirectory. ... ok
+test_09_distributed_lock_ownership (scratch.test_runtime_logic.TestRuntimeLogic)
+Verify that Redis distributed locks enforce ownership validation. ... ok
+test_10_unauthorized_startup_failure (scratch.test_runtime_logic.TestRuntimeLogic)
+Verify that start_all detects unauthorized clients and raises RuntimeError. ... ok
+test_11_placeholder_validation (scratch.test_runtime_logic.TestRuntimeLogic)
+Verify that placeholder or empty credentials trigger ValueError. ... ok
+test_12_granular_arabic_boosts (scratch.test_runtime_logic.TestRuntimeLogic) ... ok
+test_13_discovery_sources_upsert (scratch.test_runtime_logic.TestRuntimeLogic) ... ok
+
+----------------------------------------------------------------------
+Ran 13 tests in 0.551s
+
+OK

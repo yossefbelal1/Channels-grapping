@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Telegram Sessions & Credentials (CRITICAL - NEVER COMMIT)
+sessions/
+*.session
+*.session-journal
+accounts.json
+accounts.json.bak
+
+# Secrets & Environment Variables
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pub
+id_rsa
+telegram-saas-key.pem
+
+# Database Dumps, Zips & Temp Files
+*.zip
+*.tar.gz
+*.sql.gz
+*.dump
+*.backup
+*.sql
+!schema.sql
+!init_facebook_db.sql
+!migrate_v3_graph_engine.sql
+db_backups/
+postgres_data/
+redis_data/
+
+# Junk single char files
+0
+=
+
+# IDE & OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs & scratch
+*.log
+logs/
+.system_generated/
+scratch/
