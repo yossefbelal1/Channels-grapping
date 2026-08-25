@@ -77,6 +77,24 @@ async def run_scavenger(tg_manager: TelegramManager, redis_conn: redis.Redis, se
     for keyword in prioritized_keywords:
         if shutdown_event.is_set():
             break
+
+        # Check queue backpressure
+        try:
+            high_len = redis_conn.llen("queue:high")
+            normal_len = redis_conn.llen("queue:normal")
+            while (high_len + normal_len) >= 1000 and not shutdown_event.is_set():
+                logging.warning(f"[SCAVENGER] 🛑 Backpressure Active: {high_len + normal_len} items queued. Pausing search for 30s...")
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    pass
+                high_len = redis_conn.llen("queue:high")
+                normal_len = redis_conn.llen("queue:normal")
+        except Exception:
+            pass
+
+        if shutdown_event.is_set():
+            break
             
         # Dynamically calculate delay based on session health score
         health = tg_manager.get_health_score(session_name)

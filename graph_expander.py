@@ -213,19 +213,54 @@ class GraphExpander:
 
     # ── Core expansion logic ───────────────────────────────────────────────────
 
+    def check_backpressure(self, max_queued_threshold: int = 800) -> bool:
+        """
+        Checks if downstream validation queues are saturated.
+        If saturated, pauses discovery production to prevent memory/queue bloat.
+        """
+        try:
+            high_len = self.redis_conn.llen("queue:high")
+            normal_len = self.redis_conn.llen("queue:normal")
+            total = high_len + normal_len
+            if total >= max_queued_threshold:
+                logging.warning(
+                    f"[GRAPH] 🛑 Queue Backpressure Active: {total} items queued ({high_len} high, {normal_len} normal). "
+                    f"Throttling discovery..."
+                )
+                return True
+        except Exception as e:
+            logging.error(f"[GRAPH] Backpressure check error: {e}")
+        return False
+
     async def fetch_posts(self, entity, limit: int = 400) -> list:
         """
-        Fetches up to `limit` recent posts from a channel or group.
-        Uses TelegramManager for rate-limit-safe execution.
+        Fetches recent posts from a channel or group incrementally.
+        Uses a message ID watermark to avoid re-downloading existing posts on every cycle.
         """
+        username = getattr(entity, 'username', str(getattr(entity, 'id', 'unknown'))).lower()
+        watermark_key = f"graph:watermark:{username}"
+        last_max_id = self.redis_conn.get(watermark_key)
+
+        min_id = int(last_max_id) if last_max_id and last_max_id.isdigit() else 0
+        fetch_limit = min(150, limit) if min_id > 0 else limit
+
         async def fetch(cl):
-            logging.info(f"Fetching up to {limit} posts from: {getattr(entity, 'username', entity.id)}")
-            return await cl.get_messages(entity, limit=limit)
+            if min_id > 0:
+                logging.info(f"[GRAPH] Incremental scan: fetching new posts since message ID {min_id} for @{username} (limit={fetch_limit})...")
+                return await cl.get_messages(entity, limit=fetch_limit, min_id=min_id)
+            else:
+                logging.info(f"[GRAPH] Full initial scan: fetching up to {limit} posts for @{username}...")
+                return await cl.get_messages(entity, limit=limit)
 
         try:
-            return await self.tg_manager.execute_request(
+            msgs = await self.tg_manager.execute_request(
                 self.session_name, fetch, shutdown_event=self.shutdown_event
             )
+            if msgs and len(msgs) > 0:
+                max_msg_id = max(getattr(m, 'id', 0) for m in msgs)
+                if max_msg_id > 0:
+                    self.redis_conn.set(watermark_key, max_msg_id, ex=86400 * 30)
+            return msgs or []
         except Exception as e:
             logging.error(f"Failed to fetch posts: {e}")
             return []
@@ -403,6 +438,16 @@ class GraphExpander:
         logging.info(f"[GRAPH] Starting expansion cycle: {len(rows)} entities to process.")
 
         for row in rows:
+            if self.shutdown_event.is_set():
+                break
+
+            # Backpressure throttle: wait if downstream queues are backed up
+            while self.check_backpressure(max_queued_threshold=800) and not self.shutdown_event.is_set():
+                try:
+                    await asyncio.wait_for(self.shutdown_event.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    pass
+
             if self.shutdown_event.is_set():
                 break
 

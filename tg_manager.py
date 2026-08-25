@@ -1,7 +1,22 @@
+"""
+tg_manager.py — Centralized Telegram Client & Request Manager
+
+Production-Hardened Features:
+- Distributed Session Locking with host:pid:uuid ownership & atomic Lua release
+- Automatic Lock Renewal Heartbeat
+- Atomic Sliding-Window Rate Limiter via Redis Lua
+- Granular FloodWait Classification (transient backoff vs cooldown vs quarantine)
+- Bounded Iterative Failover (zero recursive call stacks)
+- Full Backward-Compatibility for all existing callers
+"""
+
 import os
+import sys
 import json
 import random
 import time
+import uuid
+import socket
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -14,6 +29,53 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s'
 )
 
+# ── Centralized Rate Limits ───────────────────────────────────────────────────
+DEFAULT_MAX_REQUESTS_PER_HOUR = int(os.getenv("TELEGRAM_MAX_REQUESTS_PER_HOUR", "300"))
+LOCK_TTL_SECONDS = int(os.getenv("TELEGRAM_SESSION_LOCK_TTL", "60"))
+LOCK_HEARTBEAT_INTERVAL = int(os.getenv("TELEGRAM_LOCK_HEARTBEAT_INTERVAL", "15"))
+
+# ── Atomic Redis Lua Scripts ──────────────────────────────────────────────────
+# 1. Atomic Lock Release (Compare and Delete)
+LUA_RELEASE_LOCK = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+"""
+
+# 2. Atomic Lock Renewal (Compare and Expire)
+LUA_RENEW_LOCK = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("expire", KEYS[1], ARGV[2])
+else
+    return 0
+end
+"""
+
+# 3. Atomic Sliding-Window Rate Limiter
+LUA_RATE_LIMIT = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local max_limit = tonumber(ARGV[3])
+local clear_before = now - window
+
+-- Clean entries older than current sliding window
+redis.call('ZREMRANGEBYSCORE', key, '-inf', clear_before)
+
+local current_count = redis.call('ZCARD', key)
+if current_count < max_limit then
+    local seq = redis.call('INCR', key .. ':seq')
+    redis.call('ZADD', key, now, now .. ':' .. seq)
+    redis.call('EXPIRE', key, window + 60)
+    return 1
+else
+    return 0
+end
+"""
+
+
 def validate_telegram_credentials(session_name: str, api_id, api_hash: str):
     """
     Validates api_id and api_hash.
@@ -25,28 +87,28 @@ def validate_telegram_credentials(session_name: str, api_id, api_hash: str):
             f"CRITICAL CONFIG ERROR: Session '{session_name}' has missing api_id or api_hash. "
             f"Please check accounts.json or environment variables."
         )
-        
+
     api_id_str = str(api_id).strip()
     api_hash_str = str(api_hash).strip()
-    
+
     if not api_id_str or not api_hash_str:
         raise ValueError(
             f"CRITICAL CONFIG ERROR: Session '{session_name}' has empty api_id or api_hash."
         )
-        
+
     try:
         api_id_int = int(api_id_str)
     except ValueError:
         raise ValueError(
             f"CRITICAL CONFIG ERROR: Session '{session_name}' has non-integer api_id '{api_id_str}'."
         )
-        
+
     if api_id_int == 123456:
         raise ValueError(
             f"CRITICAL CONFIG ERROR: Session '{session_name}' is using placeholder api_id '123456'. "
             f"Please update accounts.json or .env with your actual Telegram API ID from https://my.telegram.org."
         )
-        
+
     placeholder_hashes = [
         "your_telegram_api_hash_here",
         "your_api_hash_here",
@@ -58,6 +120,7 @@ def validate_telegram_credentials(session_name: str, api_id, api_hash: str):
             f"Please update accounts.json or .env with your actual Telegram API Hash from https://my.telegram.org."
         )
 
+
 def get_session_path(session_name: str) -> str:
     """
     Resolves the writable session file path.
@@ -68,7 +131,7 @@ def get_session_path(session_name: str) -> str:
         return "default_session"
     if os.path.isabs(session_name) or '/' in session_name or '\\' in session_name:
         return session_name
-        
+
     sessions_dir = "sessions"
     try:
         os.makedirs(sessions_dir, exist_ok=True)
@@ -78,7 +141,6 @@ def get_session_path(session_name: str) -> str:
         os.remove(test_file)
         return os.path.join(sessions_dir, session_name)
     except (IOError, OSError):
-        # Fall back to root directory if 'sessions/' is not writable
         try:
             test_file = f".write_test_{session_name}"
             with open(test_file, 'w') as f:
@@ -96,26 +158,38 @@ def get_session_path(session_name: str) -> str:
                 os.makedirs(tmp_dir, exist_ok=True)
                 return os.path.join(tmp_dir, session_name)
 
+
 class TelegramManager:
     """
     Centralized Request Manager for multiple Telegram accounts.
-    Manages rate limits, dynamic health scoring, adaptive jitter, and automatic failovers.
+    Manages rate limits, dynamic health scoring, adaptive jitter, atomic distributed locks,
+    and automatic bounded failovers.
     """
+
     def __init__(self, redis_conn: redis.Redis, session_name: str = None, worker_type: str = None):
         self.redis_conn = redis_conn
         self.session_name = session_name
         self.worker_type = worker_type
         self.accounts = []
         self.clients = {}
-        # Store unique lock value to prevent active instances from deleting/extending newer locks
-        self.lock_value = f"pid_{os.getpid()}_rand_{random.randint(1000, 9999)}_time_{datetime.now(timezone.utc).isoformat()}"
+        
+        # Production-grade unique owner identifier (hostname:pid:uuid)
+        hostname = socket.gethostname() or "unknown_host"
+        self.owner_id = f"{hostname}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+        self.lock_value = self.owner_id  # Backward-compatible alias
+        
+        # Registered Lua scripts
+        self._lua_release = self.redis_conn.register_script(LUA_RELEASE_LOCK)
+        self._lua_renew = self.redis_conn.register_script(LUA_RENEW_LOCK)
+        self._lua_ratelimit = self.redis_conn.register_script(LUA_RATE_LIMIT)
+        
+        self.heartbeat_tasks = {}
         self.load_account()
 
     def load_account(self):
         """
         Loads the assigned session + any backup accounts of the same worker type from accounts.json.
         Backup accounts are identified by role field: backup_<session_type>.
-        This enables automatic rotation when the primary account is banned or rate-limited.
         """
         session_to_load = self.session_name
         if not session_to_load:
@@ -129,7 +203,6 @@ class TelegramManager:
         primary_account = None
         backup_accounts = []
 
-        # Determine worker type from session name if not explicitly passed (e.g. validator_session → validator)
         w_type = self.worker_type
         if not w_type:
             w_type = session_to_load.replace("_session", "")
@@ -154,7 +227,6 @@ class TelegramManager:
             self.accounts = [primary_account] + backup_accounts
             logging.info(f"Loaded primary session '{session_to_load}' + {len(backup_accounts)} backup account(s) for worker type '{w_type}'.")
         else:
-            # Fallback to .env
             api_id = os.getenv("API_ID")
             api_hash = os.getenv("API_HASH")
             if api_id and api_hash:
@@ -169,7 +241,6 @@ class TelegramManager:
             else:
                 logging.error(f"No Telegram account configuration found for session: {session_to_load}")
 
-        # Validate all loaded accounts
         for acc in self.accounts:
             validate_telegram_credentials(acc.get("session_name"), acc.get("api_id"), acc.get("api_hash"))
 
@@ -181,74 +252,90 @@ class TelegramManager:
             session_name = acc["session_name"]
             api_id = acc["api_id"]
             api_hash = acc["api_hash"]
-            
-            # Resolve safe writable path for the SQLite session file
+
             session_path = get_session_path(session_name)
             client = TelegramClient(session_path, api_id, api_hash)
             client.flood_sleep_threshold = 120
             self.clients[session_name] = client
-            
-            # Initialize health state in Redis if not exists
+
             if not self.redis_conn.exists(f"health:{session_name}:score"):
-                self.redis_conn.set(f"health:{session_name}:score", 100) # Start fully healthy (100)
+                self.redis_conn.set(f"health:{session_name}:score", 100)
                 self.redis_conn.set(f"health:{session_name}:joins_today", 0)
 
-    async def acquire_lock(self, session_name: str):
+    # ── Distributed Locking (P0 Hardened) ─────────────────────────────────────
+
+    async def acquire_lock(self, session_name: str, ttl: int = LOCK_TTL_SECONDS):
         """
-        Acquires a Redis-based distributed lock for the session to prevent concurrent access.
+        Acquires a distributed lock in Redis for the given session with ownership tracking.
+        Guarantees that no two workers can open the same SQLite session file concurrently.
         """
         lock_key = f"lock:session:{session_name}"
-        # Set lock with a 60 seconds expiry if not exists
-        success = self.redis_conn.set(lock_key, self.lock_value, ex=60, nx=True)
+        success = self.redis_conn.set(lock_key, self.owner_id, ex=ttl, nx=True)
         if not success:
             current_owner = self.redis_conn.get(lock_key)
-            raise RuntimeError(
-                f"SESSION CONCURRENCY LOCK ERROR: Telethon session '{session_name}' is already opened "
-                f"by another worker instance ({current_owner}). Access denied to prevent SQLite corruption."
-            )
-        logging.info(f"Successfully acquired session lock for '{session_name}'.")
-        self.heartbeat_task = asyncio.create_task(self.lock_heartbeat_loop(lock_key))
+            # If we already own the lock (e.g. re-entry), renew it and continue
+            if current_owner == self.owner_id:
+                self.redis_conn.expire(lock_key, ttl)
+            else:
+                raise RuntimeError(
+                    f"SESSION CONCURRENCY LOCK ERROR: Telethon session '{session_name}' is currently held "
+                    f"by another instance ({current_owner}). Access denied to protect SQLite session."
+                )
 
-    async def lock_heartbeat_loop(self, lock_key: str):
+        logging.info(f"🔒 Acquired distributed session lock for '{session_name}' (Owner: {self.owner_id}).")
+        
+        # Stop any existing heartbeat for this session before creating a new one
+        if session_name in self.heartbeat_tasks and not self.heartbeat_tasks[session_name].done():
+            self.heartbeat_tasks[session_name].cancel()
+            
+        self.heartbeat_tasks[session_name] = asyncio.create_task(
+            self._lock_heartbeat_loop(session_name, lock_key, ttl)
+        )
+
+    async def _lock_heartbeat_loop(self, session_name: str, lock_key: str, ttl: int):
         """
-        Periodically extends the session lock TTL while the worker is active, validating ownership.
+        Background heartbeat that periodically extends lock TTL using atomic Lua renewal.
         """
         while True:
             try:
-                await asyncio.sleep(20)
-                current_owner = self.redis_conn.get(lock_key)
-                if current_owner == self.lock_value:
-                    self.redis_conn.expire(lock_key, 60)
-                else:
-                    logging.warning(f"Lock heartbeat ownership mismatch. Found '{current_owner}', expected '{self.lock_value}'. Stopping heartbeat.")
+                await asyncio.sleep(LOCK_HEARTBEAT_INTERVAL)
+                res = self._lua_renew(keys=[lock_key], args=[self.owner_id, ttl])
+                if res != 1:
+                    logging.warning(f"⚠️ Session lock for '{session_name}' was lost or overtaken by another instance.")
                     break
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logging.error(f"Error in lock heartbeat loop: {e}")
-                await asyncio.sleep(5)
+                logging.error(f"Error in lock renewal heartbeat for '{session_name}': {e}")
+                await asyncio.sleep(3)
 
     def release_lock(self, session_name: str):
         """
-        Releases the session lock in Redis only if this instance owns it.
+        Releases the session lock atomically via Lua script ONLY if this instance is the owner.
         """
-        if hasattr(self, 'heartbeat_task') and self.heartbeat_task:
-            self.heartbeat_task.cancel()
+        if session_name in self.heartbeat_tasks:
+            self.heartbeat_tasks[session_name].cancel()
+            self.heartbeat_tasks.pop(session_name, None)
+
         lock_key = f"lock:session:{session_name}"
-        current_owner = self.redis_conn.get(lock_key)
-        if current_owner == self.lock_value:
-            self.redis_conn.delete(lock_key)
-            logging.info(f"Released session lock for '{session_name}'.")
-        else:
-            logging.warning(f"Did not release lock for '{session_name}' because owner is '{current_owner}' (we are '{self.lock_value}').")
+        try:
+            res = self._lua_release(keys=[lock_key], args=[self.owner_id])
+            if res == 1:
+                logging.info(f"🔓 Successfully released distributed lock for '{session_name}'.")
+            else:
+                logging.debug(f"Lock for '{session_name}' was not held by {self.owner_id} or already expired.")
+        except Exception as e:
+            logging.error(f"Error during atomic lock release for '{session_name}': {e}")
+
+    # ── Health & Cooldowns ────────────────────────────────────────────────────
 
     async def health_recovery_loop(self):
         """
-        Periodically recovers health scores of all sessions (adds +5 health every 10 minutes).
+        Periodically recovers health scores of all sessions (+5 health every 10 minutes).
         """
         while True:
             try:
-                await asyncio.sleep(600) # Sleep 10 minutes
+                await asyncio.sleep(600)
                 for acc in self.accounts:
                     session_name = acc["session_name"]
                     self.update_health_score(session_name, 5)
@@ -260,156 +347,129 @@ class TelegramManager:
 
     async def start_all(self):
         """
-        Connects and authenticates the primary client. Backups are connected dynamically on demand.
+        Connects and authenticates the primary client safely without removing locks of other workers.
         """
         await self.initialize_clients()
 
-        # ── Fresh-start cleanup: clear stale locks, rate limits & reset health for primary session only ──
         primary_session = self.session_name
-        lock_key = f"lock:session:{primary_session}"
-        if self.redis_conn.exists(lock_key):
-            self.redis_conn.delete(lock_key)
-            logging.info(f"🧹 Cleared stale session lock for primary session '{primary_session}' on fresh startup.")
-
-        stale_key = f"health:{primary_session}:rate_limited_until"
-        if self.redis_conn.exists(stale_key):
-            self.redis_conn.delete(stale_key)
-            logging.info(f"🧹 Cleared stale rate-limit key for primary session '{primary_session}' on fresh startup.")
         
-        # Reset health to 100 on fresh startup
+        # Reset health score for primary session on clean start
         self.redis_conn.set(f"health:{primary_session}:score", 100)
-        logging.info(f"Health score for primary session '{primary_session}' reset to 100 on startup.")
 
-        # Connect ONLY the primary session on startup
-        primary_session = self.session_name
         client = self.clients.get(primary_session)
         if not client:
             raise RuntimeError(f"Primary session '{primary_session}' client not initialized.")
 
         try:
             await self.acquire_lock(primary_session)
-            logging.info(f"Connecting Telethon client primary session: {primary_session}...")
+            logging.info(f"Connecting Telethon primary session: {primary_session}...")
             await client.connect()
             authorized = await client.is_user_authorized()
             if not authorized:
                 raise RuntimeError(
                     f"TELEGRAM AUTHENTICATION ERROR: Primary session '{primary_session}' is not authorized. "
-                    f"Please run the bootstrap login script ('python login.py') on the host to authenticate."
+                    f"Please run 'python login.py' to authenticate."
                 )
-            logging.info(f"Starting Telethon client primary session: {primary_session}...")
+            logging.info(f"Starting Telethon primary session: {primary_session}...")
             await client.start()
-            logging.info(f"Primary client {primary_session} started and authenticated successfully.")
+            logging.info(f"Primary client '{primary_session}' connected and authorized.")
         except Exception as e:
-            logging.error(f"Failed to start primary client {primary_session}: {e}")
+            logging.error(f"Failed to start primary client '{primary_session}': {e}")
             try:
                 if client.is_connected():
                     await client.disconnect()
-            except Exception as disc_err:
-                logging.warning(f"Error disconnecting primary client {primary_session} after failed startup: {disc_err}")
+            except Exception:
+                pass
             self.release_lock(primary_session)
             self.redis_conn.set(f"health:{primary_session}:score", 0)
-            raise e  # Fail worker startup
+            raise e
 
-        # Start health recovery background task background task
         asyncio.create_task(self.health_recovery_loop())
 
     async def disconnect_all(self):
         """
-        Gracefully disconnects all client sessions and releases locks.
+        Gracefully disconnects all client sessions and releases locks atomically.
         """
         for session_name, client in list(self.clients.items()):
-            if client.is_connected():
-                logging.info(f"Disconnecting client: {session_name}...")
-                await client.disconnect()
-            self.release_lock(session_name)
+            try:
+                if client.is_connected():
+                    logging.info(f"Disconnecting client: {session_name}...")
+                    await client.disconnect()
+            except Exception as e:
+                logging.warning(f"Error disconnecting client {session_name}: {e}")
+            finally:
+                self.release_lock(session_name)
         self.clients.clear()
 
     def get_health_score(self, session_name: str) -> int:
-        """
-        Retrieves health score from Redis, defaulting to 100.
-        """
+        """Retrieves health score from Redis, defaulting to 100."""
         score = self.redis_conn.get(f"health:{session_name}:score")
         if score is None:
             return 100
-        return int(score)
+        try:
+            return int(score)
+        except ValueError:
+            return 100
 
     def update_health_score(self, session_name: str, delta: int):
-        """
-        Modifies account health score (capped between 0 and 100).
-        """
+        """Modifies account health score (capped between 0 and 100)."""
         current = self.get_health_score(session_name)
         new_score = min(100, max(0, current + delta))
         self.redis_conn.set(f"health:{session_name}:score", new_score)
-        logging.info(f"Account {session_name} health score updated: {current} -> {new_score}")
 
     async def sleep_adaptive_jitter(self, session_name: str, shutdown_event: asyncio.Event):
-        """
-        Calculates and sleeps an adaptive jitter delay based on account health.
-        """
+        """Calculates and sleeps an adaptive jitter delay based on account health."""
         health = self.get_health_score(session_name)
-        
-        # Decide delay ranges based on health tiers
         if health >= 80:
-            jitter = random.randint(4, 8) # Normal delay (sustainable rate to prevent FloodWait)
+            jitter = random.randint(4, 8)
         elif health >= 50:
-            jitter = random.randint(5, 10) # Reduced load
-            logging.warning(f"Account {session_name} is under load (Health: {health}). Extending jitter to {jitter}s...")
+            jitter = random.randint(5, 10)
         elif health >= 30:
-            jitter = random.randint(10, 25) # Cooldown mode
-            logging.warning(f"Account {session_name} is in cooldown mode (Health: {health}). Extending jitter to {jitter}s...")
+            jitter = random.randint(10, 25)
         else:
-            jitter = random.randint(25, 60) # High restrictions
-            logging.warning(f"Account {session_name} is critically restricted (Health: {health}). Extending jitter to {jitter}s...")
-            
+            jitter = random.randint(25, 60)
+
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=jitter)
         except asyncio.TimeoutError:
             pass
 
-    def check_request_limit(self, session_name: str) -> bool:
+    # ── Atomic Rate Limiter (P0 Hardened) ─────────────────────────────────────
+
+    def check_request_limit(self, session_name: str, max_requests: int = DEFAULT_MAX_REQUESTS_PER_HOUR, window: int = 3600) -> bool:
         """
-        Enforces a hard limit of max 800 requests per hour per account in Redis.
+        Enforces rate limiting using an atomic Redis sliding-window log.
+        Eliminates race conditions between multiple async tasks or containers.
         """
-        key = f"limit:{session_name}:requests_hour"
-        count = self.redis_conn.get(key)
-        
-        if count is not None and int(count) >= 300:
-            return False
-            
-        # Increment request counter and set expiry if new
-        pipe = self.redis_conn.pipeline()
-        pipe.incr(key)
-        if count is None:
-            pipe.expire(key, 3600) # Expires in 1 hour
-        pipe.execute()
-        return True
+        key = f"limit:{session_name}:requests_sliding"
+        now = time.time()
+        try:
+            allowed = self._lua_ratelimit(keys=[key], args=[now, window, max_requests])
+            return bool(allowed == 1)
+        except Exception as e:
+            logging.error(f"Rate limiter Lua error for '{session_name}': {e}. Falling back to conservative allow.")
+            return True
 
     def get_healthiest_session(self, preferred_session: str = None) -> str:
-        """
-        Finds the healthiest available session name. Falls back from preferred if unhealthy or rate-limited.
-        """
-        # Helper to check if a session is currently rate limited
-        def is_session_rate_limited(name: str) -> bool:
+        """Finds the healthiest available session name not currently rate-limited."""
+        def is_rate_limited(name: str) -> bool:
             until_ts = self.redis_conn.get(f"health:{name}:rate_limited_until")
             if until_ts:
                 try:
-                    if time.time() < float(until_ts):
-                        return True
+                    return time.time() < float(until_ts)
                 except ValueError:
                     pass
             return False
 
-        # If preferred is healthy (>=30) and not rate-limited, use it
         if preferred_session and preferred_session in self.clients:
-            if self.get_health_score(preferred_session) >= 30 and not is_session_rate_limited(preferred_session):
+            if self.get_health_score(preferred_session) >= 30 and not is_rate_limited(preferred_session):
                 return preferred_session
 
-        # Find healthiest across all clients that are not rate-limited
         best_session = None
         best_score = -1
 
         for name in self.clients.keys():
-            if is_session_rate_limited(name):
+            if is_rate_limited(name):
                 continue
             score = self.get_health_score(name)
             if score > best_score:
@@ -419,198 +479,182 @@ class TelegramManager:
         if best_session and best_score >= 30:
             return best_session
 
-        # If all are rate-limited/disabled, fallback to preferred if available
         if preferred_session and preferred_session in self.clients:
             return preferred_session
         return best_session or (list(self.clients.keys())[0] if self.clients else None)
 
     def mark_account_banned(self, session_name: str):
-        """
-        Marks an account as permanently banned in Redis.
-        Sets health to 0 and records ban timestamp.
-        """
+        """Marks an account as permanently banned in Redis."""
         self.redis_conn.set(f"health:{session_name}:score", 0)
-        self.redis_conn.set(f"health:{session_name}:banned", "1", ex=86400 * 30)  # 30 days
-        logging.critical(f"🚨 ACCOUNT BANNED: Session '{session_name}' marked as permanently banned. Will rotate to backup.")
+        self.redis_conn.set(f"health:{session_name}:banned", "1", ex=86400 * 30)
+        logging.critical(f"🚨 ACCOUNT BANNED: Session '{session_name}' marked as permanently banned. Rotating to backup.")
 
     def is_account_banned(self, session_name: str) -> bool:
         """Returns True if this account is marked as banned in Redis."""
         return self.redis_conn.get(f"health:{session_name}:banned") == "1"
 
+    # ── Bounded Iterative Request Execution (P0 Hardened) ─────────────────────
+
     async def execute_request(self, preferred_session: str, request_func, *args, **kwargs):
         """
-        Orchestrates an API call: performs account failover, checks rate limits,
-        applies adaptive jitter, handles rate limit backoffs, retries, and
-        auto-rotates to backup accounts on permanent bans.
+        Executes a Telegram API call using a bounded iterative retry/failover loop.
+        Zero recursion, robust distributed locking, atomic rate limiting, and granular FloodWait handling.
         """
         shutdown_event = kwargs.pop('shutdown_event', asyncio.Event())
-        attempted = kwargs.get('_attempted_sessions', set())
+        
+        # Clean internal kwargs
+        target_kwargs = {k: v for k, v in kwargs.items() if not k.startswith('_') and k != 'shutdown_event'}
 
-        # Select healthiest session that has not been attempted yet in this request
-        session_name = None
-        best_score = -1
-        for name in list(self.clients.keys()):
-            if name in attempted:
-                continue
-            # Check Redis rate limit cache
-            until_ts = self.redis_conn.get(f"health:{name}:rate_limited_until")
-            is_limited = False
-            if until_ts:
-                try:
-                    if time.time() < float(until_ts):
-                        is_limited = True
-                except ValueError:
-                    pass
-            if is_limited:
-                continue
-            
-            # Check Redis concurrency lock
-            lock_key = f"lock:session:{name}"
-            if self.redis_conn.exists(lock_key) and not self.clients[name].is_connected():
-                continue
-            
-            score = self.get_health_score(name)
-            if score > best_score:
-                best_score = score
-                session_name = name
+        attempted_sessions = set()
+        total_candidates = list(self.clients.keys())
+        if preferred_session and preferred_session not in total_candidates:
+            total_candidates.insert(0, preferred_session)
+        max_session_attempts = max(1, len(total_candidates))
 
-        # Fallback to preferred or any session if all are attempted/limited
-        if not session_name:
-            session_name = preferred_session if preferred_session not in attempted else None
-            if not session_name:
-                for name in list(self.clients.keys()):
-                    if name not in attempted:
-                        session_name = name
-                        break
-            if not session_name:
-                raise RuntimeError("No configured Telegram clients are available or all connection attempts failed.")
+        last_exception = None
 
-        client = self.clients.get(session_name)
-        if not client:
-            raise RuntimeError(f"No client found for session '{session_name}'.")
-
-        # Track that we are attempting this session
-        attempted.add(session_name)
-        kwargs['_attempted_sessions'] = attempted
-        kwargs['shutdown_event'] = shutdown_event
-
-        # ── DYNAMIC CONNECTION FOR BACKUPS ──
-        if not client.is_connected():
-            logging.info(f"⚡ Connecting dynamically to backup session: '{session_name}'...")
-            try:
-                await self.acquire_lock(session_name)
-                await client.connect()
-                authorized = await client.is_user_authorized()
-                if not authorized:
-                    raise RuntimeError(f"Backup session '{session_name}' is not authorized.")
-                await client.start()
-                logging.info(f"⚡ Backup client '{session_name}' started and authenticated successfully.")
-            except Exception as conn_err:
-                logging.error(f"Failed to connect dynamically to backup session '{session_name}': {conn_err}")
-                try:
-                    if client.is_connected():
-                        await client.disconnect()
-                except Exception:
-                    pass
-                self.release_lock(session_name)
-                # Temporarily disable this session in Redis by setting health score to 0
-                # only if the connection error is NOT a concurrency lock error
-                if "lock" not in str(conn_err).lower():
-                    self.redis_conn.set(f"health:{session_name}:score", 0)
-                # Failover: recursively find another healthy session
-                return await self.execute_request(preferred_session, request_func, *args, **kwargs)
-
-        if session_name != preferred_session:
-            logging.info(f"⚡ Auto-routing from '{preferred_session}' → '{session_name}' (health-based failover).")
-
-        retries = 0
-        max_retries = 3
-
-        while retries < max_retries and not shutdown_event.is_set():
-            # Check if this session is currently cached as rate-limited in Redis
-            until_ts = self.redis_conn.get(f"health:{session_name}:rate_limited_until")
-            if until_ts:
-                try:
-                    diff = float(until_ts) - time.time()
-                    if diff > 0:
-                        logging.warning(f"Session {session_name} is in cache rate-limit for another {diff:.1f}s. Rotating...")
-                        # Recursively find another healthy session
-                        return await self.execute_request(preferred_session, request_func, *args, **kwargs)
-                except ValueError:
-                    pass
-
-            # Check Redis request hourly limits
-            if not self.check_request_limit(session_name):
-                logging.warning(f"Hourly request limit reached for {session_name}. Caching limit and rotating...")
-                # Cache rate-limit expiration for 60 seconds in Redis to prevent picking it again immediately
-                self.redis_conn.set(f"health:{session_name}:rate_limited_until", time.time() + 60, ex=60)
-                # Recursively failover to another healthy session
-                return await self.execute_request(preferred_session, request_func, *args, **kwargs)
-
-            # Apply adaptive jitter sleep
-            await self.sleep_adaptive_jitter(session_name, shutdown_event)
+        for attempt_idx in range(max_session_attempts):
             if shutdown_event.is_set():
                 return None
 
-            try:
-                logging.info(f"Executing request using session '{session_name}'...")
-                # Filter out internal kwargs so they don't pollute the client request call
-                target_kwargs = kwargs.copy()
-                target_kwargs.pop('_attempted_sessions', None)
-                target_kwargs.pop('shutdown_event', None)
-                res = await request_func(client, *args, **target_kwargs)
-                self.update_health_score(session_name, 1)
-                return res
+            # 1. Select healthiest available candidate
+            session_name = None
+            best_score = -1
 
-            except errors.FloodWaitError as e:
-                self.update_health_score(session_name, -20)
-                if e.seconds > 300:
-                    logging.warning(f"Severe FloodWaitError ({e.seconds}s) on session {session_name} for a specific request. Caching limit in Redis and raising immediately.")
-                    # Cache rate-limit expiration timestamp in Redis
-                    self.redis_conn.set(f"health:{session_name}:rate_limited_until", time.time() + e.seconds, ex=e.seconds)
-                    raise e
-                
-                wait_time = e.seconds + 10
-                logging.warning(f"FloodWaitError: Session {session_name} rate limited for {e.seconds}s. Sleeping {wait_time}s...")
+            for name in total_candidates:
+                if name in attempted_sessions:
+                    continue
+                if self.is_account_banned(name):
+                    continue
+
+                # Check Redis cooldown
+                until_ts = self.redis_conn.get(f"health:{name}:rate_limited_until")
+                if until_ts:
+                    try:
+                        if time.time() < float(until_ts):
+                            continue
+                    except ValueError:
+                        pass
+
+                score = self.get_health_score(name)
+                if score > best_score:
+                    best_score = score
+                    session_name = name
+
+            # Fallback to preferred or next unattempted session
+            if not session_name:
+                for name in total_candidates:
+                    if name not in attempted_sessions and not self.is_account_banned(name):
+                        session_name = name
+                        break
+
+            if not session_name:
+                break  # All candidates exhausted
+
+            attempted_sessions.add(session_name)
+            client = self.clients.get(session_name)
+            if not client:
+                continue
+
+            # 2. Dynamic connection for backup sessions
+            if not client.is_connected():
+                logging.info(f"⚡ Connecting dynamically to session '{session_name}'...")
                 try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=wait_time)
-                except asyncio.TimeoutError:
-                    pass
-                retries += 1
+                    await self.acquire_lock(session_name)
+                    await client.connect()
+                    if not await client.is_user_authorized():
+                        raise RuntimeError(f"Session '{session_name}' is not authorized.")
+                    await client.start()
+                    logging.info(f"⚡ Session '{session_name}' connected and authenticated.")
+                except Exception as conn_err:
+                    logging.error(f"Failed to connect to session '{session_name}': {conn_err}")
+                    try:
+                        if client.is_connected():
+                            await client.disconnect()
+                    except Exception:
+                        pass
+                    self.release_lock(session_name)
+                    if "lock" not in str(conn_err).lower():
+                        self.update_health_score(session_name, -50)
+                    last_exception = conn_err
+                    continue  # Try next session in loop
 
-            except (errors.UserDeactivatedBanError, errors.AuthKeyUnregisteredError,
-                    errors.AuthKeyInvalidError, errors.SessionRevokedError) as e:
-                # ── PERMANENT BAN / AUTH REVOKE ─────────────────────────────────
-                self.mark_account_banned(session_name)
-                logging.critical(f"🚨 Session '{session_name}' is permanently banned/revoked: {e}")
-                # Try to find a healthy backup immediately by recursively calling execute_request
-                return await self.execute_request(preferred_session, request_func, *args, **kwargs)
+            # 3. Inner bounded retry loop for transient issues
+            retries = 0
+            max_inner_retries = 3
+            session_success = False
 
-            except errors.RPCError as e:
-                # Rpc call failure
-                logging.warning(f"RPC call failed on session {session_name}: {e}")
-                raise e
+            while retries < max_inner_retries and not shutdown_event.is_set():
+                # Check atomic rate limit
+                if not self.check_request_limit(session_name):
+                    logging.warning(f"Hourly rate limit reached for '{session_name}'. Cooling down and rotating...")
+                    self.redis_conn.set(f"health:{session_name}:rate_limited_until", time.time() + 60, ex=60)
+                    break  # Rotate to next session
 
-            except (ValueError, TypeError) as e:
-                # Username does not exist, type cast error, or format is invalid
-                logging.warning(f"Entity not found, invalid type, or invalid format on session {session_name}: {e}")
-                raise e
+                await self.sleep_adaptive_jitter(session_name, shutdown_event)
+                if shutdown_event.is_set():
+                    return None
 
-            except Exception as e:
-                # Catch public request-to-join error and treat as successful request
-                if "successfully requested to join" in str(e) or "InviteRequestSent" in type(e).__name__:
-                    logging.info(f"Stealth join request sent successfully (pending approval) on session {session_name}.")
+                try:
+                    res = await request_func(client, *args, **target_kwargs)
                     self.update_health_score(session_name, 1)
-                    return True
+                    return res
 
-                logging.error(f"Telegram API exception on session {session_name}: {e}")
-                self.update_health_score(session_name, -5)
-                backoff = 2 ** retries * 5
-                logging.info(f"Backing off for {backoff} seconds before retry...")
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=backoff)
-                except asyncio.TimeoutError:
-                    pass
-                retries += 1
+                except errors.FloodWaitError as e:
+                    if e.seconds <= 60:
+                        logging.warning(f"Transient FloodWait ({e.seconds}s) on '{session_name}'. Sleeping...")
+                        self.update_health_score(session_name, -5)
+                        try:
+                            await asyncio.wait_for(shutdown_event.wait(), timeout=e.seconds + 2)
+                        except asyncio.TimeoutError:
+                            pass
+                        retries += 1
+                    elif e.seconds <= 300:
+                        logging.warning(f"Moderate FloodWait ({e.seconds}s) on '{session_name}'. Setting cooldown and rotating...")
+                        self.update_health_score(session_name, -15)
+                        self.redis_conn.set(f"health:{session_name}:rate_limited_until", time.time() + e.seconds, ex=e.seconds + 60)
+                        last_exception = e
+                        break  # Rotate to next session
+                    else:
+                        logging.warning(f"Severe FloodWait ({e.seconds}s) on '{session_name}'. Setting quarantine cooldown...")
+                        self.update_health_score(session_name, -30)
+                        self.redis_conn.set(f"health:{session_name}:rate_limited_until", time.time() + e.seconds, ex=e.seconds + 3600)
+                        last_exception = e
+                        break  # Rotate to next session
 
-        raise RuntimeError(f"Request failed after {max_retries} attempts on session {session_name}.")
+                except (errors.UserDeactivatedBanError, errors.AuthKeyUnregisteredError,
+                        errors.AuthKeyInvalidError, errors.SessionRevokedError) as e:
+                    self.mark_account_banned(session_name)
+                    logging.critical(f"🚨 Session '{session_name}' permanently banned/revoked: {e}")
+                    last_exception = e
+                    break  # Rotate to next session
+
+                except errors.RPCError as e:
+                    logging.warning(f"RPC call failed on session '{session_name}': {e}")
+                    last_exception = e
+                    raise e
+
+                except (ValueError, TypeError) as e:
+                    logging.warning(f"Entity not found / invalid argument on '{session_name}': {e}")
+                    last_exception = e
+                    raise e
+
+                except Exception as e:
+                    if "successfully requested to join" in str(e) or "InviteRequestSent" in type(e).__name__:
+                        logging.info(f"Stealth join request sent successfully (pending approval) on '{session_name}'.")
+                        self.update_health_score(session_name, 1)
+                        return True
+
+                    logging.error(f"Telegram API exception on session '{session_name}': {e}")
+                    self.update_health_score(session_name, -5)
+                    backoff = min(30, (2 ** retries) * 3)
+                    try:
+                        await asyncio.wait_for(shutdown_event.wait(), timeout=backoff)
+                    except asyncio.TimeoutError:
+                        pass
+                    retries += 1
+                    last_exception = e
+
+        if last_exception:
+            raise last_exception
+        raise RuntimeError("No Telegram clients available or all candidate sessions failed.")

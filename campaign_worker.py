@@ -1,3 +1,13 @@
+"""
+campaign_worker.py — Outreach Campaign Dispatcher Worker
+
+Production-Hardened Features:
+- Concurrency-safe claiming via SELECT ... FOR UPDATE SKIP LOCKED
+- Explicit status transition (pending -> processing -> sent/failed)
+- Distributed delivery idempotency token via Redis (campaign:delivered:{campaign_id}:{lead_id})
+- Centralized rate limiting via TelegramManager
+"""
+
 import os
 import sys
 import json
@@ -19,7 +29,7 @@ from tg_manager import TelegramManager
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
+    format='%(asctime)s [CAMPAIGN] [%(levelname)s] %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout)
     ]
@@ -34,6 +44,7 @@ DB_NAME = os.getenv("DB_NAME", "leadhunter_db")
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
+
 def get_db_connection():
     return psycopg2.connect(
         host=DB_HOST,
@@ -44,20 +55,40 @@ def get_db_connection():
         cursor_factory=RealDictCursor
     )
 
+
 async def send_telegram_message(client, peer, text, media_path=None):
     """
     Sub-dispatch function executed via tg_manager.execute_request
+    Supports single media or multi-image album.
     """
-    if media_path and os.path.exists(media_path):
-        logging.info(f"Sending message with media: {media_path}")
-        await client.send_message(peer, text, file=media_path)
-    else:
-        await client.send_message(peer, text)
+    if media_path:
+        media_files = []
+        if media_path.startswith('[') and media_path.endswith(']'):
+            try:
+                media_files = [f for f in json.loads(media_path) if os.path.exists(f)]
+            except Exception:
+                pass
+        elif ',' in media_path:
+            media_files = [f.strip() for f in media_path.split(',') if f.strip() and os.path.exists(f.strip())]
+        elif os.path.exists(media_path):
+            media_files = [media_path]
+
+        if media_files:
+            if len(media_files) == 1:
+                logging.info(f"Sending message with single media: {media_files[0]}")
+                await client.send_message(peer, text, file=media_files[0])
+            else:
+                logging.info(f"Sending message with album of {len(media_files)} images...")
+                await client.send_file(peer, media_files, caption=text)
+            return True
+
+    await client.send_message(peer, text)
     return True
+
 
 async def main():
     logging.info("Starting Outreach Campaign Dispatcher Worker...")
-    
+
     # Connect to Redis
     redis_host = os.getenv("REDIS_HOST", "localhost")
     redis_port = int(os.getenv("REDIS_PORT", 6379))
@@ -73,7 +104,7 @@ async def main():
         logging.error(f"Failed to connect to Redis: {e}")
         sys.exit(1)
 
-    # Retrieve preferred campaign session (default to primary)
+    # Retrieve preferred campaign session
     preferred_session = None
     try:
         with open("accounts.json", "r") as f:
@@ -88,7 +119,7 @@ async def main():
     if not preferred_session:
         preferred_session = os.getenv("SESSION_NAME", "user_session")
 
-    # Initialize Telegram Manager using the authorized session name
+    # Initialize Telegram Manager
     tg_manager = TelegramManager(redis_conn, session_name=preferred_session, worker_type="campaign")
     await tg_manager.start_all()
 
@@ -114,7 +145,7 @@ async def main():
             conn = get_db_connection()
             cur = conn.cursor()
 
-            # Poll for a pending message attempt
+            # ── 1. Atomic Row Claiming with FOR UPDATE SKIP LOCKED ─────────────
             cur.execute("""
                 SELECT cl.id as log_id, cl.campaign_id, cl.lead_id, c.message_text, c.media_path,
                        l.contact_username, l.channel_username, l.is_group
@@ -122,29 +153,44 @@ async def main():
                 JOIN campaigns c ON cl.campaign_id = c.id
                 JOIN leads l ON cl.lead_id = l.id
                 WHERE cl.status = 'pending'
-                ORDER BY c.created_at ASC, cl.sent_at ASC
+                ORDER BY c.created_at ASC, cl.sent_at ASC NULLS FIRST
                 LIMIT 1
+                FOR UPDATE OF cl SKIP LOCKED
             """)
             pending_item = cur.fetchone()
 
             if not pending_item:
-                # No pending campaign dispatches; sleep briefly before polling again
                 cur.close()
                 conn.close()
                 await asyncio.sleep(10)
                 continue
 
             log_id = pending_item['log_id']
+            campaign_id = pending_item['campaign_id']
             lead_id = pending_item['lead_id']
             message_text = pending_item['message_text']
             media_path = pending_item['media_path']
             contact_username = pending_item['contact_username']
             channel_username = pending_item['channel_username']
 
-            # Resolve addressable peer username: strictly require contact_username for DMs
+            # Mark state as processing in database immediately
+            cur.execute("UPDATE campaign_logs SET status = 'processing' WHERE id = %s", (log_id,))
+            conn.commit()
+
+            # ── 2. Idempotency Check ──────────────────────────────────────────
+            idempotency_key = f"campaign:delivered:{campaign_id}:{lead_id}"
+            if redis_conn.exists(idempotency_key):
+                logging.info(f"Idempotency hit: message for lead {lead_id} in campaign {campaign_id} already delivered. Marking sent.")
+                cur.execute("UPDATE campaign_logs SET status = 'sent', sent_at = %s WHERE id = %s", (datetime.now(), log_id))
+                conn.commit()
+                cur.close()
+                conn.close()
+                continue
+
+            # ── 3. Validate Contact Username ──────────────────────────────────
             target_username = contact_username
             if not target_username:
-                logging.warning(f"No direct contact username found for lead ID: {lead_id}. Skipping channel board @{channel_username}.")
+                logging.warning(f"No direct contact username found for lead ID: {lead_id}. Skipping channel @{channel_username}.")
                 cur.execute(
                     "UPDATE campaign_logs SET status = 'failed', error_message = %s, sent_at = %s WHERE id = %s",
                     ("No owner or admin contact username resolved for this channel", datetime.now(), log_id)
@@ -160,8 +206,6 @@ async def main():
             error_message = None
 
             try:
-                # Execute dispatch safely via tg_manager's rotation and rate-limit controls
-                # 1. First obtain target input entity
                 async def resolve_and_send(client):
                     peer = await client.get_input_entity(target_username)
                     return await send_telegram_message(client, peer, message_text, media_path)
@@ -181,6 +225,8 @@ async def main():
 
             if success:
                 logging.info(f"Successfully sent message to @{target_username}!")
+                # Record idempotency token for 30 days
+                redis_conn.set(idempotency_key, "1", ex=86400 * 30)
                 cur.execute(
                     "UPDATE campaign_logs SET status = 'sent', sent_at = %s WHERE id = %s",
                     (datetime.now(), log_id)
@@ -200,21 +246,21 @@ async def main():
             cur.close()
             conn.close()
 
-            # Enforce strict anti-ban sleep jitter (45 to 90 seconds)
+            # Enforce human jitter break
             jitter_sleep = random.randint(45, 90)
-            logging.info(f"Jitter sleep initiated. Resting for {jitter_sleep} seconds to mimic human interaction...")
+            logging.info(f"Resting for {jitter_sleep}s to mimic human interaction...")
             await asyncio.wait_for(shutdown_event.wait(), timeout=jitter_sleep)
 
         except asyncio.TimeoutError:
             pass
         except Exception as loop_err:
-            logging.error(f"Error in Campaign worker main loop: {loop_err}")
+            logging.error(f"Error in Campaign worker loop: {loop_err}")
             await asyncio.sleep(10)
 
-    # Disconnect active Telegram session
     await tg_manager.disconnect_all()
     redis_conn.close()
     logging.info("Campaign worker has stopped.")
+
 
 if __name__ == "__main__":
     try:

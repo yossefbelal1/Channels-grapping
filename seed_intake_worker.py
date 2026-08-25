@@ -151,9 +151,9 @@ class SeedIntakeWorker:
     def process_seeds(self, seeds: list) -> tuple:
         """
         Processes a batch of seeds:
-          - Marks each as processed (prevents duplicate processing on restart)
           - Deduplicates against Redis seen_channels set
           - Pushes new seeds to appropriate priority queue
+          - Marks each as processed in PostgreSQL ONLY after successful Redis queueing
           - Returns (queued_count, skipped_count)
         """
         queued = 0
@@ -172,17 +172,12 @@ class SeedIntakeWorker:
             # Normalize to standard link format
             normalized_link = f"https://t.me/{username}"
 
-            # Mark processed FIRST (atomic — prevents double-processing on restart)
-            self.mark_seed_processed(seed_id)
-
             # Check Redis deduplication
             if self.is_already_queued(normalized_link):
-                logging.info(f"[SEED] Already known: @{username} (source={source}). Skipping.")
+                logging.info(f"[SEED] Already known: @{username} (source={source}). Marking processed & skipping.")
+                self.mark_seed_processed(seed_id)
                 skipped += 1
                 continue
-
-            # Register in seen_channels to prevent other workers from re-queueing
-            self.redis_conn.sadd("seen_channels", normalized_link)
 
             # Determine priority queue based on source
             if source.lower() in self.HIGH_PRIORITY_SOURCES:
@@ -199,15 +194,20 @@ class SeedIntakeWorker:
                 "notes": notes
             })
 
-            # Push to validation queue
-            self.redis_conn.rpush(queue_target, payload)
-            queued += 1
-            logging.info(
-                f"[SEED] Queued @{username} → {queue_target} "
-                f"(source={source}, id={seed_id[:8]}...)"
-            )
-
-        return queued, skipped
+            try:
+                # 1. Register in seen_channels
+                self.redis_conn.sadd("seen_channels", normalized_link)
+                # 2. Push to validation queue
+                self.redis_conn.rpush(queue_target, payload)
+                # 3. Mark processed in DB ONLY upon confirmed Redis enqueue
+                self.mark_seed_processed(seed_id)
+                queued += 1
+                logging.info(
+                    f"[SEED] Queued @{username} → {queue_target} "
+                    f"(source={source}, id={seed_id[:8]}...)"
+                )
+            except Exception as enqueue_err:
+                logging.error(f"[SEED] Failed to push @{username} to Redis queue: {enqueue_err}. Will retry on next cycle.")
 
     # ── Main loop ──────────────────────────────────────────────────────────────
 

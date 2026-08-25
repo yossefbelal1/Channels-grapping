@@ -1,7 +1,9 @@
 import os
 import sys
 import logging
-from fastapi import FastAPI, Query
+import json
+from fastapi import FastAPI, Query, HTTPException, Security, Depends
+from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import HTMLResponse
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -21,12 +23,69 @@ load_dotenv()
 
 app = FastAPI(title="LeadHunter CRM Dashboard")
 
+# ── Dashboard Security ────────────────────────────────────────────────────────
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+
+def verify_dashboard_auth(api_key: Optional[str] = Security(api_key_header)):
+    """
+    Authenticates mutating API requests.
+    Configured via DASHBOARD_API_KEY. If unset in development, allows transparent access.
+    """
+    required_key = os.getenv("DASHBOARD_API_KEY")
+    if not required_key:
+        return True
+    if api_key != required_key:
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing X-API-Key")
+    return True
+
+
+def sanitize_media_path(media_input: Optional[str]) -> Optional[str]:
+    """
+    Validates and resolves media paths safely to prevent directory traversal.
+    """
+    if not media_input:
+        return None
+
+    paths = []
+    if media_input.startswith('[') and media_input.endswith(']'):
+        try:
+            paths = json.loads(media_input)
+        except Exception:
+            paths = [media_input]
+    elif ',' in media_input:
+        paths = [p.strip() for p in media_input.split(',') if p.strip()]
+    else:
+        paths = [media_input.strip()]
+
+    allowed_bases = [
+        os.path.abspath("media"),
+        os.path.abspath("/app/media"),
+        os.path.abspath("."),
+        os.path.abspath("/app")
+    ]
+
+    sanitized = []
+    for p in paths:
+        if ".." in p:
+            raise HTTPException(status_code=400, detail=f"Invalid media path: Directory traversal not permitted ('{p}').")
+        abs_p = os.path.abspath(p)
+        is_safe = any(abs_p.startswith(base) for base in allowed_bases)
+        if not is_safe:
+            raise HTTPException(status_code=400, detail=f"Invalid media path: '{p}' is outside allowed media directory.")
+        sanitized.append(p)
+
+    return ",".join(sanitized) if len(sanitized) > 1 else (sanitized[0] if sanitized else None)
+
+
 # PostgreSQL credentials
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", 5432))
 DB_NAME = os.getenv("DB_NAME", "leadhunter_db")
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+
 
 def get_db_connection():
     return psycopg2.connect(
@@ -38,19 +97,25 @@ def get_db_connection():
         cursor_factory=RealDictCursor
     )
 
+
 from pydantic import BaseModel
 from typing import List, Optional
 import uuid
 from datetime import datetime
+
 
 class CampaignRequest(BaseModel):
     message_text: str
     media_path: Optional[str] = None
     selected_lead_ids: List[str]
 
-@app.post("/api/campaigns/start")
+
+@app.post("/api/campaigns/start", dependencies=[Depends(verify_dashboard_auth)])
 def start_campaign(req: CampaignRequest):
     try:
+        # Sanitize media path against traversal
+        safe_media_path = sanitize_media_path(req.media_path)
+
         conn = get_db_connection()
         cur = conn.cursor()
         
@@ -59,7 +124,7 @@ def start_campaign(req: CampaignRequest):
         # 1. Insert Campaign
         cur.execute(
             "INSERT INTO campaigns (id, message_text, media_path, status, created_at) VALUES (%s, %s, %s, %s, %s)",
-            (campaign_id, req.message_text, req.media_path, "active", datetime.now())
+            (campaign_id, req.message_text, safe_media_path, "active", datetime.now())
         )
         
         # 2. Batch-insert Pending Logs

@@ -3658,21 +3658,36 @@ class LeadValidator:
                         JOIN campaigns c ON cl.campaign_id = c.id
                         JOIN leads l ON cl.lead_id = l.id
                         WHERE cl.status = 'pending'
-                        ORDER BY c.created_at ASC, cl.sent_at ASC
+                        ORDER BY c.created_at ASC, cl.sent_at ASC NULLS FIRST
                         LIMIT 1
+                        FOR UPDATE OF cl SKIP LOCKED
                     """)
                     pending_item = cur.fetchone()
                     
                     if not pending_item:
+                        conn.commit()
                         await asyncio.sleep(10)
                         continue
                         
                     log_id = pending_item['log_id']
+                    campaign_id = pending_item['campaign_id']
                     lead_id = pending_item['lead_id']
                     message_text = pending_item['message_text']
                     media_path = pending_item['media_path']
                     contact_username = pending_item['contact_username']
                     channel_username = pending_item['channel_username']
+                    
+                    # Mark processing state in DB to claim row
+                    cur.execute("UPDATE campaign_logs SET status = 'processing' WHERE id = %s", (log_id,))
+                    conn.commit()
+
+                    # Idempotency check in Redis
+                    idempotency_key = f"campaign:delivered:{campaign_id}:{lead_id}"
+                    if self.redis_conn.exists(idempotency_key):
+                        logging.info(f"Campaign Dispatcher: Idempotency hit: message for lead {lead_id} already delivered. Marking sent.")
+                        cur.execute("UPDATE campaign_logs SET status = 'sent', sent_at = %s WHERE id = %s", (datetime.now(), log_id))
+                        conn.commit()
+                        continue
                     
                     # 1. Enforce strict daily cap of 12 messages per 24 hours to prevent freezing
                     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -3895,42 +3910,36 @@ class LeadValidator:
                           AND (cl.followup_status IS NULL OR cl.followup_status = 'pending')
                           AND cl.user_replied = FALSE
                           AND cl.sent_at < NOW() - (COALESCE(c.followup_delay_days, 4) || ' days')::INTERVAL
-                        ORDER BY cl.sent_at ASC
+                        ORDER BY cl.sent_at ASC NULLS FIRST
                         LIMIT 1
+                        FOR UPDATE OF cl SKIP LOCKED
                     """)
                     pending_followup = cur.fetchone()
 
                     if not pending_followup:
+                        conn.commit()
                         await asyncio.sleep(30)
                         continue
 
-                    # 1. Enforce strict daily cap of 8 follow-ups per 24 hours
-                    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                    followup_sent_key = f"campaign_followup_sent_today:{today_str}"
-                    sent_today = int(self.redis_conn.get(followup_sent_key) or 0)
-
-                    if sent_today >= 8:
-                        logging.info(f"Follow-up Dispatcher: Daily follow-up limit reached ({sent_today}/8) for {today_str}. Sleeping for 60 minutes...")
-                        await asyncio.wait_for(self.shutdown_event.wait(), timeout=3600)
-                        continue
-
-                    # 2. Check if account is in Follow-up cooling
-                    until_ts = self.redis_conn.get("health:user_session:followup_rate_limited_until")
-                    if until_ts:
-                        try:
-                            diff = float(until_ts) - time.time()
-                            if diff > 0:
-                                logging.info(f"Follow-up Dispatcher: Account follow-up cooling cooldown active. Sleeping for {int(diff)}s...")
-                                await asyncio.wait_for(self.shutdown_event.wait(), timeout=diff)
-                                continue
-                        except ValueError:
-                            pass
-
                     log_id = pending_followup['log_id']
+                    campaign_id = pending_followup['campaign_id']
+                    lead_id = pending_followup['lead_id']
                     target_username = pending_followup['contact_username']
                     channel_username = pending_followup['channel_username']
                     followup_text = pending_followup['followup_message_text']
                     followup_media = pending_followup['followup_media_path']
+
+                    # Mark followup_status as processing
+                    cur.execute("UPDATE campaign_logs SET followup_status = 'processing' WHERE id = %s", (log_id,))
+                    conn.commit()
+
+                    # Idempotency check for follow-up
+                    followup_idempotency_key = f"campaign:followup_delivered:{campaign_id}:{lead_id}"
+                    if self.redis_conn.exists(followup_idempotency_key):
+                        logging.info(f"Follow-up Dispatcher: Idempotency hit: follow-up for lead {lead_id} already delivered. Marking sent.")
+                        cur.execute("UPDATE campaign_logs SET followup_status = 'sent', followup_sent_at = %s WHERE id = %s", (datetime.now(), log_id))
+                        conn.commit()
+                        continue
 
                     if not target_username:
                         cur.execute("UPDATE campaign_logs SET followup_status = 'skipped', followup_error_message = 'No contact username' WHERE id = %s", (log_id,))
