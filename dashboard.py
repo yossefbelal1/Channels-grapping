@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
 
 from fastapi import FastAPI, Query, HTTPException, Security, Depends
-from fastapi.security.api_key import APIKeyHeader
+from fastapi.security.api_key import APIKeyHeader, APIKeyQuery
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import psycopg2
@@ -33,11 +33,14 @@ load_dotenv()
 app = FastAPI(title="LeadHunter CRM Dashboard")
 
 # ── Dashboard Security ────────────────────────────────────────────────────────
-API_KEY_NAME = "X-API-Key"
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+API_KEY_QUERY = APIKeyQuery(name="api_key", auto_error=False)
 
 
-def verify_dashboard_auth(api_key: Optional[str] = Security(api_key_header)):
+def verify_dashboard_auth(
+    header_key: Optional[str] = Security(API_KEY_HEADER),
+    query_key: Optional[str] = Security(API_KEY_QUERY)
+):
     """
     Authenticates mutating and sensitive API requests.
     Configured via DASHBOARD_API_KEY.
@@ -53,10 +56,14 @@ def verify_dashboard_auth(api_key: Optional[str] = Security(api_key_header)):
         )
 
     if not required_key:
-        return True  # Local development fallback
+        return True  # Local development fallback when no key is set and not production
 
-    if not api_key or api_key.strip() != required_key:
-        raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing X-API-Key header.")
+    provided_key = header_key or query_key
+    if not provided_key or provided_key.strip() != required_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: Invalid or missing API key. Provide via 'X-API-Key' header or '?api_key=' parameter."
+        )
     return True
 
 
@@ -149,7 +156,7 @@ def start_campaign(req: CampaignRequest):
         logging.error(f"Error starting campaign: {e}")
         return {"success": False, "error": str(e)}
 
-@app.get("/api/campaigns")
+@app.get("/api/campaigns", dependencies=[Depends(verify_dashboard_auth)])
 def get_campaigns():
     try:
         conn = get_db_connection()
@@ -216,7 +223,7 @@ def get_campaigns():
         logging.error(f"Error fetching campaigns: {e}")
         return {"success": False, "error": str(e)}
 
-@app.get("/api/leads")
+@app.get("/api/leads", dependencies=[Depends(verify_dashboard_auth)])
 def get_leads(
     min_score: int = Query(None, alias="minScore"),
     has_vip: bool = Query(None, alias="hasVip"),
@@ -281,7 +288,7 @@ def get_leads(
         return {"success": False, "error": str(e)}
 
 
-@app.get("/api/leaderboards")
+@app.get("/api/leaderboards", dependencies=[Depends(verify_dashboard_auth)])
 def get_leaderboards():
     try:
         conn = get_db_connection()
@@ -409,7 +416,7 @@ def get_leaderboards():
         return {"success": False, "error": str(e)}
 
 
-@app.get("/api/group_metrics")
+@app.get("/api/group_metrics", dependencies=[Depends(verify_dashboard_auth)])
 def get_group_metrics():
     try:
         conn = get_db_connection()
@@ -433,7 +440,7 @@ def get_group_metrics():
         return {"success": False, "error": str(e)}
 
 
-@app.get("/api/discovery_stats")
+@app.get("/api/discovery_stats", dependencies=[Depends(verify_dashboard_auth)])
 def get_discovery_stats():
     try:
         conn = get_db_connection()
@@ -559,7 +566,7 @@ def get_discovery_stats():
         return {"success": False, "error": str(e)}
 
 
-@app.get("/api/quality_stats")
+@app.get("/api/quality_stats", dependencies=[Depends(verify_dashboard_auth)])
 def get_quality_stats():
     """PHASE 7 — Lead Quality Dashboard: funnel, categories, score distribution, rejections."""
     try:
@@ -655,7 +662,7 @@ def get_quality_stats():
         return {"success": False, "error": str(e)}
 
 
-@app.get("/api/graph/stats")
+@app.get("/api/graph/stats", dependencies=[Depends(verify_dashboard_auth)])
 def get_graph_stats():
     """
     Exposes graph analytics: Most Mentioned, Most Connected, Fastest Growing, and Top Networks.
@@ -729,7 +736,7 @@ def get_graph_stats():
         return {"success": False, "error": str(e)}
 
 
-@app.get("/api/graph/network")
+@app.get("/api/graph/network", dependencies=[Depends(verify_dashboard_auth)])
 def get_graph_network():
     """
     Returns full node-link structure for rendering force-directed network graphs.

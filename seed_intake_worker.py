@@ -41,6 +41,7 @@ from dotenv import load_dotenv
 import redis
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from app.core.db import get_db_connection
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -97,20 +98,12 @@ class SeedIntakeWorker:
     # ── Database connection ────────────────────────────────────────────────────
 
     def connect_db(self):
-        """Establishes PostgreSQL connection."""
+        """Acquires a pooled PostgreSQL connection."""
         try:
-            self.db_conn = psycopg2.connect(
-                host=self.db_host,
-                port=self.db_port,
-                dbname=self.db_name,
-                user=self.db_user,
-                password=self.db_password,
-                cursor_factory=RealDictCursor
-            )
-            self.db_conn.autocommit = True
-            logging.info("PostgreSQL connection established.")
+            self.db_conn = get_db_connection()
+            logging.info("PostgreSQL pooled connection established.")
         except Exception as e:
-            logging.error(f"Failed to connect to PostgreSQL: {e}")
+            logging.error(f"Failed to acquire PostgreSQL connection: {e}")
             raise
 
     def check_db_connection(self):
