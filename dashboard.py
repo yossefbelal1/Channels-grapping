@@ -1,14 +1,23 @@
 import os
 import sys
-import logging
 import json
+import logging
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Dict, Any, Union
+
 from fastapi import FastAPI, Query, HTTPException, Security, Depends
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import uvicorn
 from dotenv import load_dotenv
+
+from app.core.db import get_db_connection, get_db_cursor
+from app.core import config
 
 # Configure logging
 logging.basicConfig(
@@ -30,20 +39,31 @@ api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 def verify_dashboard_auth(api_key: Optional[str] = Security(api_key_header)):
     """
-    Authenticates mutating API requests.
-    Configured via DASHBOARD_API_KEY. If unset in development, allows transparent access.
+    Authenticates mutating and sensitive API requests.
+    Configured via DASHBOARD_API_KEY.
+    In production environments, missing or invalid key is strictly rejected.
     """
-    required_key = os.getenv("DASHBOARD_API_KEY")
+    required_key = os.getenv("DASHBOARD_API_KEY", "").strip()
+    is_production = os.getenv("ENVIRONMENT", "").lower() == "production"
+
+    if is_production and not required_key:
+        raise HTTPException(
+            status_code=500,
+            detail="Server configuration error: DASHBOARD_API_KEY must be configured in production."
+        )
+
     if not required_key:
-        return True
-    if api_key != required_key:
-        raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing X-API-Key")
+        return True  # Local development fallback
+
+    if not api_key or api_key.strip() != required_key:
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing X-API-Key header.")
     return True
 
 
 def sanitize_media_path(media_input: Optional[str]) -> Optional[str]:
     """
-    Validates and resolves media paths safely to prevent directory traversal.
+    Validates and resolves media paths safely using canonical Path resolution.
+    Rejects directory traversal (e.g. '../', symlinks outside media directory).
     """
     if not media_input:
         return None
@@ -59,49 +79,27 @@ def sanitize_media_path(media_input: Optional[str]) -> Optional[str]:
     else:
         paths = [media_input.strip()]
 
-    allowed_bases = [
-        os.path.abspath("media"),
-        os.path.abspath("/app/media"),
-        os.path.abspath("."),
-        os.path.abspath("/app")
-    ]
+    # Canonical base directory for media
+    base_media_dir = Path(os.getenv("ALLOWED_MEDIA_DIR", "media")).resolve()
+    # Create media directory if it doesn't exist yet
+    base_media_dir.mkdir(parents=True, exist_ok=True)
 
     sanitized = []
     for p in paths:
-        if ".." in p:
-            raise HTTPException(status_code=400, detail=f"Invalid media path: Directory traversal not permitted ('{p}').")
-        abs_p = os.path.abspath(p)
-        is_safe = any(abs_p.startswith(base) for base in allowed_bases)
-        if not is_safe:
-            raise HTTPException(status_code=400, detail=f"Invalid media path: '{p}' is outside allowed media directory.")
-        sanitized.append(p)
+        path_obj = Path(p.strip())
+        # Resolve full canonical path
+        try:
+            resolved = (base_media_dir / path_obj).resolve() if not path_obj.is_absolute() else path_obj.resolve()
+            # Strict path containment verification
+            resolved.relative_to(base_media_dir)
+        except (ValueError, RuntimeError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Security Alert: Media path '{p}' is outside allowed media directory ('{base_media_dir}')."
+            )
+        sanitized.append(str(resolved))
 
     return ",".join(sanitized) if len(sanitized) > 1 else (sanitized[0] if sanitized else None)
-
-
-# PostgreSQL credentials
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = int(os.getenv("DB_PORT", 5432))
-DB_NAME = os.getenv("DB_NAME", "leadhunter_db")
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-
-
-def get_db_connection():
-    return psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        cursor_factory=RealDictCursor
-    )
-
-
-from pydantic import BaseModel
-from typing import List, Optional
-import uuid
-from datetime import datetime
 
 
 class CampaignRequest(BaseModel):

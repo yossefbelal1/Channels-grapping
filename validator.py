@@ -1271,8 +1271,8 @@ class LeadValidator:
                     usdt_payments=False, binance_payments=False, lead_score=0,
                     tier='Tier_D', ai_confidence=100, last_activity=None,
                     discovery_source=discovery_source, discovery_method=discovery_method,
-                    arabic_score=arabic_score, region_score=region_score,
-                    status='rejected', forex_intent_score=forex_intent_score, forex_category=forex_category,
+                    arabic_score=0, region_score=0,
+                    status='rejected', forex_intent_score=0, forex_category='Unclassified',
                     high_risk_fraud=False
                 )
                 return True
@@ -3329,11 +3329,11 @@ class LeadValidator:
 
                 TARGET_FOLDERS = {"My_Channels", "حملات", "No_Post", "Banned", "Only_Post"}
                 
-                target_admin_peers = list(admin_peers_map.values()) if admin_peers_map else [InputPeerSelf()]
-                
                 from telethon.tl.functions.messages import UpdateDialogFilterRequest
                 import telethon.tl.functions.chatlists as chatlists_fn
                 from telethon.tl.types import DialogFilter, TextWithEntities, InputPeerSelf, InputChatlistDialogFilter
+
+                target_admin_peers = list(admin_peers_map.values()) if admin_peers_map else [InputPeerSelf()]
                 
                 def is_channel_or_chat_peer(peer):
                     classname = peer.__class__.__name__
@@ -3895,6 +3895,26 @@ class LeadValidator:
             try:
                 self.db_helper.check_connection()
                 conn = self.db_helper.conn
+
+                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                followup_sent_key = f"campaign_followup_sent_today:{today_str}"
+                sent_today = int(self.redis_conn.get(followup_sent_key) or 0)
+
+                if sent_today >= 8:
+                    logging.info(f"Follow-up Dispatcher: Daily follow-up limit reached ({sent_today}/8) for {today_str}. Sleeping for 60 minutes...")
+                    await asyncio.wait_for(self.shutdown_event.wait(), timeout=3600)
+                    continue
+
+                until_ts = self.redis_conn.get("health:user_session:followup_rate_limited_until")
+                if until_ts:
+                    try:
+                        diff = float(until_ts) - time.time()
+                        if diff > 0:
+                            logging.info(f"Follow-up Dispatcher: Account follow-up cooling cooldown active. Sleeping for {int(diff)}s...")
+                            await asyncio.wait_for(self.shutdown_event.wait(), timeout=diff)
+                            continue
+                    except ValueError:
+                        pass
 
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
                     cur.execute("""

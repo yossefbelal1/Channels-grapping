@@ -1,0 +1,35 @@
+version: '3.8'
+
+# Development override: binds local working directory for live code reloading
+services:
+  worker_scavenger:
+    volumes:
+      - .:/app
+      - sessions_data:/app/sessions
+
+  worker_radar:
+    volumes:
+      - .:/app
+      - sessions_data:/app/sessions
+
+  worker_validator:
+    volumes:
+      - .:/app
+      - sessions_data:/app/sessions
+
+  worker_web_scraper:
+    volumes:
+      - .:/app
+
+  worker_graph_expander:
+    volumes:
+      - .:/app
+      - sessions_data:/app/sessions
+
+  worker_seed_intake:
+    volumes:
+      - .:/app
+
+  dashboard:
+    volumes:
+      - .:/app

@@ -101,7 +101,7 @@ async def main():
                         title=title_str,
                         peers=target_admin_peers
                     ))
-                    inv_url = getattr(edit_res, 'url', None) or (getattr(edit_res.invite, 'url', None) if hasattr(edit_res, 'invite') else share_url)
+                    inv_url = getattr(edit_res, 'url', None) or (getattr(edit_res.invite, 'url', None) if hasattr(edit_res, 'invite') else url)
                     print(f"  ✓ Share link successfully updated: {inv_url} (contains {len(target_admin_peers)} admin channels/groups)")
             else:
                 print("  No existing share link found. Creating new exported invite link...")

@@ -49,6 +49,16 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 
+LUA_ATOMIC_SEED_ENQUEUE = """
+local is_seen = redis.call("SISMEMBER", KEYS[1], ARGV[1])
+if is_seen == 1 then
+    return 0
+end
+redis.call("SADD", KEYS[1], ARGV[1])
+redis.call("RPUSH", KEYS[2], ARGV[2])
+return 1
+"""
+
 
 class SeedIntakeWorker:
     """
@@ -144,16 +154,12 @@ class SeedIntakeWorker:
         except Exception as e:
             logging.error(f"Failed to mark seed {seed_id} as processed: {e}")
 
-    def is_already_queued(self, normalized_link: str) -> bool:
-        """Checks Redis deduplication set to avoid re-queueing known channels."""
-        return bool(self.redis_conn.sismember("seen_channels", normalized_link))
-
     def process_seeds(self, seeds: list) -> tuple:
         """
-        Processes a batch of seeds:
-          - Deduplicates against Redis seen_channels set
-          - Pushes new seeds to appropriate priority queue
-          - Marks each as processed in PostgreSQL ONLY after successful Redis queueing
+        Processes a batch of seeds atomically:
+          - Uses Redis Lua script to atomically check deduplication and push to queue.
+          - If Redis push fails, the seed remains pending in DB and is NOT marked as seen.
+          - Marks seed as processed in PostgreSQL ONLY after confirmed Redis enqueue or if already known.
           - Returns (queued_count, skipped_count)
         """
         queued = 0
@@ -172,13 +178,6 @@ class SeedIntakeWorker:
             # Normalize to standard link format
             normalized_link = f"https://t.me/{username}"
 
-            # Check Redis deduplication
-            if self.is_already_queued(normalized_link):
-                logging.info(f"[SEED] Already known: @{username} (source={source}). Marking processed & skipping.")
-                self.mark_seed_processed(seed_id)
-                skipped += 1
-                continue
-
             # Determine priority queue based on source
             if source.lower() in self.HIGH_PRIORITY_SOURCES:
                 queue_target = "queue:high"
@@ -195,19 +194,25 @@ class SeedIntakeWorker:
             })
 
             try:
-                # 1. Register in seen_channels
-                self.redis_conn.sadd("seen_channels", normalized_link)
-                # 2. Push to validation queue
-                self.redis_conn.rpush(queue_target, payload)
-                # 3. Mark processed in DB ONLY upon confirmed Redis enqueue
-                self.mark_seed_processed(seed_id)
-                queued += 1
-                logging.info(
-                    f"[SEED] Queued @{username} → {queue_target} "
-                    f"(source={source}, id={seed_id[:8]}...)"
+                # Atomic check-and-enqueue via Redis Lua script
+                res = self.redis_conn.eval(
+                    LUA_ATOMIC_SEED_ENQUEUE, 2, "seen_channels", queue_target, normalized_link, payload
                 )
+                if res == 1:
+                    self.mark_seed_processed(seed_id)
+                    queued += 1
+                    logging.info(
+                        f"[SEED] Queued @{username} → {queue_target} "
+                        f"(source={source}, id={seed_id[:8]}...)"
+                    )
+                elif res == 0:
+                    self.mark_seed_processed(seed_id)
+                    skipped += 1
+                    logging.info(f"[SEED] Already known: @{username} (source={source}). Marked processed & skipped.")
             except Exception as enqueue_err:
-                logging.error(f"[SEED] Failed to push @{username} to Redis queue: {enqueue_err}. Will retry on next cycle.")
+                logging.error(f"[SEED] Failed atomic enqueue for @{username}: {enqueue_err}. Will retry on next cycle.")
+
+        return queued, skipped
 
     # ── Main loop ──────────────────────────────────────────────────────────────
 

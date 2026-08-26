@@ -439,7 +439,7 @@ class TelegramManager:
     def check_request_limit(self, session_name: str, max_requests: int = DEFAULT_MAX_REQUESTS_PER_HOUR, window: int = 3600) -> bool:
         """
         Enforces rate limiting using an atomic Redis sliding-window log.
-        Eliminates race conditions between multiple async tasks or containers.
+        Fails CLOSED on Redis/Lua errors to protect Telegram accounts from bans.
         """
         key = f"limit:{session_name}:requests_sliding"
         now = time.time()
@@ -447,8 +447,8 @@ class TelegramManager:
             allowed = self._lua_ratelimit(keys=[key], args=[now, window, max_requests])
             return bool(allowed == 1)
         except Exception as e:
-            logging.error(f"Rate limiter Lua error for '{session_name}': {e}. Falling back to conservative allow.")
-            return True
+            logging.error(f"Rate limiter Redis/Lua error for '{session_name}': {e}. Failing CLOSED to prevent Telegram account bans.")
+            return False
 
     def get_healthiest_session(self, preferred_session: str = None) -> str:
         """Finds the healthiest available session name not currently rate-limited."""

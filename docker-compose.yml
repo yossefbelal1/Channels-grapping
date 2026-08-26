@@ -13,7 +13,6 @@ services:
       - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # Automatically initializes the schema on first container startup
       - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
@@ -46,7 +45,6 @@ services:
     env_file:
       - .env
     volumes:
-      - .:/app
       - sessions_data:/app/sessions
 
   worker_radar:
@@ -60,7 +58,6 @@ services:
     env_file:
       - .env
     volumes:
-      - .:/app
       - sessions_data:/app/sessions
 
   worker_validator:
@@ -76,8 +73,8 @@ services:
     env_file:
       - .env
     volumes:
-      - .:/app
       - sessions_data:/app/sessions
+      - media_data:/app/media
 
   worker_web_scraper:
     build: .
@@ -89,8 +86,6 @@ services:
         condition: service_healthy
     env_file:
       - .env
-    volumes:
-      - .:/app
 
   worker_graph_expander:
     build: .
@@ -105,7 +100,6 @@ services:
     env_file:
       - .env
     volumes:
-      - .:/app
       - sessions_data:/app/sessions
 
   worker_seed_intake:
@@ -120,8 +114,6 @@ services:
         condition: service_healthy
     env_file:
       - .env
-    volumes:
-      - .:/app
 
   dashboard:
     build: .
@@ -136,7 +128,7 @@ services:
     env_file:
       - .env
     volumes:
-      - .:/app
+      - media_data:/app/media
     healthcheck:
       test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/docs\")' || exit 1"]
       interval: 30s
@@ -148,3 +140,4 @@ volumes:
   pgdata:
   redisdata:
   sessions_data:
+  media_data:

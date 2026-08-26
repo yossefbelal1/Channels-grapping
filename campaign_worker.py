@@ -153,6 +153,7 @@ async def main():
                 JOIN campaigns c ON cl.campaign_id = c.id
                 JOIN leads l ON cl.lead_id = l.id
                 WHERE cl.status = 'pending'
+                   OR (cl.status = 'processing' AND cl.sent_at IS NULL)
                 ORDER BY c.created_at ASC, cl.sent_at ASC NULLS FIRST
                 LIMIT 1
                 FOR UPDATE OF cl SKIP LOCKED
