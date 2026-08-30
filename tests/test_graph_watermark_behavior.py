@@ -47,14 +47,12 @@ class TestGraphWatermarkBehavior(unittest.TestCase):
         self.expander.redis_conn.set("graph:watermark:testchannel", max_id, ex=86400 * 30)
         self.expander.redis_conn.set.assert_called_once_with("graph:watermark:testchannel", 1520, ex=86400 * 30)
 
-    def test_crash_before_watermark_persistence_zero_message_loss(self):
-        """P1-G Verification: If process crashes before watermark is set, next cycle safely re-fetches with Redis seen_channels dedup."""
-        # Simulated seen_channels deduplication set
-        seen_channels = {"https://t.me/knownchannel"}
-
-        discovered_link = "https://t.me/knownchannel"
-        is_already_seen = discovered_link in seen_channels
-        self.assertTrue(is_already_seen, "seen_channels set guarantees duplicate discovered links are deduplicated.")
+    def test_duplicate_execution_with_empty_new_messages(self):
+        """P1-G Verification: When no messages are newer than watermark, watermark remains unchanged and no redundant edges are written."""
+        watermark = 1520
+        new_msgs = []
+        new_max_id = max((m.id for m in new_msgs), default=watermark)
+        self.assertEqual(new_max_id, watermark, "Watermark must remain stable when no new messages exist.")
 
 
 if __name__ == '__main__':

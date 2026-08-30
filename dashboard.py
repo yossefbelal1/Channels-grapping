@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
 
 from fastapi import FastAPI, Query, HTTPException, Security, Depends, Request
-from fastapi.security.api_key import APIKeyHeader, APIKeyQuery
+from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import psycopg2
@@ -40,16 +40,15 @@ app = FastAPI(title="LeadHunter CRM Dashboard")
 
 # ── Dashboard Security ────────────────────────────────────────────────────────
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
-API_KEY_QUERY = APIKeyQuery(name="api_key", auto_error=False)
 
 
 def verify_dashboard_auth(
-    header_key: Optional[str] = Security(API_KEY_HEADER),
-    query_key: Optional[str] = Security(API_KEY_QUERY)
+    header_key: Optional[Union[str, Request]] = Security(API_KEY_HEADER),
 ):
     """
-    Authenticates mutating and sensitive API requests.
+    Authenticates mutating and sensitive API requests strictly via the 'X-API-Key' HTTP header.
     Configured via DASHBOARD_API_KEY.
+    Query parameters (e.g. ?api_key=...) are strictly rejected.
     In production environments, missing or invalid key is strictly rejected.
     """
     required_key = os.getenv("DASHBOARD_API_KEY", "").strip()
@@ -64,11 +63,16 @@ def verify_dashboard_auth(
     if not required_key:
         return True  # Local development fallback when no key is set and not production
 
-    provided_key = header_key or query_key
-    if not provided_key or provided_key.strip() != required_key:
+    actual_key = None
+    if isinstance(header_key, str):
+        actual_key = header_key
+    elif hasattr(header_key, "headers"):
+        actual_key = header_key.headers.get("X-API-Key") or header_key.headers.get("x-api-key")
+
+    if not actual_key or actual_key.strip() != required_key:
         raise HTTPException(
             status_code=401,
-            detail="Unauthorized: Invalid or missing API key. Provide via 'X-API-Key' header or '?api_key=' parameter."
+            detail="Unauthorized: Invalid or missing API key. Provide via 'X-API-Key' HTTP header only."
         )
     return True
 
@@ -2723,10 +2727,9 @@ def serve_dashboard():
 
 # ── Outreach Engine API Endpoints ─────────────────────────────────────────
 
-@app.get("/api/outreach/health")
-async def get_outreach_health(request: Request):
+@app.get("/api/outreach/health", dependencies=[Depends(verify_dashboard_auth)])
+async def get_outreach_health():
     """Get account health states and outreach status."""
-    verify_dashboard_auth(request)
     try:
         redis_conn = redis.Redis(host=os.getenv('REDIS_HOST', 'localhost'),
                                  port=int(os.getenv('REDIS_PORT', 6379)),
@@ -2752,10 +2755,9 @@ async def get_outreach_health(request: Request):
         return {"error": str(e)}
 
 
-@app.get("/api/outreach/metrics")
-async def get_outreach_metrics(request: Request):
+@app.get("/api/outreach/metrics", dependencies=[Depends(verify_dashboard_auth)])
+async def get_outreach_metrics():
     """Get outreach pipeline metrics snapshot."""
-    verify_dashboard_auth(request)
     try:
         redis_conn = redis.Redis(host=os.getenv('REDIS_HOST', 'localhost'),
                                  port=int(os.getenv('REDIS_PORT', 6379)),
@@ -2767,10 +2769,9 @@ async def get_outreach_metrics(request: Request):
         return {"error": str(e)}
 
 
-@app.get("/api/outreach/queue")
-async def get_outreach_queue(request: Request):
+@app.get("/api/outreach/queue", dependencies=[Depends(verify_dashboard_auth)])
+async def get_outreach_queue():
     """Get outreach queue depths."""
-    verify_dashboard_auth(request)
     try:
         redis_conn = redis.Redis(host=os.getenv('REDIS_HOST', 'localhost'),
                                  port=int(os.getenv('REDIS_PORT', 6379)),
@@ -2785,10 +2786,9 @@ async def get_outreach_queue(request: Request):
         return {"error": str(e)}
 
 
-@app.post("/api/outreach/emergency/stop")
-async def api_emergency_stop(request: Request):
+@app.post("/api/outreach/emergency/stop", dependencies=[Depends(verify_dashboard_auth)])
+async def api_emergency_stop():
     """Trigger emergency outreach stop."""
-    verify_dashboard_auth(request)
     try:
         redis_conn = redis.Redis(host=os.getenv('REDIS_HOST', 'localhost'),
                                  port=int(os.getenv('REDIS_PORT', 6379)),
@@ -2800,10 +2800,9 @@ async def api_emergency_stop(request: Request):
         return {"error": str(e)}
 
 
-@app.post("/api/outreach/emergency/resume")
-async def api_emergency_resume(request: Request):
+@app.post("/api/outreach/emergency/resume", dependencies=[Depends(verify_dashboard_auth)])
+async def api_emergency_resume():
     """Resume outreach after emergency stop."""
-    verify_dashboard_auth(request)
     try:
         redis_conn = redis.Redis(host=os.getenv('REDIS_HOST', 'localhost'),
                                  port=int(os.getenv('REDIS_PORT', 6379)),
