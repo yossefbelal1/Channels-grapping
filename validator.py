@@ -20,6 +20,19 @@ from telethon.tl.functions.messages import CheckChatInviteRequest
 from tg_manager import TelegramManager, get_session_path
 from keyword_frequency_service import KeywordFrequencyService
 
+# Outreach Engine imports
+from app.outreach.emergency import is_outreach_enabled, is_account_enabled
+from app.outreach.dry_run import is_dry_run, log_dry_run_decision
+from app.outreach.risk_scorer import calculate_risk_score, classify_risk_level
+from app.outreach.eligibility import check_eligibility
+from app.outreach.account_health import AccountHealthManager
+from app.outreach.adaptive_throttle import AdaptiveThrottle
+from app.outreach.circuit_breaker import CircuitBreaker
+from app.outreach.message_validator import validate_message
+from app.outreach.metrics import OutreachMetrics
+from app.outreach.reconciliation import ReconciliationManager
+from app.outreach.backpressure import BackpressureManager
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -990,6 +1003,14 @@ class LeadValidator:
         self.tg_manager = None
         self.session_name = os.getenv("SESSION_VALIDATOR", "validator_session")
         self.shutdown_event = asyncio.Event()
+
+        # Outreach engine modules (initialized in start() after Redis/DB connection)
+        self.outreach_metrics = None
+        self.account_health_mgr = None
+        self.adaptive_throttle = None
+        self.circuit_breaker = None
+        self.backpressure_mgr = None
+        self.reconciliation_mgr = None
 
     def is_all_sessions_rate_limited(self) -> bool:
         """Check if ALL Telegram sessions are currently rate-limited."""
@@ -3646,6 +3667,16 @@ class LeadValidator:
         import random
         
         while not self.shutdown_event.is_set():
+            # ── Outreach Engine: Emergency & Circuit Breaker Check ──────────
+            if not is_outreach_enabled(self.redis_conn):
+                logging.info("Campaign Dispatcher: Outreach globally disabled. Sleeping 60s.")
+                await asyncio.sleep(60)
+                continue
+            if self.circuit_breaker and self.circuit_breaker.check_account_circuit('user_session')[0]:
+                reason = self.circuit_breaker.check_account_circuit('user_session')[1]
+                logging.warning(f"Campaign Dispatcher: Account circuit breaker OPEN: {reason}. Sleeping 120s.")
+                await asyncio.sleep(120)
+                continue
             try:
                 self.db_helper.check_connection()
                 conn = self.db_helper.conn
@@ -3687,6 +3718,76 @@ class LeadValidator:
                         logging.info(f"Campaign Dispatcher: Idempotency hit: message for lead {lead_id} already delivered. Marking sent.")
                         cur.execute("UPDATE campaign_logs SET status = 'sent', sent_at = %s WHERE id = %s", (datetime.now(), log_id))
                         conn.commit()
+                        continue
+                    
+                    # ── Outreach Engine: Eligibility Check ──────────────────
+                    if self.outreach_metrics:
+                        self.outreach_metrics.record_attempt('user_session', str(campaign_id))
+                    
+                    elig_status, elig_reason = check_eligibility(
+                        self.redis_conn, conn.cursor(), str(lead_id), str(campaign_id),
+                        contact_username or ''
+                    )
+                    if elig_status != 'ELIGIBLE':
+                        logging.info(f"Campaign Dispatcher: Lead {lead_id} not eligible: {elig_status} - {elig_reason}")
+                        cur.execute(
+                            "UPDATE campaign_logs SET status = 'skipped', error_message = %s, sent_at = %s, eligibility = %s WHERE id = %s",
+                            (f"Not eligible: {elig_reason}", datetime.now(), elig_status, log_id)
+                        )
+                        conn.commit()
+                        if self.outreach_metrics:
+                            self.outreach_metrics.record_skip(elig_status)
+                            self.outreach_metrics.record_eligibility_check(elig_status)
+                        continue
+                    
+                    # ── Outreach Engine: Risk Scoring ──────────────────────
+                    risk_score, risk_level = calculate_risk_score(
+                        self.redis_conn, conn.cursor(), str(lead_id), 'user_session', str(campaign_id)
+                    )
+                    if risk_level in ('HIGH', 'CRITICAL'):
+                        logging.warning(f"Campaign Dispatcher: Lead {lead_id} risk too high: {risk_level} (score={risk_score}). Skipping.")
+                        cur.execute(
+                            "UPDATE campaign_logs SET status = 'skipped', error_message = %s, sent_at = %s, risk_level = %s WHERE id = %s",
+                            (f"Risk too high: {risk_level} (score={risk_score})", datetime.now(), risk_level, log_id)
+                        )
+                        conn.commit()
+                        if self.outreach_metrics:
+                            self.outreach_metrics.record_skip('HIGH_RISK')
+                            self.outreach_metrics.record_risk_level(risk_level)
+                        continue
+                    
+                    # Record risk level and eligibility on the log row
+                    cur.execute(
+                        "UPDATE campaign_logs SET risk_level = %s, eligibility = %s, attempt_count = COALESCE(attempt_count, 0) + 1, last_attempt_at = %s WHERE id = %s",
+                        (risk_level, 'ELIGIBLE', datetime.now(), log_id)
+                    )
+                    conn.commit()
+                    
+                    # ── Outreach Engine: Message Validation ────────────────
+                    msg_valid, msg_errors = validate_message(message_text, self._resolve_media_list(media_path) if media_path else None)
+                    if not msg_valid:
+                        logging.warning(f"Campaign Dispatcher: Message validation failed for lead {lead_id}: {msg_errors}")
+                        cur.execute(
+                            "UPDATE campaign_logs SET status = 'skipped', error_message = %s, sent_at = %s WHERE id = %s",
+                            (f"Message validation failed: {'; '.join(msg_errors)}", datetime.now(), log_id)
+                        )
+                        conn.commit()
+                        continue
+                    
+                    # ── Outreach Engine: Dry Run Check ─────────────────────
+                    if is_dry_run():
+                        decision = log_dry_run_decision(
+                            str(lead_id), str(campaign_id), contact_username or '',
+                            'user_session', risk_level, 'ELIGIBLE',
+                            message_text[:100] if message_text else ''
+                        )
+                        cur.execute(
+                            "UPDATE campaign_logs SET status = 'skipped', error_message = 'DRY_RUN: Message not sent', sent_at = %s WHERE id = %s",
+                            (datetime.now(), log_id)
+                        )
+                        conn.commit()
+                        if self.outreach_metrics:
+                            self.outreach_metrics.record_dry_run_decision()
                         continue
                     
                     # 1. Enforce configurable daily cap
@@ -3802,6 +3903,16 @@ class LeadValidator:
                         error_message = f"Telegram rate limit: FloodWaitError ({flood_err.seconds}s)"
                         logging.warning(f"Campaign Dispatcher: Rate limit triggered for @{target_username}: {error_message}. Cooling down for {wait_seconds}s...")
                         self.redis_conn.set("health:user_session:dm_rate_limited_until", time.time() + wait_seconds, ex=wait_seconds + 3600)
+                        # ── Outreach Engine: Record FloodWait ──────────────
+                        if self.account_health_mgr:
+                            self.account_health_mgr.record_flood_wait('user_session', 'send_message', flood_err.seconds)
+                        if self.circuit_breaker:
+                            self.circuit_breaker.record_flood_wait('user_session')
+                        if self.adaptive_throttle:
+                            self.adaptive_throttle.record_flood_wait(flood_err.seconds)
+                        if self.outreach_metrics:
+                            self.outreach_metrics.record_flood_wait('user_session', flood_err.seconds)
+                            self.outreach_metrics.record_failure('user_session', str(campaign_id), 'FloodWait')
                         # Keep lead as pending so it will be retried safely after cooldown
                         cur.execute(
                             "UPDATE campaign_logs SET status = 'pending', error_message = NULL, sent_at = NULL WHERE id = %s",
@@ -3814,6 +3925,13 @@ class LeadValidator:
                         error_message = "Telegram PeerFloodError: Account is in temporary spam cooldown."
                         logging.warning(f"Campaign Dispatcher: PeerFloodError hit on @{target_username}! Pausing outreach for 2 hours to protect account.")
                         self.redis_conn.set("health:user_session:dm_rate_limited_until", time.time() + 7200, ex=8000)
+                        # ── Outreach Engine: Record PeerFlood ──────────────
+                        if self.account_health_mgr:
+                            self.account_health_mgr.record_error('user_session', 'PeerFloodError', str(peer_flood))
+                        if self.circuit_breaker:
+                            self.circuit_breaker.record_flood_wait('user_session')
+                        if self.outreach_metrics:
+                            self.outreach_metrics.record_failure('user_session', str(campaign_id), 'PeerFlood')
                         # Keep lead as pending
                         cur.execute(
                             "UPDATE campaign_logs SET status = 'pending', error_message = NULL, sent_at = NULL WHERE id = %s",
@@ -3873,16 +3991,47 @@ class LeadValidator:
                         # Increment daily sent count in Redis
                         self.redis_conn.incr(campaign_sent_key)
                         self.redis_conn.expire(campaign_sent_key, 86400)
+                        
+                        # ── Outreach Engine: Record Success ────────────────
+                        if self.account_health_mgr:
+                            self.account_health_mgr.record_success('user_session')
+                        if self.adaptive_throttle:
+                            self.adaptive_throttle.record_success()
+                        if self.outreach_metrics:
+                            self.outreach_metrics.record_success('user_session', str(campaign_id))
+                            self.outreach_metrics.record_eligibility_check('ELIGIBLE')
+                            self.outreach_metrics.record_risk_level(risk_level)
+                        # Update per-lead cooldown
+                        try:
+                            cur.execute(
+                                "UPDATE leads SET last_contact_at = %s, next_eligible_at = %s WHERE id = %s",
+                                (datetime.now(), datetime.now() + timedelta(days=30), lead_id)
+                            )
+                            conn.commit()
+                        except Exception:
+                            pass
                     else:
                         cur.execute(
                             "UPDATE campaign_logs SET status = 'failed', error_message = %s, sent_at = %s WHERE id = %s",
                             (error_message, datetime.now(), log_id)
                         )
+                        # ── Outreach Engine: Record Failure ────────────────
+                        if self.account_health_mgr:
+                            self.account_health_mgr.record_error('user_session', 'permanent', error_message or '')
+                        if self.adaptive_throttle:
+                            self.adaptive_throttle.record_failure()
+                        if self.outreach_metrics:
+                            self.outreach_metrics.record_failure('user_session', str(campaign_id), 'permanent')
+                        if self.circuit_breaker:
+                            self.circuit_breaker.record_rejection(str(campaign_id))
                         
                     conn.commit()
                     
                 # 4. Safe human-like random jitter between sends (90 to 210 seconds)
-                jitter_profile = random.randint(jitter_min, jitter_max)
+                if self.adaptive_throttle:
+                    jitter_profile = int(self.adaptive_throttle.get_next_delay())
+                else:
+                    jitter_profile = random.randint(jitter_min, jitter_max)
                 logging.info(f"Campaign Dispatcher: Pacing sleep: {jitter_profile}s (~{jitter_profile//60}m {jitter_profile%60}s). Daily sent: {sent_today}/{daily_limit}.")
                 await asyncio.wait_for(self.shutdown_event.wait(), timeout=jitter_profile)
                 
@@ -4111,6 +4260,35 @@ class LeadValidator:
         except Exception as init_err:
             logging.error(f"Failed to initialize rejected_groups_set in Redis: {init_err}")
         
+        # ── Initialize Outreach Engine ─────────────────────────────────────
+        try:
+            self.outreach_metrics = OutreachMetrics(self.redis_conn, self.db_helper.conn)
+            self.account_health_mgr = AccountHealthManager(self.redis_conn, self.db_helper.conn)
+            self.adaptive_throttle = AdaptiveThrottle(self.redis_conn, 'user_session')
+            self.circuit_breaker = CircuitBreaker(self.redis_conn)
+            self.backpressure_mgr = BackpressureManager(self.redis_conn)
+            self.reconciliation_mgr = ReconciliationManager(
+                self.redis_conn, self.db_helper.conn
+            )
+            # Run outreach schema migration
+            try:
+                migration_path = os.path.join(os.path.dirname(__file__), 'migrate_outreach_engine.sql')
+                if os.path.exists(migration_path):
+                    with open(migration_path, 'r') as f:
+                        migration_sql = f.read()
+                    self.db_helper.conn.cursor().execute(migration_sql)
+                    self.db_helper.conn.commit()
+                    logging.info("Outreach engine schema migration applied successfully.")
+            except Exception as mig_err:
+                logging.warning(f"Outreach migration warning (may already be applied): {mig_err}")
+                try:
+                    self.db_helper.conn.rollback()
+                except Exception:
+                    pass
+            logging.info("Outreach engine modules initialized.")
+        except Exception as oe_err:
+            logging.error(f"Outreach engine initialization error (non-fatal): {oe_err}")
+
         # Start the periodic rescan scheduler
         asyncio.create_task(self.rescan_scheduler_loop())
         

@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
 
-from fastapi import FastAPI, Query, HTTPException, Security, Depends
+from fastapi import FastAPI, Query, HTTPException, Security, Depends, Request
 from fastapi.security.api_key import APIKeyHeader, APIKeyQuery
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -15,9 +15,15 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import uvicorn
 from dotenv import load_dotenv
+import redis
 
 from app.core.db import get_db_connection, get_db_cursor
 from app.core import config
+from app.outreach.metrics import OutreachMetrics
+from app.outreach.emergency import is_outreach_enabled, emergency_stop, emergency_resume, disable_account, enable_account
+from app.outreach.account_health import AccountHealthManager
+from app.outreach.circuit_breaker import CircuitBreaker
+from app.outreach.backpressure import BackpressureManager
 
 # Configure logging
 logging.basicConfig(
@@ -2714,6 +2720,99 @@ def serve_dashboard():
     </html>
     """
     return HTMLResponse(content=html_content, status_code=200)
+
+# ── Outreach Engine API Endpoints ─────────────────────────────────────────
+
+@app.get("/api/outreach/health")
+async def get_outreach_health(request: Request):
+    """Get account health states and outreach status."""
+    verify_dashboard_auth(request)
+    try:
+        redis_conn = redis.Redis(host=os.getenv('REDIS_HOST', 'localhost'),
+                                 port=int(os.getenv('REDIS_PORT', 6379)),
+                                 db=int(os.getenv('REDIS_DB', 0)),
+                                 decode_responses=True)
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Get account health from DB
+        cur.execute("SELECT * FROM account_health ORDER BY health_score DESC")
+        accounts = cur.fetchall()
+        
+        # Get global outreach status
+        outreach_enabled = is_outreach_enabled(redis_conn)
+        
+        conn.close()
+        return {
+            "outreach_enabled": outreach_enabled,
+            "accounts": [dict(a) for a in accounts] if accounts else [],
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/outreach/metrics")
+async def get_outreach_metrics(request: Request):
+    """Get outreach pipeline metrics snapshot."""
+    verify_dashboard_auth(request)
+    try:
+        redis_conn = redis.Redis(host=os.getenv('REDIS_HOST', 'localhost'),
+                                 port=int(os.getenv('REDIS_PORT', 6379)),
+                                 db=int(os.getenv('REDIS_DB', 0)),
+                                 decode_responses=True)
+        metrics = OutreachMetrics(redis_conn)
+        return metrics.get_dashboard_snapshot()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/outreach/queue")
+async def get_outreach_queue(request: Request):
+    """Get outreach queue depths."""
+    verify_dashboard_auth(request)
+    try:
+        redis_conn = redis.Redis(host=os.getenv('REDIS_HOST', 'localhost'),
+                                 port=int(os.getenv('REDIS_PORT', 6379)),
+                                 db=int(os.getenv('REDIS_DB', 0)),
+                                 decode_responses=True)
+        depths = {}
+        for queue_name in ['outreach:high', 'outreach:normal', 'outreach:low']:
+            depths[queue_name] = redis_conn.llen(queue_name) or 0
+        depths['total'] = sum(depths.values())
+        return depths
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/outreach/emergency/stop")
+async def api_emergency_stop(request: Request):
+    """Trigger emergency outreach stop."""
+    verify_dashboard_auth(request)
+    try:
+        redis_conn = redis.Redis(host=os.getenv('REDIS_HOST', 'localhost'),
+                                 port=int(os.getenv('REDIS_PORT', 6379)),
+                                 db=int(os.getenv('REDIS_DB', 0)),
+                                 decode_responses=True)
+        emergency_stop(redis_conn)
+        return {"success": True, "message": "Outreach emergency stop activated"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/outreach/emergency/resume")
+async def api_emergency_resume(request: Request):
+    """Resume outreach after emergency stop."""
+    verify_dashboard_auth(request)
+    try:
+        redis_conn = redis.Redis(host=os.getenv('REDIS_HOST', 'localhost'),
+                                 port=int(os.getenv('REDIS_PORT', 6379)),
+                                 db=int(os.getenv('REDIS_DB', 0)),
+                                 decode_responses=True)
+        emergency_resume(redis_conn)
+        return {"success": True, "message": "Outreach resumed"}
+    except Exception as e:
+        return {"error": str(e)}
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))

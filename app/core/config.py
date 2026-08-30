@@ -30,3 +30,11 @@ LOCK_HEARTBEAT_INTERVAL = int(os.getenv("TELEGRAM_LOCK_HEARTBEAT_INTERVAL", "15"
 # Dashboard Security
 DASHBOARD_API_KEY = os.getenv("DASHBOARD_API_KEY", "")
 ALLOWED_MEDIA_DIR = os.getenv("ALLOWED_MEDIA_DIR", "/app/media")
+
+# Outreach Engine Configuration
+OUTREACH_ENABLED = os.getenv("OUTREACH_ENABLED", "true").lower() == "true"
+OUTREACH_DRY_RUN = os.getenv("OUTREACH_DRY_RUN", "false").lower() == "true"
+OUTREACH_CANARY_SIZE = int(os.getenv("OUTREACH_CANARY_SIZE", "5"))
+OUTREACH_MAX_RETRIES = int(os.getenv("OUTREACH_MAX_RETRIES", "3"))
+OUTREACH_LEAD_COOLDOWN_DAYS = int(os.getenv("OUTREACH_LEAD_COOLDOWN_DAYS", "30"))
+OUTREACH_RECONCILIATION_INTERVAL = int(os.getenv("OUTREACH_RECONCILIATION_INTERVAL", "300"))
