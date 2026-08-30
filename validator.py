@@ -3689,27 +3689,29 @@ class LeadValidator:
                         conn.commit()
                         continue
                     
-                    # 1. Enforce strict daily cap of 12 messages per 24 hours to prevent freezing
+                    # 1. Enforce configurable daily cap
                     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                     campaign_sent_key = f"campaign_sent_today:{today_str}"
                     sent_today = int(self.redis_conn.get(campaign_sent_key) or 0)
-                    
-                    if sent_today >= 12:
-                        logging.info(f"Campaign Dispatcher: Daily outreach limit reached ({sent_today}/12) for {today_str}. Sleeping for 60 minutes...")
+                    daily_limit = int(os.getenv("CAMPAIGN_DAILY_LIMIT", 60))
+                    jitter_min = int(os.getenv("CAMPAIGN_JITTER_MIN", 90))
+                    jitter_max = int(os.getenv("CAMPAIGN_JITTER_MAX", 210))
+                    burst_size = int(os.getenv("CAMPAIGN_BURST_SIZE", 5))
+
+                    if sent_today >= daily_limit:
+                        logging.info(f"Campaign Dispatcher: Daily outreach limit reached ({sent_today}/{daily_limit}) for {today_str}. Sleeping for 60 minutes...")
                         await asyncio.wait_for(self.shutdown_event.wait(), timeout=3600)
                         continue
 
-                    # 1b. Enforce human break: every 3 messages, take a 1.5 to 3 hour break
-                    if sent_today > 0 and sent_today % 3 == 0:
-                        # Check if we already logged/slept for this break by looking at a Redis key
+                    # 1b. Human micro-break: every burst_size messages, take a 10-20 min pause
+                    if sent_today > 0 and sent_today % burst_size == 0:
                         break_key = f"campaign_break_taken:{today_str}:{sent_today}"
                         if not self.redis_conn.get(break_key):
-                            break_duration = random.randint(5400, 10800)  # 1.5 to 3 hours
-                            logging.info(f"Campaign Dispatcher: Taking a human break. Sleeping for {break_duration//60} minutes (~{break_duration/3600:.1f} hours) after sending {sent_today} messages...")
-                            self.redis_conn.set(break_key, "1", ex=break_duration + 3600)
+                            break_duration = random.randint(600, 1200)
+                            logging.info(f"Campaign Dispatcher: Short pause of {break_duration//60} minutes after sending {sent_today} messages...")
+                            self.redis_conn.set(break_key, "1", ex=break_duration + 1800)
                             await asyncio.wait_for(self.shutdown_event.wait(), timeout=break_duration)
                             continue
-
 
                     # 2. Check if account is globally rate limited for DMs
                     until_ts = self.redis_conn.get("health:user_session:dm_rate_limited_until")
@@ -3723,13 +3725,24 @@ class LeadValidator:
                         except ValueError:
                             pass
 
-                    # Strictly require contact_username
-                    target_username = contact_username
+                    # Strictly require valid contact_username
+                    target_username = contact_username.strip().lstrip('@') if contact_username else None
                     if not target_username:
-                        logging.warning(f"Campaign Dispatcher: No direct contact username found for lead ID: {lead_id}. Skipping channel board @{channel_username}.")
+                        logging.info(f"Campaign Dispatcher: No direct contact username for lead {lead_id} (@{channel_username}). Marking as skipped.")
                         cur.execute(
-                            "UPDATE campaign_logs SET status = 'failed', error_message = %s, sent_at = %s WHERE id = %s",
-                            ("No owner or admin contact username resolved for this channel", datetime.now(), log_id)
+                            "UPDATE campaign_logs SET status = 'skipped', error_message = 'No contact username', sent_at = %s WHERE id = %s",
+                            (datetime.now(), log_id)
+                        )
+                        conn.commit()
+                        continue
+
+                    # Skip bot accounts or system keywords
+                    target_lower = target_username.lower()
+                    if target_lower.endswith('bot') or target_lower.endswith('_bot') or target_lower in ('addlist', 'everyone', 'share', 'joinchat', 'setlanguage', 'proxy', 'socks', 'c', 's', 'm', 'i', '4030'):
+                        logging.info(f"Campaign Dispatcher: @{target_username} is a bot or system keyword. Skipping log ID {log_id}.")
+                        cur.execute(
+                            "UPDATE campaign_logs SET status = 'skipped', error_message = 'Invalid contact: bot or system keyword', sent_at = %s WHERE id = %s",
+                            (datetime.now(), log_id)
                         )
                         conn.commit()
                         continue
@@ -3761,7 +3774,7 @@ class LeadValidator:
                         conn.commit()
                         continue
                         
-                    # 3. Message sending (using original unmodified text as requested)
+                    # 3. Message sending with multi-tier fallback (Album -> Single Photo -> Text Pitch)
                     logging.info(f"Campaign Dispatcher: Attempting outreach message delivery to @{target_username} (associated with channel @{channel_username})...")
                     
                     success = False
@@ -3771,12 +3784,16 @@ class LeadValidator:
                         peer = await user_client.get_input_entity(target_username)
                         media_files = self._resolve_media_list(media_path)
                         if media_files:
-                            if len(media_files) == 1:
-                                logging.info(f"Campaign Dispatcher: Sending message with single media: {media_files[0]}")
-                                await user_client.send_message(peer, message_text, file=media_files[0])
-                            else:
-                                logging.info(f"Campaign Dispatcher: Sending message with album of {len(media_files)} images...")
-                                await user_client.send_file(peer, media_files, caption=message_text)
+                            try:
+                                if len(media_files) == 1:
+                                    logging.info(f"Campaign Dispatcher: Sending message with single media: {media_files[0]}")
+                                    await user_client.send_message(peer, message_text, file=media_files[0])
+                                else:
+                                    logging.info(f"Campaign Dispatcher: Sending message with album of {len(media_files)} images...")
+                                    await user_client.send_file(peer, media_files, caption=message_text)
+                            except Exception as media_err:
+                                logging.warning(f"Campaign Dispatcher: Media send failed for @{target_username} ({media_err}). Falling back to text-only pitch...")
+                                await user_client.send_message(peer, message_text)
                         else:
                             await user_client.send_message(peer, message_text)
                         success = True
@@ -3795,8 +3812,8 @@ class LeadValidator:
                         continue
                     except errors.PeerFloodError as peer_flood:
                         error_message = "Telegram PeerFloodError: Account is in temporary spam cooldown."
-                        logging.warning(f"Campaign Dispatcher: PeerFloodError hit on @{target_username}! Pausing outreach for 6 hours to protect account.")
-                        self.redis_conn.set(f"health:user_session:rate_limited_until", time.time() + 21600, ex=25000)
+                        logging.warning(f"Campaign Dispatcher: PeerFloodError hit on @{target_username}! Pausing outreach for 2 hours to protect account.")
+                        self.redis_conn.set("health:user_session:dm_rate_limited_until", time.time() + 7200, ex=8000)
                         # Keep lead as pending
                         cur.execute(
                             "UPDATE campaign_logs SET status = 'pending', error_message = NULL, sent_at = NULL WHERE id = %s",
@@ -3822,13 +3839,13 @@ class LeadValidator:
                         
                         if is_temporary:
                             logging.warning(f"Campaign Dispatcher: Temporary issue detected for @{target_username}: {error_message}. Will retry after cooldown.")
-                            self.redis_conn.set(f"health:user_session:rate_limited_until", time.time() + 600, ex=1200)
+                            self.redis_conn.set("health:user_session:dm_rate_limited_until", time.time() + 300, ex=600)
                             cur.execute(
                                 "UPDATE campaign_logs SET status = 'pending', error_message = NULL, sent_at = NULL WHERE id = %s",
                                 (log_id,)
                             )
                             conn.commit()
-                            await asyncio.sleep(600)
+                            await asyncio.sleep(300)
                             continue
                         else:
                             # Permanent error: privacy settings, deleted account, blocked DMs
@@ -3864,9 +3881,9 @@ class LeadValidator:
                         
                     conn.commit()
                     
-                # 4. Ultra-safe human-like random jitter: varies between 20 and 45 minutes
-                jitter_profile = random.randint(1200, 2700)
-                logging.info(f"Campaign Dispatcher: Ultra-safe jitter sleep: {jitter_profile}s (~{jitter_profile//60} min). Daily sent: {sent_today}/12.")
+                # 4. Safe human-like random jitter between sends (90 to 210 seconds)
+                jitter_profile = random.randint(jitter_min, jitter_max)
+                logging.info(f"Campaign Dispatcher: Pacing sleep: {jitter_profile}s (~{jitter_profile//60}m {jitter_profile%60}s). Daily sent: {sent_today}/{daily_limit}.")
                 await asyncio.wait_for(self.shutdown_event.wait(), timeout=jitter_profile)
                 
             except asyncio.TimeoutError:

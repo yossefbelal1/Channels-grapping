@@ -43,13 +43,14 @@ from app.core.db import get_db_connection
 async def send_telegram_message(client, peer, text, media_path=None):
     """
     Sub-dispatch function executed via tg_manager.execute_request
-    Supports single media or multi-image album.
+    Supports single media, multi-image album, and falls back to text if media upload is restricted.
     """
     if media_path:
         media_files = []
         if media_path.startswith('[') and media_path.endswith(']'):
             try:
-                media_files = [f for f in json.loads(media_path) if os.path.exists(f)]
+                paths = json.loads(media_path)
+                media_files = [p for p in paths if os.path.exists(p)]
             except Exception:
                 pass
         elif ',' in media_path:
@@ -58,13 +59,16 @@ async def send_telegram_message(client, peer, text, media_path=None):
             media_files = [media_path]
 
         if media_files:
-            if len(media_files) == 1:
-                logging.info(f"Sending message with single media: {media_files[0]}")
-                await client.send_message(peer, text, file=media_files[0])
-            else:
-                logging.info(f"Sending message with album of {len(media_files)} images...")
-                await client.send_file(peer, media_files, caption=text)
-            return True
+            try:
+                if len(media_files) == 1:
+                    logging.info(f"Sending message with single media: {media_files[0]}")
+                    await client.send_message(peer, text, file=media_files[0])
+                else:
+                    logging.info(f"Sending message with album of {len(media_files)} images...")
+                    await client.send_file(peer, media_files, caption=text)
+                return True
+            except Exception as media_err:
+                logging.warning(f"Media send failed ({media_err}). Falling back to text pitch...")
 
     await client.send_message(peer, text)
     return True

@@ -173,7 +173,8 @@ def get_campaigns():
                 FROM leads l
                 WHERE l.contact_username IS NOT NULL
                   AND l.contact_username != ''
-                  AND LOWER(l.contact_username) NOT IN ('addlist', 'share', 'joinchat', 'setlanguage', 'proxy', 'socks', 'c', 's', 'm', 'i')
+                  AND LOWER(l.contact_username) NOT LIKE '%bot'
+                  AND LOWER(l.contact_username) NOT IN ('addlist', 'everyone', 'share', 'joinchat', 'setlanguage', 'proxy', 'socks', 'c', 's', 'm', 'i', '4030')
                   AND (l.description IS NULL OR (l.description NOT LIKE 'Blacklisted entity%%' AND l.description NOT LIKE 'Entity does not exist%%'))
                   AND l.id NOT IN (SELECT lead_id FROM campaign_logs WHERE campaign_id = %s)
                 ON CONFLICT (id) DO NOTHING
