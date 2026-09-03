@@ -419,3 +419,58 @@ def test_23_idempotent_job_handling(mock_clients_and_redis):
 
     is_new_again, _, _ = prov.record_candidate_discovery("idempotent_lead", "telegram_global_search")
     assert is_new_again is False
+
+
+def test_26_post_search_engine_constructor_dependency_injection(mock_clients_and_redis):
+    """26: Verifies that TelegramPostSearchEngine constructor accepts global_search_engine dependency injection cleanly."""
+    mock_tg, mock_redis, mock_db = mock_clients_and_redis
+    global_engine = TelegramGlobalSearchEngine(
+        tg_manager=mock_tg,
+        redis_conn=mock_redis,
+        candidate_queue="queue:normal"
+    )
+
+    # Constructor with explicit keyword dependency injection
+    post_engine = TelegramPostSearchEngine(
+        tg_manager=mock_tg,
+        redis_conn=mock_redis,
+        candidate_queue="queue:normal",
+        global_search_engine=global_engine
+    )
+
+    assert post_engine.global_search_engine is global_engine
+    assert post_engine.candidate_queue == "queue:normal"
+
+
+def test_27_checkpoint_postgres_fallback_restores_offset_peer_when_redis_empty():
+    """27: Verifies PostgreSQL fallback restores full state including offset_peer_id and offset_peer_type when Redis is cleared."""
+    mock_redis = MagicMock()
+    mock_redis.get.return_value = None # Simulate Redis cache miss or loss
+
+    mock_db = MagicMock()
+    mock_cur = MagicMock()
+    mock_db.cursor.return_value.__enter__.return_value = mock_cur
+
+    # Mock DB row returned from discovery_checkpoints
+    mock_cur.fetchone.return_value = {
+        "offset_id": 89100,
+        "offset_rate": 250,
+        "offset_peer_id": 1987654321,
+        "offset_peer_type": "channel",
+        "offset_date": None,
+        "page_number": 4,
+        "total_yield": 42,
+        "status": "in_progress"
+    }
+
+    chk_mgr = SearchCheckpointManager(mock_redis, mock_db)
+    cp = chk_mgr.get_checkpoint("telegram_global_search", "XAUUSD")
+
+    assert cp is not None
+    assert cp["offset_id"] == 89100
+    assert cp["offset_rate"] == 250
+    assert cp["offset_peer_id"] == 1987654321
+    assert cp["offset_peer_type"] == "channel"
+    assert cp["page_number"] == 4
+    assert cp["total_yield"] == 42
+

@@ -75,6 +75,8 @@ CREATE TABLE IF NOT EXISTS discovery_checkpoints (
     query_key VARCHAR(255) NOT NULL,
     last_offset_rate INT DEFAULT 0,
     last_offset_id INT DEFAULT 0,
+    last_offset_peer_id BIGINT DEFAULT NULL,
+    last_offset_peer_type VARCHAR(50) DEFAULT NULL,
     last_offset_date TIMESTAMP,
     page_number INT DEFAULT 1,
     total_yield INT DEFAULT 0,
@@ -82,6 +84,9 @@ CREATE TABLE IF NOT EXISTS discovery_checkpoints (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uq_discovery_checkpoint UNIQUE (search_type, query_key)
 );
+
+ALTER TABLE discovery_checkpoints ADD COLUMN IF NOT EXISTS last_offset_peer_id BIGINT DEFAULT NULL;
+ALTER TABLE discovery_checkpoints ADD COLUMN IF NOT EXISTS last_offset_peer_type VARCHAR(50) DEFAULT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_discovery_checkpoints_type_status ON discovery_checkpoints(search_type, status);
 

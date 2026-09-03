@@ -73,17 +73,24 @@ class SearchCheckpointManager:
                     cur.execute("""
                         INSERT INTO discovery_checkpoints (
                             search_type, query_key, last_offset_id, last_offset_rate,
+                            last_offset_peer_id, last_offset_peer_type,
                             last_offset_date, page_number, total_yield, status, updated_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                         ON CONFLICT (search_type, query_key) DO UPDATE SET
                             last_offset_id = EXCLUDED.last_offset_id,
                             last_offset_rate = EXCLUDED.last_offset_rate,
+                            last_offset_peer_id = EXCLUDED.last_offset_peer_id,
+                            last_offset_peer_type = EXCLUDED.last_offset_peer_type,
                             last_offset_date = EXCLUDED.last_offset_date,
                             page_number = EXCLUDED.page_number,
                             total_yield = EXCLUDED.total_yield,
                             status = EXCLUDED.status,
                             updated_at = NOW();
-                    """, (search_type, query_key, offset_id, offset_rate, offset_date, page_number, total_yield, status))
+                    """, (
+                        search_type, query_key, offset_id, offset_rate,
+                        offset_peer_id, offset_peer_type,
+                        offset_date, page_number, total_yield, status
+                    ))
                 self.db.commit()
             except Exception as db_err:
                 logger.warning(f"Failed to persist search checkpoint in DB: {db_err}")
@@ -109,13 +116,26 @@ class SearchCheckpointManager:
                 with self.db.cursor() as cur:
                     cur.execute("""
                         SELECT last_offset_id as offset_id, last_offset_rate as offset_rate,
+                               last_offset_peer_id as offset_peer_id, last_offset_peer_type as offset_peer_type,
                                last_offset_date as offset_date, page_number, total_yield, status
                         FROM discovery_checkpoints
                         WHERE search_type = %s AND query_key = %s
                     """, (search_type, query_key))
                     row = cur.fetchone()
                     if row:
-                        return dict(row)
+                        if hasattr(row, 'keys') or isinstance(row, dict):
+                            return dict(row)
+                        else:
+                            return {
+                                "offset_id": row[0],
+                                "offset_rate": row[1],
+                                "offset_peer_id": row[2],
+                                "offset_peer_type": row[3],
+                                "offset_date": row[4],
+                                "page_number": row[5],
+                                "total_yield": row[6],
+                                "status": row[7]
+                            }
             except Exception as db_err:
                 logger.warning(f"Failed to read search checkpoint from DB: {db_err}")
                 try:
