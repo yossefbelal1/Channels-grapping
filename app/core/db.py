@@ -41,11 +41,14 @@ class PooledConnectionWrapper:
         self._pool = pool_instance
 
     def __enter__(self):
-        return self._conn
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type is not None:
-            self._conn.rollback()
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
         else:
             try:
                 self._conn.commit()
@@ -91,16 +94,25 @@ def get_raw_connection():
 def get_db_cursor(commit_on_success: bool = True):
     """
     Context manager for acquiring a pooled connection & cursor in a single with block.
+    Guarantees immediate and safe return of connection to pool.
     """
     conn = get_db_connection()
-    cursor = conn.cursor()
+    cur = None
     try:
-        yield cursor
+        cur = conn.cursor()
+        yield cur
         if commit_on_success:
             conn.commit()
     except Exception:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         raise
     finally:
-        cursor.close()
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
         conn.close()

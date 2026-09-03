@@ -1,0 +1,84 @@
+import json
+
+# Full aggregated list with new additions
+raw_list = [
+    # Major Tier 1 Networks & Hubs
+    {"username": "@farida_ads", "name": "Farida Ads (فريدة)", "tier": "Tier 1 (الكبرى)", "channels_count": "+25 قناة", "specialty": "إدارة إعلانات كبرى قنوات الذهب والفوركس والـ VIP", "score": 99},
+    {"username": "@Adsazza", "name": "Azza Ads (عزة)", "tier": "Tier 1 (الكبرى)", "channels_count": "+20 قناة", "specialty": "وسيطة إعلانات وتبادل ترافيك ومتابعين", "score": 98},
+    {"username": "@fatenexchange", "name": "Faten Exchange (فاتن)", "tier": "Tier 1 (الكبرى)", "channels_count": "+18 قناة", "specialty": "شبكة تبادل إعلاني وتمويل قنوات الفوركس", "score": 97},
+    {"username": "@adprofx", "name": "Ad Pro FX (دينا إعلانات)", "tier": "Tier 1 (الكبرى)", "channels_count": "+15 قناة", "specialty": "وكالة إعلانات وترويج قنوات التداول والفوركس", "score": 96},
+    {"username": "@EliteTradersAd", "name": "Elite Traders Ad Hub", "tier": "Tier 1 (الكبرى)", "channels_count": "+15 قناة", "specialty": "شبكة التبادل الإعلاني لقنوات التداول", "score": 95},
+    {"username": "@Growthengine_co", "name": "Growth Engine Official", "tier": "Tier 1 (الكبرى)", "channels_count": "+15 قناة", "specialty": "وكالة نمو وتمويل وشراء ترافيك للقنوات", "score": 94},
+    {"username": "@MaryamAds1", "name": "Maryam Ads (مريم)", "tier": "Tier 1 (الكبرى)", "channels_count": "+12 قناة", "specialty": "إدارة إعلانات قنوات الذهب والماسترز", "score": 93},
+    {"username": "@maysa_ads", "name": "Maysa Ads (مايسة)", "tier": "Tier 1 (الكبرى)", "channels_count": "+12 قناة", "specialty": "مسؤولة تسويق ونشر إعلاني ومؤثرين", "score": 92},
+    {"username": "@HagerAds", "name": "Hager Ads (هاجر)", "tier": "Tier 1 (الكبرى)", "channels_count": "+10 قنوات", "specialty": "مديرة تبادل إعلاني وتكبير قنوات التداول", "score": 91},
+    {"username": "@Mohamed_ads97", "name": "Mohamed Ads 97 (محمد)", "tier": "Tier 1 (الكبرى)", "channels_count": "+10 قنوات", "specialty": "ميديا باير وتسويق منصات التداول الرقمي", "score": 90},
+    {"username": "@protradersad", "name": "Pro Traders Ad Exchange", "tier": "Tier 1 (الكبرى)", "channels_count": "+10 قنوات", "specialty": "خدمات ترويج وتبادل قنوات المتداولين", "score": 89},
+    {"username": "@dinaads", "name": "Dina Ads (دينا)", "tier": "Tier 1 (الكبرى)", "channels_count": "+10 قنوات", "specialty": "تسويق قنوات الفوركس والتمويل الإعلاني", "score": 88},
+
+    # Tier 2 Active Specialized Marketers (Including New Additions)
+    {"username": "@ReemAds", "name": "Reem Ads (ريم)", "tier": "Tier 2 (متوسطة - نشطة جداً)", "channels_count": "+8 قنوات", "specialty": "إدارة حملات ترويجية وتبادل إعلاني مباشر", "score": 87},
+    {"username": "@Emanadsa", "name": "Eman Ads (إيمان)", "tier": "Tier 2 (متوسطة - نشطة جداً)", "channels_count": "+8 قنوات", "specialty": "مسؤولة إعلانات قنوات واستقبال رعايات", "score": 86},
+    {"username": "@Asmaaa_ads", "name": "Asmaa Ads (أسماء)", "tier": "Tier 2 (متوسطة - نشطة جداً)", "channels_count": "+8 قنوات", "specialty": "تسويق وتبادل إعلاني لقنوات الفوركس والمال", "score": 85},
+    {"username": "@nonaads", "name": "Nona Ads (نونا / ناهد)", "tier": "Tier 2 (متوسطة - نشطة جداً)", "channels_count": "+8 قنوات", "specialty": "مسؤولة تبادل إعلاني وتكبير قنوات تداول", "score": 84},
+    {"username": "@Sarah_Ads", "name": "Sarah Ads (سارة)", "tier": "Tier 2 (متوسطة - نشطة جداً)", "channels_count": "+8 قنوات", "specialty": "إعلانات وترويج قنوات الكريبتو والتداول", "score": 83},
+    {"username": "@ADSSALMAa", "name": "Salma Ads (سلمى)", "tier": "Tier 2 (متوسطة - نشطة جداً)", "channels_count": "+7 قنوات", "specialty": "مسؤولة تسويق ونمو قنوات التداول", "score": 82},
+    {"username": "@MOKHTARR1", "name": "Mokhtar Ads (مختار)", "tier": "Tier 2 (متوسطة - نشطة جداً)", "channels_count": "+7 قنوات", "specialty": "ميديا باير وإدارة إعلانات الفوركس والشراكات", "score": 81},
+    {"username": "@AdSwift", "name": "AdSwift Agency", "tier": "Tier 2 (متوسطة - نشطة جداً)", "channels_count": "+7 قنوات", "specialty": "وكالة ترويج مالي وشراء ترافيك", "score": 80},
+    {"username": "@Lamar_Ads", "name": "Lamar Ads (لمار)", "tier": "Tier 2 (متوسطة - نشطة جداً)", "channels_count": "+6 قنوات", "specialty": "إدارة إعلانات وتبادل نشر يومي", "score": 79},
+    {"username": "@HayamAd2j", "name": "Hayam Ads (هيام)", "tier": "Tier 2 (متوسطة - نشطة جداً)", "channels_count": "+6 قنوات", "specialty": "مسؤولة تبادل إعلاني وترويج", "score": 78},
+    {"username": "@Jamilaads", "name": "Jamila Ads (جميلة)", "tier": "Tier 2 (متوسطة - نشطة جداً)", "channels_count": "+6 قنوات", "specialty": "ترويج منصات وقنوات VIP", "score": 77},
+    {"username": "@nancy_ads1", "name": "Nancy Ads (نانسي)", "tier": "Tier 2 (متوسطة - نشطة جداً)", "channels_count": "+6 قنوات", "specialty": "مسؤولة إعلانات قنوات نشطة", "score": 76},
+    {"username": "@rahma4565", "name": "Rahma Ads (رحمة)", "tier": "Tier 2 (متوسطة - نشطة جداً)", "channels_count": "+6 قنوات", "specialty": "تبادل إعلاني وتزويد تفاعل", "score": 75},
+    {"username": "@lis_anihad", "name": "Nihad Trading (نهاد)", "tier": "Tier 2 (متوسطة - نشطة جداً)", "channels_count": "+5 قنوات", "specialty": "مسؤولة تواصل وإعلانات في قنوات المليونير", "score": 74},
+    {"username": "@nahed_ads", "name": "Nahed Ads (ناهد)", "tier": "Tier 2 (متوسطة - نشطة جداً)", "channels_count": "+5 قنوات", "specialty": "حساب حجز وتبادل إعلانات القنوات", "score": 73},
+
+    # Tier 3 Individual Channels & Direct Promoters
+    {"username": "@joee_ads", "name": "Joee Ads (جو)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+4 قنوات", "specialty": "تسويق قنوات وتبادل", "score": 72},
+    {"username": "@AdsSafwat", "name": "Safwat Ads (صفوت)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+4 قنوات", "specialty": "إدارة إعلانات تجارية", "score": 71},
+    {"username": "@Emanads000", "name": "Eman Ads 2", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+4 قنوات", "specialty": "حساب احتياطي للإعلانات", "score": 70},
+    {"username": "@faridaads", "name": "Farida Ads 2", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+4 قنوات", "specialty": "حساب فرعي لفريدة إعلانات", "score": 69},
+    {"username": "@Mairaads", "name": "Maira Ads (مايرا)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+4 قنوات", "specialty": "ترويج ونشر وتبادل", "score": 68},
+    {"username": "@lina_bnm", "name": "Lina (لينا)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+3 قنوات", "specialty": "تبادل إعلاني وتوجيه منشورات", "score": 67},
+    {"username": "@mai_promoter", "name": "Mai Promoter (مي)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+3 قنوات", "specialty": "بروموشن وزيادة مشاهدات", "score": 66},
+    {"username": "@abdo0o0o0oo", "name": "Abdo Ads (عبده)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+3 قنوات", "specialty": "إدارة إعلانات قنوات", "score": 65},
+    {"username": "@MohammedAds33", "name": "Mohammed Ads 33", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+3 قنوات", "specialty": "ترويج قنوات تداول", "score": 64},
+    {"username": "@AesyGul", "name": "Aesy Gul", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+3 قنوات", "specialty": "تبادل نشر وتفاعل", "score": 63},
+    {"username": "@Maha2210", "name": "Maha Ads (مها)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+3 قنوات", "specialty": "مسؤولة تبادل إعلاني", "score": 62},
+    {"username": "@Elsaidd22", "name": "Elsaid Ads (السيد)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+3 قنوات", "specialty": "إعلانات وتمويل", "score": 61},
+    {"username": "@uniqads2", "name": "Uniq Ads", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+3 قنوات", "specialty": "خدمات ترويج قنوات", "score": 60},
+    {"username": "@Meromero3131", "name": "Mero Mero (ميرو)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+3 قنوات", "specialty": "تبادل ونشر قنوات", "score": 59},
+    {"username": "@mayar_medhat1012", "name": "Mayar Medhat (ميار)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+3 قنوات", "specialty": "مسؤولة إعلانات قنوات", "score": 58},
+    {"username": "@Abou_yaqoub", "name": "Abou Yaqoub (أبو يعقوب)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+3 قنوات", "specialty": "إدارة قنوات وتواصل إعلاني", "score": 57},
+    {"username": "@EmaAds", "name": "Ema Ads (إيما)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+3 قنوات", "specialty": "ترويج وتبادل قنوات", "score": 56},
+    {"username": "@Stateuntied_ads", "name": "Stateunited Ads", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+2 قنوات", "specialty": "إعلانات قنوات متنوعة", "score": 55},
+    {"username": "@Khaled_ads", "name": "Khaled Ads (خالد)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+2 قنوات", "specialty": "شراء مساحات إعلانية", "score": 54},
+    {"username": "@malak_ads22", "name": "Malak Ads 22 (ملك)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+2 قنوات", "specialty": "تبادل إعلاني وتزويد متابعين", "score": 53},
+    {"username": "@Maya_ADS1", "name": "Maya Ads (مايا)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+2 قنوات", "specialty": "إعلانات وترويج قنوات", "score": 52},
+    {"username": "@Node231", "name": "Node Ads (نود)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+2 قنوات", "specialty": "تبادل نشر", "score": 51},
+    {"username": "@Dododede23", "name": "Dodo Dede (دودو)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+2 قنوات", "specialty": "إعلانات قنوات تفاعلية", "score": 50},
+    {"username": "@Malaaaakads", "name": "Malak Ads (ملاك)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+2 قنوات", "specialty": "مسؤولة تبادل", "score": 49},
+    {"username": "@Mohamedben392", "name": "Mohamed Ben", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+2 قنوات", "specialty": "إدارة قنوات", "score": 48},
+    {"username": "@Ggfigt", "name": "Ggfigt Ads", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+2 قنوات", "specialty": "تبادل قنوات", "score": 47},
+    {"username": "@zeyad3112", "name": "Zeyad Ads (زياد)", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+2 قنوات", "specialty": "ميديا باير وترويج", "score": 46},
+    {"username": "@ADSONLYF", "name": "Ads Only Official", "tier": "Tier 3 (قنوات مباشرة ومسوقون)", "channels_count": "+2 قنوات", "specialty": "حساب إعلانات فقط", "score": 45}
+]
+
+# Strict deduplication
+seen = set()
+deduped = []
+for item in raw_list:
+    u = item['username'].lower()
+    if u not in seen:
+        seen.add(u)
+        deduped.append(item)
+
+# Sort strictly by score descending
+deduped.sort(key=lambda x: x['score'], reverse=True)
+
+print(f"Total Unique Classified Advertisers: {len(deduped)}")
+
+with open('final_ranked_master_advertisers.json', 'w', encoding='utf-8') as f:
+    json.dump(deduped, f, ensure_ascii=False, indent=2)
+
+print("Saved ranked list to final_ranked_master_advertisers.json")

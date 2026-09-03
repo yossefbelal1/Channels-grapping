@@ -130,31 +130,24 @@ def start_campaign(req: CampaignRequest):
     try:
         # Sanitize media path against traversal
         safe_media_path = sanitize_media_path(req.media_path)
-
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
         campaign_id = str(uuid.uuid4())
-        
-        # 1. Insert Campaign
-        cur.execute(
-            "INSERT INTO campaigns (id, message_text, media_path, status, created_at) VALUES (%s, %s, %s, %s, %s)",
-            (campaign_id, req.message_text, safe_media_path, "active", datetime.now())
-        )
-        
-        # 2. Batch-insert Pending Logs
         inserted_logs = 0
-        for lead_id in req.selected_lead_ids:
-            log_id = str(uuid.uuid4())
+
+        with get_db_cursor(commit_on_success=True) as cur:
+            # 1. Insert Campaign
             cur.execute(
-                "INSERT INTO campaign_logs (id, campaign_id, lead_id, status) VALUES (%s, %s, %s, %s)",
-                (log_id, campaign_id, lead_id, "pending")
+                "INSERT INTO campaigns (id, message_text, media_path, status, created_at) VALUES (%s, %s, %s, %s, %s)",
+                (campaign_id, req.message_text, safe_media_path, "active", datetime.now())
             )
-            inserted_logs += 1
             
-        conn.commit()
-        cur.close()
-        conn.close()
+            # 2. Batch-insert Pending Logs
+            for lead_id in req.selected_lead_ids:
+                log_id = str(uuid.uuid4())
+                cur.execute(
+                    "INSERT INTO campaign_logs (id, campaign_id, lead_id, status) VALUES (%s, %s, %s, %s)",
+                    (log_id, campaign_id, lead_id, "pending")
+                )
+                inserted_logs += 1
         
         logging.info(f"Outreach Campaign started: ID {campaign_id} with {inserted_logs} recipient leads.")
         return {
@@ -169,63 +162,57 @@ def start_campaign(req: CampaignRequest):
 @app.get("/api/campaigns", dependencies=[Depends(verify_dashboard_auth)])
 def get_campaigns():
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # 0. Auto-enqueue any unqueued eligible leads into active campaign
-        cur.execute("SELECT id FROM campaigns WHERE status = 'active' ORDER BY created_at DESC LIMIT 1")
-        active_camp = cur.fetchone()
-        if active_camp:
-            active_campaign_id = active_camp['id']
-            cur.execute("""
-                INSERT INTO campaign_logs (id, campaign_id, lead_id, status)
-                SELECT gen_random_uuid(), %s, l.id, 'pending'
-                FROM leads l
-                WHERE l.contact_username IS NOT NULL
-                  AND l.contact_username != ''
-                  AND LOWER(l.contact_username) NOT LIKE '%%bot'
-                  AND LOWER(l.contact_username) NOT LIKE '%%_bot'
-                  AND LOWER(l.contact_username) NOT IN ('addlist', 'everyone', 'share', 'joinchat', 'setlanguage', 'proxy', 'socks', 'c', 's', 'm', 'i', '4030')
-                  AND (l.description IS NULL OR (l.description NOT LIKE 'Blacklisted entity%%' AND l.description NOT LIKE 'Entity does not exist%%'))
-                  AND l.id NOT IN (SELECT lead_id FROM campaign_logs WHERE campaign_id = %s)
-                ON CONFLICT (id) DO NOTHING
-            """, (active_campaign_id, active_campaign_id))
-            conn.commit()
+        with get_db_cursor(commit_on_success=True) as cur:
+            # 0. Auto-enqueue any unqueued eligible leads into active campaign
+            cur.execute("SELECT id FROM campaigns WHERE status = 'active' ORDER BY created_at DESC LIMIT 1")
+            active_camp = cur.fetchone()
+            if active_camp:
+                active_campaign_id = active_camp['id']
+                cur.execute("""
+                    INSERT INTO campaign_logs (id, campaign_id, lead_id, status)
+                    SELECT gen_random_uuid(), %s, l.id, 'pending'
+                    FROM leads l
+                    WHERE l.contact_username IS NOT NULL
+                      AND l.contact_username != ''
+                      AND LOWER(l.contact_username) NOT LIKE '%%bot'
+                      AND LOWER(l.contact_username) NOT LIKE '%%_bot'
+                      AND LOWER(l.contact_username) NOT IN ('addlist', 'everyone', 'share', 'joinchat', 'setlanguage', 'proxy', 'socks', 'c', 's', 'm', 'i', '4030')
+                      AND (l.description IS NULL OR (l.description NOT LIKE 'Blacklisted entity%%' AND l.description NOT LIKE 'Entity does not exist%%'))
+                      AND l.id NOT IN (SELECT lead_id FROM campaign_logs WHERE campaign_id = %s)
+                    ON CONFLICT (id) DO NOTHING
+                """, (active_campaign_id, active_campaign_id))
 
-        # 1. Fetch campaigns along with aggregated status counts (including follow-up counts)
-        cur.execute("""
-            SELECT c.id, c.created_at, c.message_text, c.media_path, c.status,
-                   c.followup_enabled, c.followup_message_text, c.followup_delay_days,
-                   COUNT(cl.id) as total_recipients,
-                   COUNT(CASE WHEN cl.status = 'sent' THEN 1 END) as sent_count,
-                   COUNT(CASE WHEN cl.status = 'failed' THEN 1 END) as failed_count,
-                   COUNT(CASE WHEN cl.status = 'skipped' THEN 1 END) as skipped_count,
-                   COUNT(CASE WHEN cl.status = 'pending' THEN 1 END) as pending_count,
-                   COUNT(CASE WHEN cl.followup_status = 'sent' THEN 1 END) as followup_sent_count,
-                   COUNT(CASE WHEN cl.user_replied = TRUE THEN 1 END) as replied_count,
-                   COUNT(CASE WHEN cl.status = 'sent' AND (cl.followup_status IS NULL OR cl.followup_status = 'pending') AND cl.user_replied = FALSE AND cl.sent_at < NOW() - (COALESCE(c.followup_delay_days, 4) || ' days')::INTERVAL THEN 1 END) as followup_ready_count
-            FROM campaigns c
-            LEFT JOIN campaign_logs cl ON c.id = cl.campaign_id
-            GROUP BY c.id, c.created_at, c.message_text, c.media_path, c.status, c.followup_enabled, c.followup_message_text, c.followup_delay_days
-            ORDER BY c.created_at DESC
-        """)
-        campaigns = cur.fetchall()
-        
-        # 2. Fetch latest 50 logs with target channel info
-        cur.execute("""
-            SELECT cl.campaign_id, cl.status, cl.error_message, cl.sent_at,
-                   l.channel_username, l.contact_username, c.message_text
-            FROM campaign_logs cl
-            JOIN campaigns c ON cl.campaign_id = c.id
-            JOIN leads l ON cl.lead_id = l.id
-            ORDER BY cl.sent_at DESC NULLS FIRST, c.created_at DESC
-            LIMIT 50
-        """)
-        logs = cur.fetchall()
-        
-        cur.close()
-        conn.close()
-        
+            # 1. Fetch campaigns along with aggregated status counts (including follow-up counts)
+            cur.execute("""
+                SELECT c.id, c.created_at, c.message_text, c.media_path, c.status,
+                       c.followup_enabled, c.followup_message_text, c.followup_delay_days,
+                       COUNT(cl.id) as total_recipients,
+                       COUNT(CASE WHEN cl.status = 'sent' THEN 1 END) as sent_count,
+                       COUNT(CASE WHEN cl.status = 'failed' THEN 1 END) as failed_count,
+                       COUNT(CASE WHEN cl.status = 'skipped' THEN 1 END) as skipped_count,
+                       COUNT(CASE WHEN cl.status = 'pending' THEN 1 END) as pending_count,
+                       COUNT(CASE WHEN cl.followup_status = 'sent' THEN 1 END) as followup_sent_count,
+                       COUNT(CASE WHEN cl.user_replied = TRUE THEN 1 END) as replied_count,
+                       COUNT(CASE WHEN cl.status = 'sent' AND (cl.followup_status IS NULL OR cl.followup_status = 'pending') AND cl.user_replied = FALSE AND cl.sent_at < NOW() - (COALESCE(c.followup_delay_days, 4) || ' days')::INTERVAL THEN 1 END) as followup_ready_count
+                FROM campaigns c
+                LEFT JOIN campaign_logs cl ON c.id = cl.campaign_id
+                GROUP BY c.id, c.created_at, c.message_text, c.media_path, c.status, c.followup_enabled, c.followup_message_text, c.followup_delay_days
+                ORDER BY c.created_at DESC
+            """)
+            campaigns = cur.fetchall()
+            
+            # 2. Fetch latest 50 logs with target channel info
+            cur.execute("""
+                SELECT cl.campaign_id, cl.status, cl.error_message, cl.sent_at,
+                       l.channel_username, l.contact_username, c.message_text
+                FROM campaign_logs cl
+                JOIN campaigns c ON cl.campaign_id = c.id
+                JOIN leads l ON cl.lead_id = l.id
+                ORDER BY cl.sent_at DESC NULLS FIRST, c.created_at DESC
+                LIMIT 50
+            """)
+            logs = cur.fetchall()
+            
         return {
             "success": True,
             "campaigns": campaigns,
@@ -245,47 +232,42 @@ def get_leads(
     arabic_only: bool = Query(None, alias="arabicOnly")
 ):
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Build query dynamically
-        # Only show genuinely qualified leads: must have score>=10, real member count, and not be a dummy/broken record
-        query = """SELECT * FROM leads WHERE status = 'new' AND last_scan IS NOT NULL
-            AND lead_score >= 10
-            AND member_count > 0
-            AND (description IS NULL OR description NOT LIKE 'Blacklisted entity%%')
-            AND (description IS NULL OR description NOT LIKE 'Entity does not exist%%')"""
-        params = []
-        
-        if min_score is not None:
-            query += " AND lead_score >= %s"
-            params.append(min_score)
-        if has_vip:
-            query += " AND vip = TRUE"
-        if has_ac_mgmt:
-            query += " AND account_management = TRUE"
-        if has_website:
-            query += " AND website IS NOT NULL AND website != ''"
-        if has_whatsapp:
-            query += " AND whatsapp IS NOT NULL AND whatsapp != ''"
-        if arabic_only:
-            query += " AND language = 'Arabic'"
+        with get_db_cursor(commit_on_success=False) as cur:
+            # Build query dynamically
+            # Only show genuinely qualified leads: must have score>=10, real member count, and not be a dummy/broken record
+            query = """SELECT * FROM leads WHERE status = 'new' AND last_scan IS NOT NULL
+                AND lead_score >= 10
+                AND member_count > 0
+                AND (description IS NULL OR description NOT LIKE 'Blacklisted entity%%')
+                AND (description IS NULL OR description NOT LIKE 'Entity does not exist%%')"""
+            params = []
             
-        query += " ORDER BY lead_score DESC"
-        
-        cur.execute(query, params)
-        leads = cur.fetchall()
-        
-        # Get count of blacklist and total posts for stats
-        cur.execute("SELECT COUNT(*) as count FROM blacklist")
-        blacklist_count = cur.fetchone()["count"]
-        
-        cur.execute("SELECT COUNT(*) as count FROM channel_posts")
-        posts_count = cur.fetchone()["count"]
-        
-        cur.close()
-        conn.close()
-        
+            if min_score is not None:
+                query += " AND lead_score >= %s"
+                params.append(min_score)
+            if has_vip:
+                query += " AND vip = TRUE"
+            if has_ac_mgmt:
+                query += " AND account_management = TRUE"
+            if has_website:
+                query += " AND website IS NOT NULL AND website != ''"
+            if has_whatsapp:
+                query += " AND whatsapp IS NOT NULL AND whatsapp != ''"
+            if arabic_only:
+                query += " AND language = 'Arabic'"
+                
+            query += " ORDER BY lead_score DESC"
+            
+            cur.execute(query, params)
+            leads = cur.fetchall()
+            
+            # Get count of blacklist and total posts for stats
+            cur.execute("SELECT COUNT(*) as count FROM blacklist")
+            blacklist_count = cur.fetchone()["count"]
+            
+            cur.execute("SELECT COUNT(*) as count FROM channel_posts")
+            posts_count = cur.fetchone()["count"]
+            
         return {
             "success": True,
             "leads": leads,
@@ -303,114 +285,109 @@ def get_leads(
 @app.get("/api/leaderboards", dependencies=[Depends(verify_dashboard_auth)])
 def get_leaderboards():
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # 1. Top VIP Sellers
-        cur.execute("""
-            SELECT channel_username, lead_score, tier, member_count 
-            FROM leads 
-            WHERE vip = TRUE AND status != 'rejected' 
-            ORDER BY lead_score DESC, member_count DESC 
-            LIMIT 10
-        """)
-        top_vip = cur.fetchall()
-        
-        # 2. Top Account Managers
-        cur.execute("""
-            SELECT channel_username, lead_score, tier, member_count 
-            FROM leads 
-            WHERE account_management = TRUE AND status != 'rejected' 
-            ORDER BY lead_score DESC, member_count DESC 
-            LIMIT 10
-        """)
-        top_ac_mgmt = cur.fetchall()
-        
-        # 3. Top Copy Trading Providers
-        cur.execute("""
-            SELECT channel_username, lead_score, tier, member_count 
-            FROM leads 
-            WHERE copy_trading = TRUE AND status != 'rejected' 
-            ORDER BY lead_score DESC, member_count DESC 
-            LIMIT 10
-        """)
-        top_copy = cur.fetchall()
-        
-        # 4. Top Funded Account Providers
-        cur.execute("""
-            SELECT channel_username, lead_score, tier, member_count 
-            FROM leads 
-            WHERE funded_accounts = TRUE AND status != 'rejected' 
-            ORDER BY lead_score DESC, member_count DESC 
-            LIMIT 10
-        """)
-        top_funded = cur.fetchall()
-        
-        # 5. Most Connected Channels
-        cur.execute("""
-            SELECT l.channel_username, 
-                   ((SELECT COUNT(*) FROM channel_graph WHERE source_channel_id = l.id) + 
-                    (SELECT COUNT(*) FROM channel_graph WHERE target_channel_id = l.id)) as connection_count,
-                   l.lead_score, l.tier
-            FROM leads l
-            WHERE l.status != 'rejected'
-            ORDER BY connection_count DESC, l.lead_score DESC
-            LIMIT 10;
-        """)
-        most_connected = cur.fetchall()
-        
-        # 6. Most Advertised Channels
-        cur.execute("""
-            SELECT l.channel_username, COUNT(cg.target_channel_id) as ad_count, l.lead_score, l.tier
-            FROM leads l
-            JOIN channel_graph cg ON l.id = cg.target_channel_id
-            WHERE l.status != 'rejected'
-            GROUP BY l.channel_username, l.lead_score, l.tier
-            ORDER BY ad_count DESC, l.lead_score DESC
-            LIMIT 10;
-        """)
-        most_advertised = cur.fetchall()
-        
-        # 7. Highest Lead Score
-        cur.execute("""
-            SELECT channel_username, lead_score, tier, member_count 
-            FROM leads 
-            WHERE status != 'rejected' 
-            ORDER BY lead_score DESC, member_count DESC 
-            LIMIT 10
-        """)
-        highest_score = cur.fetchall()
-        
-        # 8. Fastest Growing Channels
-        # Growth tracked by new graph connections in last 30 days, fallback to member_count
-        cur.execute("""
-            SELECT l.channel_username, COALESCE(growth.cnt, 0) as growth_count, l.lead_score, l.tier, l.member_count
-            FROM leads l
-            LEFT JOIN (
-                SELECT source_channel_id, COUNT(*) as cnt 
-                FROM channel_graph 
-                WHERE created_at >= NOW() - INTERVAL '30 days' 
-                GROUP BY source_channel_id
-            ) growth ON l.id = growth.source_channel_id
-            WHERE l.status != 'rejected'
-            ORDER BY growth_count DESC, l.member_count DESC
-            LIMIT 10;
-        """)
-        fastest_growing = cur.fetchall()
-        
-        # 9. Highest Marketplace Score
-        cur.execute("""
-            SELECT channel_username, marketplace_score, lead_score, tier 
-            FROM leads 
-            WHERE is_group = TRUE AND status != 'rejected' 
-            ORDER BY marketplace_score DESC, lead_score DESC 
-            LIMIT 10
-        """)
-        highest_marketplace = cur.fetchall()
-        
-        cur.close()
-        conn.close()
-        
+        with get_db_cursor(commit_on_success=False) as cur:
+            # 1. Top VIP Sellers
+            cur.execute("""
+                SELECT channel_username, lead_score, tier, member_count 
+                FROM leads 
+                WHERE vip = TRUE AND status != 'rejected' 
+                ORDER BY lead_score DESC, member_count DESC 
+                LIMIT 10
+            """)
+            top_vip = cur.fetchall()
+            
+            # 2. Top Account Managers
+            cur.execute("""
+                SELECT channel_username, lead_score, tier, member_count 
+                FROM leads 
+                WHERE account_management = TRUE AND status != 'rejected' 
+                ORDER BY lead_score DESC, member_count DESC 
+                LIMIT 10
+            """)
+            top_ac_mgmt = cur.fetchall()
+            
+            # 3. Top Copy Trading Providers
+            cur.execute("""
+                SELECT channel_username, lead_score, tier, member_count 
+                FROM leads 
+                WHERE copy_trading = TRUE AND status != 'rejected' 
+                ORDER BY lead_score DESC, member_count DESC 
+                LIMIT 10
+            """)
+            top_copy = cur.fetchall()
+            
+            # 4. Top Funded Account Providers
+            cur.execute("""
+                SELECT channel_username, lead_score, tier, member_count 
+                FROM leads 
+                WHERE funded_accounts = TRUE AND status != 'rejected' 
+                ORDER BY lead_score DESC, member_count DESC 
+                LIMIT 10
+            """)
+            top_funded = cur.fetchall()
+            
+            # 5. Most Connected Channels
+            cur.execute("""
+                SELECT l.channel_username, 
+                       ((SELECT COUNT(*) FROM channel_graph WHERE source_channel_id = l.id) + 
+                        (SELECT COUNT(*) FROM channel_graph WHERE target_channel_id = l.id)) as connection_count,
+                       l.lead_score, l.tier
+                FROM leads l
+                WHERE l.status != 'rejected'
+                ORDER BY connection_count DESC, l.lead_score DESC
+                LIMIT 10;
+            """)
+            most_connected = cur.fetchall()
+            
+            # 6. Most Advertised Channels
+            cur.execute("""
+                SELECT l.channel_username, COUNT(cg.target_channel_id) as ad_count, l.lead_score, l.tier
+                FROM leads l
+                JOIN channel_graph cg ON l.id = cg.target_channel_id
+                WHERE l.status != 'rejected'
+                GROUP BY l.channel_username, l.lead_score, l.tier
+                ORDER BY ad_count DESC, l.lead_score DESC
+                LIMIT 10;
+            """)
+            most_advertised = cur.fetchall()
+            
+            # 7. Highest Lead Score
+            cur.execute("""
+                SELECT channel_username, lead_score, tier, member_count 
+                FROM leads 
+                WHERE status != 'rejected' 
+                ORDER BY lead_score DESC, member_count DESC 
+                LIMIT 10
+            """)
+            highest_score = cur.fetchall()
+            
+            # 8. Fastest Growing Channels
+            # Growth tracked by new graph connections in last 30 days, fallback to member_count
+            cur.execute("""
+                SELECT l.channel_username, COALESCE(growth.cnt, 0) as growth_count, l.lead_score, l.tier, l.member_count
+                FROM leads l
+                LEFT JOIN (
+                    SELECT source_channel_id, COUNT(*) as cnt 
+                    FROM channel_graph 
+                    WHERE created_at >= NOW() - INTERVAL '30 days' 
+                    GROUP BY source_channel_id
+                ) growth ON l.id = growth.source_channel_id
+                WHERE l.status != 'rejected'
+                ORDER BY growth_count DESC, l.member_count DESC
+                LIMIT 10;
+            """)
+            fastest_growing = cur.fetchall()
+            
+            # 9. Highest Marketplace Score
+            cur.execute("""
+                SELECT channel_username, marketplace_score, lead_score, tier 
+                FROM leads 
+                WHERE is_group = TRUE AND status != 'rejected' 
+                ORDER BY marketplace_score DESC, lead_score DESC 
+                LIMIT 10
+            """)
+            highest_marketplace = cur.fetchall()
+            
         return {
             "success": True,
             "top_vip": top_vip,
@@ -431,21 +408,18 @@ def get_leaderboards():
 @app.get("/api/group_metrics", dependencies=[Depends(verify_dashboard_auth)])
 def get_group_metrics():
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT l.channel_username as group_username, gm.messages_scanned, gm.mentions_count, 
-                   gm.telegram_links_count, gm.advertisements_count, gm.marketplace_score, 
-                   gm.last_scan, l.member_count
-            FROM group_metrics gm
-            JOIN leads l ON gm.group_id = l.id
-            WHERE l.status != 'rejected'
-            ORDER BY gm.marketplace_score DESC, gm.last_scan DESC
-            LIMIT 50
-        """)
-        metrics = cur.fetchall()
-        cur.close()
-        conn.close()
+        with get_db_cursor(commit_on_success=False) as cur:
+            cur.execute("""
+                SELECT l.channel_username as group_username, gm.messages_scanned, gm.mentions_count, 
+                       gm.telegram_links_count, gm.advertisements_count, gm.marketplace_score, 
+                       gm.last_scan, l.member_count
+                FROM group_metrics gm
+                JOIN leads l ON gm.group_id = l.id
+                WHERE l.status != 'rejected'
+                ORDER BY gm.marketplace_score DESC, gm.last_scan DESC
+                LIMIT 50
+            """)
+            metrics = cur.fetchall()
         return {"success": True, "metrics": metrics}
     except Exception as e:
         logging.error(f"Error fetching group metrics: {e}")
@@ -455,114 +429,109 @@ def get_group_metrics():
 @app.get("/api/discovery_stats", dependencies=[Depends(verify_dashboard_auth)])
 def get_discovery_stats():
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # 1. Top Arabic Keywords (Phase 7 & Phase 8)
-        cur.execute("""
-            SELECT discovery_source as keyword, COUNT(*) as discovered_channels, COUNT(*) FILTER (WHERE lead_score >= 50) as high_quality_leads,
-                   CASE WHEN COUNT(*) > 0 THEN CAST((COUNT(*) FILTER (WHERE lead_score >= 50) * 100.0 / COUNT(*)) AS INT) ELSE 0 END as quality_score
-            FROM leads
-            WHERE is_group = FALSE AND discovery_method = 'telegram_search' AND (language = 'Arabic' OR arabic_score >= 40)
-            GROUP BY discovery_source
-            ORDER BY discovered_channels DESC, quality_score DESC
-            LIMIT 20
-        """)
-        top_keywords = cur.fetchall()
-        
-        # 2. Top Arabic Discovery Sources (Phase 7)
-        cur.execute("""
-            SELECT discovery_source as source_name, 
-                   CASE WHEN discovery_method = 'telegram_search' THEN 'keyword' ELSE 'group' END as source_type,
-                   MAX(discovery_source) as keyword,
-                   COUNT(*) as discovered_channels,
-                   COUNT(*) FILTER (WHERE lead_score >= 50) as high_quality_leads,
-                   CASE WHEN COUNT(*) > 0 THEN CAST((COUNT(*) FILTER (WHERE lead_score >= 50) * 100.0 / COUNT(*)) AS INT) ELSE 0 END as quality_score,
-                   MAX(discovered_at) as last_discovery
-            FROM leads
-            WHERE is_group = FALSE AND (language = 'Arabic' OR arabic_score >= 40)
-            GROUP BY discovery_source, discovery_method
-            ORDER BY discovered_channels DESC
-            LIMIT 20
-        """)
-        top_sources = cur.fetchall()
-        for r in top_sources:
-            if r.get('last_discovery'):
-                r['last_discovery'] = r['last_discovery'].isoformat()
-        
-        # 3. Top Arabic Marketplace Groups (Phase 7: ordered by Arabic channels discovered)
-        cur.execute("""
-            SELECT l.channel_username as group_username, l.marketplace_score, l.member_count,
-                   0 as messages_scanned,
-                   (SELECT COUNT(*) FROM channel_graph cg JOIN leads l2 ON cg.target_channel_id = l2.id WHERE cg.source_channel_id = l.id AND (l2.language = 'Arabic' OR l2.arabic_score >= 40)) as advertisements_count
-            FROM leads l
-            WHERE l.is_group = TRUE AND l.status != 'rejected'
-            ORDER BY advertisements_count DESC, l.marketplace_score DESC, l.member_count DESC
-            LIMIT 20
-        """)
-        top_marketplace_groups = cur.fetchall()
-        
-        # 4. Arabic Channels Discovered Per Day (last 14 days)
-        cur.execute("""
-            SELECT DATE(discovered_at) as date, COUNT(*) as count
-            FROM leads
-            WHERE is_group = FALSE AND (language = 'Arabic' OR arabic_score >= 40)
-            GROUP BY DATE(discovered_at)
-            ORDER BY DATE(discovered_at) DESC
-            LIMIT 14
-        """)
-        discovered_per_day = cur.fetchall()
-        for r in discovered_per_day:
-            r['date'] = str(r['date'])
+        with get_db_cursor(commit_on_success=False) as cur:
+            # 1. Top Arabic Keywords (Phase 7 & Phase 8)
+            cur.execute("""
+                SELECT discovery_source as keyword, COUNT(*) as discovered_channels, COUNT(*) FILTER (WHERE lead_score >= 50) as high_quality_leads,
+                       CASE WHEN COUNT(*) > 0 THEN CAST((COUNT(*) FILTER (WHERE lead_score >= 50) * 100.0 / COUNT(*)) AS INT) ELSE 0 END as quality_score
+                FROM leads
+                WHERE is_group = FALSE AND discovery_method = 'telegram_search' AND (language = 'Arabic' OR arabic_score >= 40)
+                GROUP BY discovery_source
+                ORDER BY discovered_channels DESC, quality_score DESC
+                LIMIT 20
+            """)
+            top_keywords = cur.fetchall()
             
-        # 5. Arabic High Quality Leads Per Day (last 14 days)
-        cur.execute("""
-            SELECT DATE(discovered_at) as date, COUNT(*) as count
-            FROM leads
-            WHERE is_group = FALSE AND lead_score >= 50 AND (language = 'Arabic' OR arabic_score >= 40)
-            GROUP BY DATE(discovered_at)
-            ORDER BY DATE(discovered_at) DESC
-            LIMIT 14
-        """)
-        hq_leads_per_day = cur.fetchall()
-        for r in hq_leads_per_day:
-            r['date'] = str(r['date'])
+            # 2. Top Arabic Discovery Sources (Phase 7)
+            cur.execute("""
+                SELECT discovery_source as source_name, 
+                       CASE WHEN discovery_method = 'telegram_search' THEN 'keyword' ELSE 'group' END as source_type,
+                       MAX(discovery_source) as keyword,
+                       COUNT(*) as discovered_channels,
+                       COUNT(*) FILTER (WHERE lead_score >= 50) as high_quality_leads,
+                       CASE WHEN COUNT(*) > 0 THEN CAST((COUNT(*) FILTER (WHERE lead_score >= 50) * 100.0 / COUNT(*)) AS INT) ELSE 0 END as quality_score,
+                       MAX(discovered_at) as last_discovery
+                FROM leads
+                WHERE is_group = FALSE AND (language = 'Arabic' OR arabic_score >= 40)
+                GROUP BY discovery_source, discovery_method
+                ORDER BY discovered_channels DESC
+                LIMIT 20
+            """)
+            top_sources = cur.fetchall()
+            for r in top_sources:
+                if r.get('last_discovery'):
+                    r['last_discovery'] = r['last_discovery'].isoformat()
             
-        # 6. Arabic Discovery Rate (Phase 7)
-        cur.execute("""
-            SELECT 
-                COUNT(*) as total,
-                COUNT(*) FILTER (WHERE language = 'Arabic' OR arabic_score >= 40) as arabic_count,
-                CASE 
-                    WHEN COUNT(*) > 0 THEN CAST((COUNT(*) FILTER (WHERE language = 'Arabic' OR arabic_score >= 40) * 100.0 / COUNT(*)) AS INT)
-                    ELSE 0
-                END as overall_rate
-            FROM leads
-            WHERE is_group = FALSE
-        """)
-        arabic_rate_stats = cur.fetchone()
-        
-        # Arabic discovery rate per day
-        cur.execute("""
-            SELECT 
-                DATE(discovered_at) as date,
-                CASE 
-                    WHEN COUNT(*) > 0 THEN CAST((COUNT(*) FILTER (WHERE language = 'Arabic' OR arabic_score >= 40) * 100.0 / COUNT(*)) AS INT)
-                    ELSE 0
-                END as rate
-            FROM leads
-            WHERE is_group = FALSE
-            GROUP BY DATE(discovered_at)
-            ORDER BY DATE(discovered_at) DESC
-            LIMIT 14
-        """)
-        arabic_rate_per_day = cur.fetchall()
-        for r in arabic_rate_per_day:
-            r['date'] = str(r['date'])
+            # 3. Top Arabic Marketplace Groups (Phase 7: ordered by Arabic channels discovered)
+            cur.execute("""
+                SELECT l.channel_username as group_username, l.marketplace_score, l.member_count,
+                       0 as messages_scanned,
+                       (SELECT COUNT(*) FROM channel_graph cg JOIN leads l2 ON cg.target_channel_id = l2.id WHERE cg.source_channel_id = l.id AND (l2.language = 'Arabic' OR l2.arabic_score >= 40)) as advertisements_count
+                FROM leads l
+                WHERE l.is_group = TRUE AND l.status != 'rejected'
+                ORDER BY advertisements_count DESC, l.marketplace_score DESC, l.member_count DESC
+                LIMIT 20
+            """)
+            top_marketplace_groups = cur.fetchall()
             
-        cur.close()
-        conn.close()
-        
+            # 4. Arabic Channels Discovered Per Day (last 14 days)
+            cur.execute("""
+                SELECT DATE(discovered_at) as date, COUNT(*) as count
+                FROM leads
+                WHERE is_group = FALSE AND (language = 'Arabic' OR arabic_score >= 40)
+                GROUP BY DATE(discovered_at)
+                ORDER BY DATE(discovered_at) DESC
+                LIMIT 14
+            """)
+            discovered_per_day = cur.fetchall()
+            for r in discovered_per_day:
+                r['date'] = str(r['date'])
+                
+            # 5. Arabic High Quality Leads Per Day (last 14 days)
+            cur.execute("""
+                SELECT DATE(discovered_at) as date, COUNT(*) as count
+                FROM leads
+                WHERE is_group = FALSE AND lead_score >= 50 AND (language = 'Arabic' OR arabic_score >= 40)
+                GROUP BY DATE(discovered_at)
+                ORDER BY DATE(discovered_at) DESC
+                LIMIT 14
+            """)
+            hq_leads_per_day = cur.fetchall()
+            for r in hq_leads_per_day:
+                r['date'] = str(r['date'])
+                
+            # 6. Arabic Discovery Rate (Phase 7)
+            cur.execute("""
+                SELECT 
+                    COUNT(*) as total,
+                    COUNT(*) FILTER (WHERE language = 'Arabic' OR arabic_score >= 40) as arabic_count,
+                    CASE 
+                        WHEN COUNT(*) > 0 THEN CAST((COUNT(*) FILTER (WHERE language = 'Arabic' OR arabic_score >= 40) * 100.0 / COUNT(*)) AS INT)
+                        ELSE 0
+                    END as overall_rate
+                FROM leads
+                WHERE is_group = FALSE
+            """)
+            arabic_rate_stats = cur.fetchone()
+            
+            # Arabic discovery rate per day
+            cur.execute("""
+                SELECT 
+                    DATE(discovered_at) as date,
+                    CASE 
+                        WHEN COUNT(*) > 0 THEN CAST((COUNT(*) FILTER (WHERE language = 'Arabic' OR arabic_score >= 40) * 100.0 / COUNT(*)) AS INT)
+                        ELSE 0
+                    END as rate
+                FROM leads
+                WHERE is_group = FALSE
+                GROUP BY DATE(discovered_at)
+                ORDER BY DATE(discovered_at) DESC
+                LIMIT 14
+            """)
+            arabic_rate_per_day = cur.fetchall()
+            for r in arabic_rate_per_day:
+                r['date'] = str(r['date'])
+            
         return {
             "success": True,
             "top_keywords": top_keywords,
@@ -582,83 +551,78 @@ def get_discovery_stats():
 def get_quality_stats():
     """PHASE 7 — Lead Quality Dashboard: funnel, categories, score distribution, rejections."""
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
+        with get_db_cursor(commit_on_success=False) as cur:
+            # 1. Lead Conversion Funnel
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE is_group = FALSE) as total_discovered,
+                    COUNT(*) FILTER (WHERE is_group = FALSE AND lead_score IS NOT NULL AND lead_score > 0) as total_validated,
+                    COUNT(*) FILTER (WHERE is_group = FALSE AND status = 'new' AND lead_score >= 10 AND member_count > 0) as qualified_leads,
+                    COUNT(*) FILTER (WHERE is_group = FALSE AND status = 'contacted') as partners
+                FROM leads
+            """)
+            funnel = cur.fetchone()
 
-        # 1. Lead Conversion Funnel
-        cur.execute("""
-            SELECT
-                COUNT(*) FILTER (WHERE is_group = FALSE) as total_discovered,
-                COUNT(*) FILTER (WHERE is_group = FALSE AND lead_score IS NOT NULL AND lead_score > 0) as total_validated,
-                COUNT(*) FILTER (WHERE is_group = FALSE AND status = 'new' AND lead_score >= 10 AND member_count > 0) as qualified_leads,
-                COUNT(*) FILTER (WHERE is_group = FALSE AND status = 'contacted') as partners
-            FROM leads
-        """)
-        funnel = cur.fetchone()
+            # 2. Forex Category Breakdown
+            cur.execute("""
+                SELECT
+                    COALESCE(forex_category, 'unknown') as category,
+                    COUNT(*) as count,
+                    ROUND(AVG(lead_score)) as avg_score,
+                    ROUND(AVG(forex_intent_score)) as avg_forex_intent
+                FROM leads
+                WHERE is_group = FALSE AND status = 'new' AND lead_score > 0
+                GROUP BY forex_category
+                ORDER BY count DESC
+            """)
+            categories = cur.fetchall()
 
-        # 2. Forex Category Breakdown
-        cur.execute("""
-            SELECT
-                COALESCE(forex_category, 'unknown') as category,
-                COUNT(*) as count,
-                ROUND(AVG(lead_score)) as avg_score,
-                ROUND(AVG(forex_intent_score)) as avg_forex_intent
-            FROM leads
-            WHERE is_group = FALSE AND status = 'new' AND lead_score > 0
-            GROUP BY forex_category
-            ORDER BY count DESC
-        """)
-        categories = cur.fetchall()
+            # 3. Score Distribution
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE lead_score >= 90) as tier_s,
+                    COUNT(*) FILTER (WHERE lead_score >= 75 AND lead_score < 90) as tier_a,
+                    COUNT(*) FILTER (WHERE lead_score >= 50 AND lead_score < 75) as tier_b,
+                    COUNT(*) FILTER (WHERE lead_score >= 25 AND lead_score < 50) as tier_c,
+                    COUNT(*) FILTER (WHERE lead_score > 0 AND lead_score < 25) as tier_d,
+                    ROUND(AVG(lead_score)) as avg_lead_score,
+                    ROUND(AVG(forex_intent_score)) as avg_forex_intent,
+                    ROUND(AVG(arabic_score)) as avg_arabic_score
+                FROM leads
+                WHERE is_group = FALSE AND lead_score > 0
+            """)
+            score_dist = cur.fetchone()
 
-        # 3. Score Distribution
-        cur.execute("""
-            SELECT
-                COUNT(*) FILTER (WHERE lead_score >= 90) as tier_s,
-                COUNT(*) FILTER (WHERE lead_score >= 75 AND lead_score < 90) as tier_a,
-                COUNT(*) FILTER (WHERE lead_score >= 50 AND lead_score < 75) as tier_b,
-                COUNT(*) FILTER (WHERE lead_score >= 25 AND lead_score < 50) as tier_c,
-                COUNT(*) FILTER (WHERE lead_score > 0 AND lead_score < 25) as tier_d,
-                ROUND(AVG(lead_score)) as avg_lead_score,
-                ROUND(AVG(forex_intent_score)) as avg_forex_intent,
-                ROUND(AVG(arabic_score)) as avg_arabic_score
-            FROM leads
-            WHERE is_group = FALSE AND lead_score > 0
-        """)
-        score_dist = cur.fetchone()
+            # 4. Rejection Reasons
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE status = 'rejected' AND arabic_score < 50) as rejected_low_arabic,
+                    COUNT(*) FILTER (WHERE status = 'rejected' AND (lead_score < 50 OR forex_intent_score < 30)) as rejected_low_score,
+                    COUNT(*) as total_rejected
+                FROM leads
+                WHERE is_group = FALSE AND status = 'rejected'
+            """)
+            rejections = cur.fetchone()
 
-        # 4. Rejection Reasons
-        cur.execute("""
-            SELECT
-                COUNT(*) FILTER (WHERE status = 'rejected' AND arabic_score < 50) as rejected_low_arabic,
-                COUNT(*) FILTER (WHERE status = 'rejected' AND (lead_score < 50 OR forex_intent_score < 30)) as rejected_low_score,
-                COUNT(*) as total_rejected
-            FROM leads
-            WHERE is_group = FALSE AND status = 'rejected'
-        """)
-        rejections = cur.fetchone()
+            # 5. Blacklist reasons breakdown
+            cur.execute("""
+                SELECT reason, COUNT(*) as count
+                FROM blacklist
+                GROUP BY reason
+                ORDER BY count DESC
+            """)
+            blacklist_reasons = cur.fetchall()
 
-        # 5. Blacklist reasons breakdown
-        cur.execute("""
-            SELECT reason, COUNT(*) as count
-            FROM blacklist
-            GROUP BY reason
-            ORDER BY count DESC
-        """)
-        blacklist_reasons = cur.fetchall()
-
-        # 6. Top Forex Intent Score leads
-        cur.execute("""
-            SELECT channel_username, lead_score, forex_intent_score, arabic_score,
-                   forex_category, tier, member_count
-            FROM leads
-            WHERE is_group = FALSE AND status = 'new' AND forex_intent_score > 0
-            ORDER BY forex_intent_score DESC, lead_score DESC
-            LIMIT 10
-        """)
-        top_forex_intent = cur.fetchall()
-
-        cur.close()
-        conn.close()
+            # 6. Top Forex Intent Score leads
+            cur.execute("""
+                SELECT channel_username, lead_score, forex_intent_score, arabic_score,
+                       forex_category, tier, member_count
+                FROM leads
+                WHERE is_group = FALSE AND status = 'new' AND forex_intent_score > 0
+                ORDER BY forex_intent_score DESC, lead_score DESC
+                LIMIT 10
+            """)
+            top_forex_intent = cur.fetchall()
 
         return {
             "success": True,
@@ -680,62 +644,57 @@ def get_graph_stats():
     Exposes graph analytics: Most Mentioned, Most Connected, Fastest Growing, and Top Networks.
     """
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # 1. Most Mentioned Channels
-        query_mentioned = """
-        SELECT l.channel_username, COUNT(cg.target_channel_id) as mention_count, l.lead_score, l.tier
-        FROM leads l
-        JOIN channel_graph cg ON l.id = cg.target_channel_id
-        GROUP BY l.channel_username, l.lead_score, l.tier
-        ORDER BY mention_count DESC
-        LIMIT 10;
-        """
-        cur.execute(query_mentioned)
-        most_mentioned = cur.fetchall()
-        
-        # 2. Most Connected Channels (Degree Centrality)
-        query_connected = """
-        SELECT l.channel_username, 
-               ((SELECT COUNT(*) FROM channel_graph WHERE source_channel_id = l.id) + 
-                (SELECT COUNT(*) FROM channel_graph WHERE target_channel_id = l.id)) as connection_count,
-               l.lead_score, l.tier
-        FROM leads l
-        ORDER BY connection_count DESC
-        LIMIT 10;
-        """
-        cur.execute(query_connected)
-        most_connected = cur.fetchall()
-        
-        # 3. Fastest Growing Discovery Sources
-        query_growing = """
-        SELECT l.channel_username, COUNT(cg.target_channel_id) as new_discoveries_count, l.lead_score, l.tier
-        FROM leads l
-        JOIN channel_graph cg ON l.id = cg.source_channel_id
-        WHERE cg.created_at >= NOW() - INTERVAL '7 days'
-        GROUP BY l.channel_username, l.lead_score, l.tier
-        ORDER BY new_discoveries_count DESC
-        LIMIT 10;
-        """
-        cur.execute(query_growing)
-        fastest_growing = cur.fetchall()
-        
-        # 4. Top Forex Networks (Edges list)
-        query_networks = """
-        SELECT l_source.channel_username as source, l_target.channel_username as target, cg.discovery_method
-        FROM channel_graph cg
-        JOIN leads l_source ON cg.source_channel_id = l_source.id
-        JOIN leads l_target ON cg.target_channel_id = l_target.id
-        ORDER BY cg.created_at DESC
-        LIMIT 15;
-        """
-        cur.execute(query_networks)
-        top_networks = cur.fetchall()
-        
-        cur.close()
-        conn.close()
-        
+        with get_db_cursor(commit_on_success=False) as cur:
+            # 1. Most Mentioned Channels
+            query_mentioned = """
+            SELECT l.channel_username, COUNT(cg.target_channel_id) as mention_count, l.lead_score, l.tier
+            FROM leads l
+            JOIN channel_graph cg ON l.id = cg.target_channel_id
+            GROUP BY l.channel_username, l.lead_score, l.tier
+            ORDER BY mention_count DESC
+            LIMIT 10;
+            """
+            cur.execute(query_mentioned)
+            most_mentioned = cur.fetchall()
+            
+            # 2. Most Connected Channels (Degree Centrality)
+            query_connected = """
+            SELECT l.channel_username, 
+                   ((SELECT COUNT(*) FROM channel_graph WHERE source_channel_id = l.id) + 
+                    (SELECT COUNT(*) FROM channel_graph WHERE target_channel_id = l.id)) as connection_count,
+                   l.lead_score, l.tier
+            FROM leads l
+            ORDER BY connection_count DESC
+            LIMIT 10;
+            """
+            cur.execute(query_connected)
+            most_connected = cur.fetchall()
+            
+            # 3. Fastest Growing Discovery Sources
+            query_growing = """
+            SELECT l.channel_username, COUNT(cg.target_channel_id) as new_discoveries_count, l.lead_score, l.tier
+            FROM leads l
+            JOIN channel_graph cg ON l.id = cg.source_channel_id
+            WHERE cg.created_at >= NOW() - INTERVAL '7 days'
+            GROUP BY l.channel_username, l.lead_score, l.tier
+            ORDER BY new_discoveries_count DESC
+            LIMIT 10;
+            """
+            cur.execute(query_growing)
+            fastest_growing = cur.fetchall()
+            
+            # 4. Top Forex Networks (Edges list)
+            query_networks = """
+            SELECT l_source.channel_username as source, l_target.channel_username as target, cg.discovery_method
+            FROM channel_graph cg
+            JOIN leads l_source ON cg.source_channel_id = l_source.id
+            JOIN leads l_target ON cg.target_channel_id = l_target.id
+            ORDER BY cg.created_at DESC
+            LIMIT 15;
+            """
+            cur.execute(query_networks)
+            top_networks = cur.fetchall()
+            
         return {
             "success": True,
             "most_mentioned": most_mentioned,
@@ -754,20 +713,15 @@ def get_graph_network():
     Returns full node-link structure for rendering force-directed network graphs.
     """
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Select active nodes
-        cur.execute("SELECT id, channel_username, lead_score, tier FROM leads WHERE status != 'rejected'")
-        nodes = cur.fetchall()
-        
-        # Select edges
-        cur.execute("SELECT source_channel_id as source, target_channel_id as target, discovery_method FROM channel_graph")
-        edges = cur.fetchall()
-        
-        cur.close()
-        conn.close()
-        
+        with get_db_cursor(commit_on_success=False) as cur:
+            # Select active nodes
+            cur.execute("SELECT id, channel_username, lead_score, tier FROM leads WHERE status != 'rejected'")
+            nodes = cur.fetchall()
+            
+            # Select edges
+            cur.execute("SELECT source_channel_id as source, target_channel_id as target, discovery_method FROM channel_graph")
+            edges = cur.fetchall()
+            
         return {
             "success": True,
             "nodes": nodes,

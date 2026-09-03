@@ -19,6 +19,7 @@ import uuid
 import socket
 import asyncio
 import logging
+from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone
 import redis
 from telethon import TelegramClient, errors
@@ -653,8 +654,78 @@ class TelegramManager:
                     except asyncio.TimeoutError:
                         pass
                     retries += 1
-                    last_exception = e
-
         if last_exception:
             raise last_exception
         raise RuntimeError("No Telegram clients available or all candidate sessions failed.")
+
+    # ── Advanced Discovery Methods (v5 Graph Intelligence) ────────────────────
+
+    async def search_global_messages(
+        self,
+        session_name: str,
+        query: str,
+        offset_rate: int = 0,
+        offset_id: int = 0,
+        limit: int = 100,
+        shutdown_event: Optional[asyncio.Event] = None
+    ):
+        """
+        Executes a global message search (messages.searchGlobal) across all public Telegram channels.
+        Returns messages and chats matching the query.
+        """
+        from telethon.tl.functions.messages import SearchGlobalRequest
+        from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty
+
+        async def _req(cl):
+            return await cl(SearchGlobalRequest(
+                q=query,
+                filter=InputMessagesFilterEmpty(),
+                min_date=None,
+                max_date=None,
+                offset_rate=offset_rate,
+                offset_peer=InputPeerEmpty(),
+                offset_id=offset_id,
+                limit=limit
+            ))
+
+        return await self.execute_request(session_name, _req, shutdown_event=shutdown_event or asyncio.Event())
+
+    async def get_channel_recommendations(
+        self,
+        session_name: str,
+        channel_peer,
+        shutdown_event: Optional[asyncio.Event] = None
+    ):
+        """
+        Fetches similar channel recommendations (channels.getChannelRecommendations) for a given channel.
+        """
+        from telethon.tl.functions.channels import GetChannelRecommendationsRequest
+
+        async def _req(cl):
+            return await cl(GetChannelRecommendationsRequest(channel=channel_peer))
+
+        return await self.execute_request(session_name, _req, shutdown_event=shutdown_event or asyncio.Event())
+
+    async def search_posts(
+        self,
+        session_name: str,
+        query: str,
+        hashtag: Optional[str] = None,
+        offset_rate: int = 0,
+        offset_id: int = 0,
+        limit: int = 100,
+        shutdown_event: Optional[asyncio.Event] = None
+    ):
+        """
+        Searches public posts with fallback to global message search if searchPosts is restricted.
+        """
+        search_term = f"#{hashtag} {query}".strip() if hashtag else query
+        return await self.search_global_messages(
+            session_name=session_name,
+            query=search_term,
+            offset_rate=offset_rate,
+            offset_id=offset_id,
+            limit=limit,
+            shutdown_event=shutdown_event
+        )
+

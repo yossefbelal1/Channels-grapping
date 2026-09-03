@@ -6,6 +6,7 @@ import random
 import asyncio
 import signal
 import logging
+from typing import Optional, Dict, Any, List, Tuple, Union, Set
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import redis
@@ -32,6 +33,16 @@ from app.outreach.message_validator import validate_message
 from app.outreach.metrics import OutreachMetrics
 from app.outreach.reconciliation import ReconciliationManager
 from app.outreach.backpressure import BackpressureManager
+
+# Discovery, Graph, Scoring & Scheduling imports (v5)
+from app.scoring.dimensions import ScoringDimensions, calculate_all_dimensions
+from app.scoring.engine import LeadScoringEngine
+from app.scheduler.activity_classifier import ActivityClassifier, ActivityClass
+from app.graph.edge_manager import GraphEdgeManager, EdgeRelation
+from app.discovery.provenance import ProvenanceManager
+from app.discovery.taxonomy import classify_text_taxonomy
+from app.discovery.arabic_normalizer import calculate_arabic_letter_ratio, normalize_arabic_text
+
 
 # Configure logging
 logging.basicConfig(
@@ -882,6 +893,140 @@ class DatabaseHelper:
             if res:
                 return res['id']
         return None
+
+    def insert_snapshot(self, channel_id: str, member_count: int, post_count: int = 0, posts_24h: int = 0, posts_7d: int = 0, posts_30d: int = 0, avg_views: int = 0):
+        """Records metric snapshot for growth tracking."""
+        self.check_connection()
+        query = """
+        INSERT INTO channel_snapshots (channel_id, member_count, post_count, posts_24h, posts_7d, posts_30d, avg_views_per_post, recorded_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW());
+        """
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(query, (channel_id, member_count, post_count, posts_24h, posts_7d, posts_30d, avg_views))
+            self.conn.commit()
+        except Exception as e:
+            logging.warning(f"Failed to record channel snapshot: {e}")
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+
+    def insert_structured_contact(self, channel_id: str, contact_type: str, value: str, confidence: int = 100, source: str = 'bio'):
+        """Persists structured contact handle, whatsapp, or site."""
+        self.check_connection()
+        query = """
+        INSERT INTO channel_contacts (channel_id, contact_type, value, confidence, source, first_seen, last_seen)
+        VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+        ON CONFLICT (channel_id, contact_type, value) DO UPDATE SET
+            confidence = EXCLUDED.confidence,
+            last_seen = NOW();
+        """
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(query, (channel_id, contact_type, value, confidence, source))
+            self.conn.commit()
+        except Exception as e:
+            logging.warning(f"Failed to record structured contact: {e}")
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+
+    def upsert_lead_v5(
+        self,
+        channel_username: str,
+        member_count: int,
+        description: str,
+        scores: ScoringDimensions,
+        activity_class: str = "WARM",
+        next_crawl_at: Optional[datetime] = None,
+        contacts_dict: Optional[dict] = None,
+        posts_24h: int = 0,
+        posts_7d: int = 0,
+        posts_30d: int = 0,
+        avg_posts_per_day: float = 0.0,
+        discovery_source: str = 'unknown',
+        discovery_method: str = 'unknown',
+        status: str = 'new'
+    ) -> Optional[str]:
+        """Upserts lead with all 13 multi-dimensional scores and activity metadata."""
+        self.check_connection()
+        contacts_dict = contacts_dict or {}
+        query = """
+        INSERT INTO leads (
+            channel_username, member_count, description, language, arabic_ratio,
+            website, email, whatsapp, contact_username, owner_username, admin_username,
+            is_group, lead_score, tier, status, last_scan, discovery_source, discovery_method,
+            forex_score, trading_score, signal_score, gold_score, activity_score, growth_score,
+            commercial_score, contact_score, legitimacy_score, discovery_score, new_channel_score,
+            activity_class, posts_24h, posts_7d, posts_30d, avg_posts_per_day, next_crawl_at
+        ) VALUES (
+            %s, %s, %s, 'Arabic', %s,
+            %s, %s, %s, %s, %s, %s,
+            FALSE, %s, %s::tier_level, %s, NOW(), %s, %s,
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s
+        )
+        ON CONFLICT (channel_username) DO UPDATE SET
+            member_count = EXCLUDED.member_count,
+            description = EXCLUDED.description,
+            arabic_ratio = EXCLUDED.arabic_ratio,
+            website = COALESCE(EXCLUDED.website, leads.website),
+            email = COALESCE(EXCLUDED.email, leads.email),
+            whatsapp = COALESCE(EXCLUDED.whatsapp, leads.whatsapp),
+            contact_username = COALESCE(EXCLUDED.contact_username, leads.contact_username),
+            owner_username = COALESCE(EXCLUDED.owner_username, leads.owner_username),
+            admin_username = COALESCE(EXCLUDED.admin_username, leads.admin_username),
+            lead_score = EXCLUDED.lead_score,
+            tier = EXCLUDED.tier,
+            status = EXCLUDED.status,
+            last_scan = NOW(),
+            forex_score = EXCLUDED.forex_score,
+            trading_score = EXCLUDED.trading_score,
+            signal_score = EXCLUDED.signal_score,
+            gold_score = EXCLUDED.gold_score,
+            activity_score = EXCLUDED.activity_score,
+            growth_score = EXCLUDED.growth_score,
+            commercial_score = EXCLUDED.commercial_score,
+            contact_score = EXCLUDED.contact_score,
+            legitimacy_score = EXCLUDED.legitimacy_score,
+            discovery_score = EXCLUDED.discovery_score,
+            new_channel_score = EXCLUDED.new_channel_score,
+            activity_class = EXCLUDED.activity_class,
+            posts_24h = EXCLUDED.posts_24h,
+            posts_7d = EXCLUDED.posts_7d,
+            posts_30d = EXCLUDED.posts_30d,
+            avg_posts_per_day = EXCLUDED.avg_posts_per_day,
+            next_crawl_at = EXCLUDED.next_crawl_at
+        RETURNING id;
+        """
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(query, (
+                    channel_username, member_count, description, scores.arabic_score,
+                    contacts_dict.get('website'), contacts_dict.get('email'), contacts_dict.get('whatsapp'),
+                    contacts_dict.get('contact_username'), contacts_dict.get('owner_username'), contacts_dict.get('admin_username'),
+                    scores.final_score, scores.tier, status, discovery_source, discovery_method,
+                    scores.forex_score, scores.trading_score, scores.signal_score, scores.gold_score,
+                    scores.activity_score, scores.growth_score, scores.commercial_score, scores.contact_score,
+                    scores.legitimacy_score, scores.discovery_score, scores.new_channel_score,
+                    activity_class, posts_24h, posts_7d, posts_30d, avg_posts_per_day, next_crawl_at
+                ))
+                res = cur.fetchone()
+                self.conn.commit()
+                channel_id = str(res['id']) if res else None
+                logging.info(f"Lead v5 upserted: @{channel_username} (Score={scores.final_score}, Tier={scores.tier}, Activity={activity_class}, SmallBonus={scores.new_channel_score})")
+                return channel_id
+        except Exception as err:
+            logging.error(f"Error in upsert_lead_v5 for @{channel_username}: {err}")
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            return None
+
 
     def get_channels_for_graph_expansion(self, batch_size: int = 15, max_depth: int = 5) -> list:
         """
@@ -2688,60 +2833,84 @@ class LeadValidator:
             tier = self.classify_tier(score)
             lang_str = "Arabic"
 
-            # ── PHASE 4: DUAL LEAD GATE ───────────────────────────────────────────
-            # A channel MUST pass BOTH gates and NOT be flagged as high risk fraud to become a real CRM lead
-            passes_gate = (score >= 10 and forex_intent_score >= 30 and not is_scam)
-            if not passes_gate:
-                status_val = 'rejected'
-                logging.info(f"Channel @{username} below gate (score={score}<10 or forex_intent={forex_intent_score}<30 or is_scam={is_scam}). Saving as rejected.")
-            else:
+            # ── 13-Dimension Scoring & Activity Intelligence (v5) ─────────────────
+            post_texts = [m.text for m in messages if getattr(m, 'text', None)]
+            scoring_dims = LeadScoringEngine.evaluate_stage_2(
+                title=title,
+                description=description,
+                recent_posts=post_texts,
+                member_count=member_count,
+                has_contact=bool(contacts.get('contact_username') or contacts.get('whatsapp')),
+                contact_types=[c['type'] for c in contacts.get('structured_contacts', [])],
+                discovery_count=1,
+                last_post_at=last_activity_ts
+            )
+
+            # Activity Classification & Crawl Scheduling
+            act_class, crawl_interval, next_crawl_at = ActivityClassifier.classify_activity(
+                posts_24h=msgs_72h, # Recent active posts
+                posts_7d=msgs_7d,
+                posts_30d=len(messages),
+                last_post_at=last_activity_ts
+            )
+
+            # Pass Gate: Qualify channels based on multi-dimensional Forex relevance (NO subscriber minimum rejection)
+            if scoring_dims.forex_score >= 15 or scoring_dims.gold_score >= 15 or scoring_dims.signal_score >= 15 or score >= 10:
                 status_val = 'new'
-                logging.info(f"Channel @{username} PASSED gate → Real CRM Lead! (score={score} forex_intent={forex_intent_score})")
-                try:
-                    payload = json.dumps({"link": actual_link})
-                    self.redis_conn.rpush("user_join_queue", payload)
-                    logging.info(f"User Joiner: Queued verified Forex active channel {actual_link} for auto-join.")
-                except Exception as q_err:
-                    logging.warning(f"Failed to queue user join for active channel: {q_err}")
-                
-            last_activity_ts = last_activity_date.astimezone(timezone.utc) if last_activity_date else None
-            
-            # Save to database (status is 'rejected' if arabic_score is low)
-            self.db_helper.upsert_lead(
+                logging.info(f"Channel @{username} PASSED gate (FinalScore={scoring_dims.final_score}, Forex={scoring_dims.forex_score}, Gold={scoring_dims.gold_score}, Tier={scoring_dims.tier})")
+            else:
+                status_val = 'rejected'
+                logging.info(f"Channel @{username} below qualification threshold. Marking rejected.")
+
+            # Save to database using v5 schema (all 13 scoring dimensions + activity class)
+            channel_db_id = self.db_helper.upsert_lead_v5(
                 channel_username=username,
                 member_count=member_count,
                 description=description,
-                language=lang_str,
-                arabic_ratio=metadata['arabic_ratio'],
-                website=contacts['website'],
-                email=contacts['email'],
-                whatsapp=contacts['whatsapp'],
-                contact_username=contacts['contact_username'],
-                is_group=False,
-                marketplace_score=0,
-                vip=metadata['vip'],
-                premium=metadata['premium'],
-                subscription=metadata['subscription'],
-                monthly_plans=metadata['monthly_plans'],
-                yearly_plans=metadata['yearly_plans'],
-                account_management=metadata['account_management'],
-                copy_trading=metadata['copy_trading'],
-                funded_accounts=metadata['funded_accounts'],
-                usdt_payments=metadata['usdt_payments'],
-                binance_payments=metadata['binance_payments'],
-                lead_score=score,
-                tier=tier,
-                ai_confidence=metadata['confidence'],
-                last_activity=last_activity_ts,
+                scores=scoring_dims,
+                activity_class=act_class,
+                next_crawl_at=next_crawl_at,
+                contacts_dict=contacts,
+                posts_24h=msgs_72h,
+                posts_7d=msgs_7d,
+                posts_30d=len(messages),
+                avg_posts_per_day=round(len(messages) / 30.0, 2),
                 discovery_source=discovery_source,
                 discovery_method=discovery_method,
-                arabic_score=arabic_score,
-                region_score=region_score,
-                status=status_val,
-                forex_intent_score=forex_intent_score,
-                forex_category=forex_category,
-                high_risk_fraud=metadata.get('high_risk_fraud', False)
+                status=status_val
             )
+
+            if channel_db_id:
+                # 1. Record snapshot for historical growth tracking
+                self.db_helper.insert_snapshot(
+                    channel_id=channel_db_id,
+                    member_count=member_count,
+                    post_count=len(messages),
+                    posts_24h=msgs_72h,
+                    posts_7d=msgs_7d,
+                    posts_30d=len(messages)
+                )
+
+                # 2. Record structured contacts
+                for sc in contacts.get('structured_contacts', []):
+                    self.db_helper.insert_structured_contact(
+                        channel_id=channel_db_id,
+                        contact_type=sc['type'],
+                        value=sc['value'],
+                        confidence=sc.get('confidence', 100)
+                    )
+
+                # 3. Queue high-value channels for similar channel recommendations discovery
+                if status_val == 'new' and scoring_dims.tier in ('Tier_A', 'Tier_B'):
+                    try:
+                        self.redis_conn.rpush("recommendations:queue", json.dumps({
+                            "username": username,
+                            "channel_id": channel_db_id,
+                            "tier": scoring_dims.tier
+                        }))
+                    except Exception as err:
+                        logging.warning(f"Failed to queue recommendation candidate: {err}")
+
             
             # ── Auto Outreach Enqueue for Newly Discovered Qualified Lead ──────────
             contact_user_str = contacts.get('contact_username')

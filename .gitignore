@@ -37,6 +37,7 @@ telegram-saas-key.pem
 !init_facebook_db.sql
 !migrate_v3_graph_engine.sql
 !migrate_outreach_engine.sql
+!migrate_v5_graph_engine.sql
 db_backups/
 postgres_data/
 redis_data/

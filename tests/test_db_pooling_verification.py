@@ -32,7 +32,7 @@ class TestDbPoolingVerification(unittest.TestCase):
         wrapper = PooledConnectionWrapper(mock_raw_conn, mock_pool)
 
         with wrapper as conn:
-            self.assertEqual(conn, mock_raw_conn)
+            self.assertEqual(conn, wrapper)
 
         # On normal exit: commit was called, and returned to pool
         mock_raw_conn.commit.assert_called_once()
