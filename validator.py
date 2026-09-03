@@ -2834,6 +2834,7 @@ class LeadValidator:
             lang_str = "Arabic"
 
             # ── 13-Dimension Scoring & Activity Intelligence (v5) ─────────────────
+            last_activity_ts = last_activity_date.astimezone(timezone.utc) if last_activity_date else None
             post_texts = [m.text for m in messages if getattr(m, 'text', None)]
             scoring_dims = LeadScoringEngine.evaluate_stage_2(
                 title=title,
