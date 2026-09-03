@@ -56,7 +56,8 @@ POPULAR_HASHTAGS = [
 
 # High-Intent Post Search Phrases
 POPULAR_POST_QUERIES = [
-    "XAUUSD BUY", "Forex VIP signals", "توصيات ذهب وفوركس", "صفقة شراء ذهب"
+    "XAUUSD", "Forex", "Forex signals", "gold signals",
+    "توصيات ذهب", "توصيات فوركس", "إشارات فوركس", "تداول"
 ]
 
 
