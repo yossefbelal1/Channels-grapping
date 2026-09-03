@@ -2,8 +2,10 @@
 tests/test_phase1_search_integration.py — Integration Test for Phase 1 Search Pipeline
 
 Demonstrates full flow:
-1. Global Search (messages.searchGlobal) -> Result -> Canonical Channel -> Dedupe -> Candidate Queue -> Validation
-2. SearchPosts (channels.searchPosts) -> Result -> Canonical Channel -> Dedupe -> Candidate Queue -> Validation
+1. Contacts Directory Search (functions.contacts.SearchRequest) -> Canonical Channel -> Dedupe -> Candidate Queue
+2. Global Search (messages.searchGlobal) -> Result -> Canonical Channel -> Dedupe -> Candidate Queue -> Validation
+3. SearchPosts (channels.searchPosts) -> Result -> Canonical Channel -> Dedupe -> Candidate Queue -> Validation
+4. Production scavenger orchestration executing all 3 sources into shared candidate queue ('queue:normal')
 """
 
 import pytest
@@ -14,9 +16,11 @@ from datetime import datetime, timezone
 from app.discovery.telegram_global_search import TelegramGlobalSearchEngine
 from app.discovery.telegram_post_search import TelegramPostSearchEngine
 from app.discovery.provenance import ProvenanceManager
+from app.discovery.checkpoint import SearchCheckpointManager
 from app.scoring.engine import LeadScoringEngine
 from app.validator.contact_extractor import extract_contacts
 from tg_manager import TelegramManager
+from scavenger import run_scavenger, run_contacts_directory_search
 
 
 @pytest.mark.asyncio
@@ -109,13 +113,21 @@ async def test_full_phase1_search_integration_flow():
 
 
 @pytest.mark.asyncio
-async def test_scavenger_production_worker_loop_integration():
+async def test_scavenger_production_worker_executes_all_three_sources(monkeypatch):
     """
     Proves that the real production discovery entrypoint (scavenger.py:run_scavenger)
-    invokes TelegramGlobalSearchEngine and TelegramPostSearchEngine, depositing candidates into Redis.
+    executes all three discovery sources:
+    1. Contacts Directory Search (functions.contacts.SearchRequest)
+    2. TelegramGlobalSearchEngine (messages.searchGlobal)
+    3. TelegramPostSearchEngine (channels.searchPosts: hashtag & text query)
+    And deposits all candidates into the shared candidate queue ('queue:normal').
     """
-    from scavenger import run_scavenger
-    from app.discovery.checkpoint import SearchCheckpointManager
+    # Fast mock sleep
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    import scavenger
+    monkeypatch.setattr(scavenger, "get_all_keywords", lambda: ["ذهب", "فوركس"])
+    monkeypatch.setattr(scavenger, "POPULAR_HASHTAGS", ["ذهب", "فوركس"])
+    monkeypatch.setattr(scavenger, "POPULAR_POST_QUERIES", ["XAUUSD BUY"])
 
     mock_redis = MagicMock()
     mock_redis.llen.return_value = 0 # No backpressure
@@ -127,13 +139,24 @@ async def test_scavenger_production_worker_loop_integration():
     mock_redis.rpush.side_effect = lambda queue, val: enqueued_items.append((queue, val))
 
     mock_tg = MagicMock(spec=TelegramManager)
-    mock_chan = MagicMock(id=999, username="scavenger_prod_chan", broadcast=True, title="Scavenger Prod")
-    mock_msg = MagicMock(id=1, chat=mock_chan, text="XAUUSD BUY #Gold", date=datetime.now(timezone.utc))
-    search_res = MagicMock(messages=[mock_msg], chats=[mock_chan], next_rate=0)
     
-    mock_tg.search_global_messages = AsyncMock(return_value=search_res)
-    mock_tg.search_posts = AsyncMock(return_value=search_res)
-    mock_tg.get_channel_recommendations = AsyncMock(return_value=None)
+    # 1. Contacts search mock
+    mock_contacts_chan = MagicMock(id=101, username="contacts_discovered_chan", broadcast=True, title="Contacts Chan")
+    contacts_res = MagicMock(chats=[mock_contacts_chan])
+    mock_tg.execute_request = AsyncMock(return_value=contacts_res)
+
+    # 2. Global search mock
+    mock_global_chan = MagicMock(id=202, username="global_discovered_chan", broadcast=True, title="Global Chan")
+    mock_global_msg = MagicMock(id=1, chat=mock_global_chan, text="XAUUSD BUY #Gold", date=datetime.now(timezone.utc), peer_id=None)
+    global_search_res = MagicMock(messages=[mock_global_msg], chats=[mock_global_chan], next_rate=0)
+    mock_tg.search_global_messages = AsyncMock(return_value=global_search_res)
+
+    # 3. Post search mock
+    mock_post_chan = MagicMock(id=303, username="post_discovered_chan", broadcast=True, title="Post Chan")
+    mock_post_msg = MagicMock(id=2, chat=mock_post_chan, text="SMC Strategy #Forex", date=datetime.now(timezone.utc), peer_id=None)
+    post_search_res = MagicMock(messages=[mock_post_msg], chats=[mock_post_chan], next_rate=0)
+    mock_tg.search_posts = AsyncMock(return_value=post_search_res)
+
     mock_tg.sleep_adaptive_jitter = AsyncMock()
 
     chk_mgr = SearchCheckpointManager(mock_redis)
@@ -141,24 +164,62 @@ async def test_scavenger_production_worker_loop_integration():
 
     shutdown_event = asyncio.Event()
 
-    # Trigger single cycle with fast shutdown
-    async def shutdown_soon():
-        await asyncio.sleep(0.1)
-        shutdown_event.set()
-
-    asyncio.create_task(shutdown_soon())
-
+    # Call with full explicit parameters
     await run_scavenger(
         tg_manager=mock_tg,
         redis_conn=mock_redis,
+        session_name="scavenger_session",
+        shutdown_event=shutdown_event,
         checkpoint_mgr=chk_mgr,
         provenance_mgr=prov_mgr,
-        session_name="scavenger_session",
-        shutdown_event=shutdown_event
+        candidate_queue="queue:normal"
     )
 
-    # Verify that run_scavenger successfully invoked search_global_messages and deposited candidate
-    assert mock_tg.search_global_messages.called
-    assert len(enqueued_items) >= 1
-    assert any("scavenger_prod_chan" in str(item[1]) for item in enqueued_items)
-    print("Scavenger production loop integration verified!")
+    # Verify that ALL THREE discovery sources were invoked
+    assert mock_tg.execute_request.called, "Source 1 (Contacts directory search) must be executed"
+    assert mock_tg.search_global_messages.called, "Source 2 (Global message search) must be executed"
+    assert mock_tg.search_posts.called, "Source 3 (Public channel post search) must be executed"
+
+    # Verify that all candidates were enqueued to the shared queue:normal
+    assert len(enqueued_items) >= 3
+    for queue_name, handle in enqueued_items:
+        assert queue_name == "queue:normal"
+
+    enqueued_handles = [item[1] for item in enqueued_items]
+    assert "contacts_discovered_chan" in enqueued_handles
+    assert "global_discovered_chan" in enqueued_handles
+    assert "post_discovered_chan" in enqueued_handles
+
+    print("All 3 discovery sources successfully executed into shared candidate queue!")
+
+
+@pytest.mark.asyncio
+async def test_scavenger_signature_flexibility_and_defaults():
+    """
+    Proves that run_scavenger works with minimal positional/default arguments
+    without requiring external managers or explicit candidate queues.
+    """
+    mock_redis = MagicMock()
+    mock_redis.llen.return_value = 0
+    mock_redis.sadd.return_value = 1
+    mock_redis.incr.return_value = 1
+    mock_redis.get.return_value = None
+
+    mock_tg = MagicMock(spec=TelegramManager)
+    mock_tg.execute_request = AsyncMock(return_value=None)
+    mock_tg.search_global_messages = AsyncMock(return_value=None)
+    mock_tg.search_posts = AsyncMock(return_value=None)
+    mock_tg.sleep_adaptive_jitter = AsyncMock()
+
+    shutdown_event = asyncio.Event()
+    shutdown_event.set() # Stop immediately
+
+    # Call with minimal default signature: run_scavenger(tg_manager, redis_conn, session_name, shutdown_event)
+    result = await run_scavenger(
+        mock_tg,
+        mock_redis,
+        "scavenger_session",
+        shutdown_event
+    )
+    assert result == 0
+

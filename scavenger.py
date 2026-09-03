@@ -2,9 +2,9 @@
 scavenger.py — Production Multi-Source Discovery Engine (Worker C)
 
 Unified Phase 1 Discovery Pipeline:
-1. Existing Contacts Search: functions.contacts.SearchRequest(q=keyword, limit=100)
-2. Telegram Global Search: app.discovery.telegram_global_search.TelegramGlobalSearchEngine (messages.searchGlobal)
-3. Telegram Post Search: app.discovery.telegram_post_search.TelegramPostSearchEngine (channels.searchPosts)
+1. Existing Contacts Directory Search: functions.contacts.SearchRequest(q=keyword, limit=100)
+2. Telegram Global Message Search: TelegramGlobalSearchEngine (messages.searchGlobal)
+3. Telegram Public Post Search: TelegramPostSearchEngine (channels.searchPosts - hashtags & text queries)
                      ↓
         Canonical Candidate Resolution
                      ↓
@@ -22,6 +22,7 @@ import asyncio
 import signal
 import logging
 import random
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 import redis
@@ -51,6 +52,11 @@ POPULAR_HASHTAGS = [
     "ذهب", "فوركس", "xauusd", "توصيات_ذهب", "تداول_العملات",
     "توصيات_فوركس", "smc", "ict", "تحليل_فني", "سكالبينج",
     "حسابات_ممولة", "ادارة_محافظ", "نسخ_صفقات", "بيتكوين"
+]
+
+# High-Intent Post Search Phrases
+POPULAR_POST_QUERIES = [
+    "XAUUSD BUY", "Forex VIP signals", "توصيات ذهب وفوركس", "صفقة شراء ذهب"
 ]
 
 
@@ -113,22 +119,28 @@ async def run_contacts_directory_search(
 async def run_scavenger(
     tg_manager: TelegramManager,
     redis_conn: redis.Redis,
-    checkpoint_mgr: SearchCheckpointManager,
-    provenance_mgr: ProvenanceManager,
-    session_name: str,
-    shutdown_event: asyncio.Event
+    session_name: str = "scavenger_session",
+    shutdown_event: Optional[asyncio.Event] = None,
+    checkpoint_mgr: Optional[SearchCheckpointManager] = None,
+    provenance_mgr: Optional[ProvenanceManager] = None,
+    candidate_queue: str = "queue:normal"
 ):
     """
     Executes a complete, unified discovery cycle:
     1. Existing Directory/Contacts Search (functions.contacts.SearchRequest)
     2. Real Telegram Global Search (messages.searchGlobal via TelegramGlobalSearchEngine)
-    3. Real Telegram Post Search (channels.searchPosts via TelegramPostSearchEngine)
+    3. Real Telegram Post Search (channels.searchPosts via TelegramPostSearchEngine: hashtags & text queries)
     All three feed the exact SAME candidate queue ('queue:normal') with atomic deduplication.
     """
+    if shutdown_event is None:
+        shutdown_event = asyncio.Event()
+    if checkpoint_mgr is None:
+        checkpoint_mgr = SearchCheckpointManager(redis_conn)
+    if provenance_mgr is None:
+        provenance_mgr = ProvenanceManager(redis_conn)
+
     logging.info("Starting Multi-Source Scavenging & Discovery cycle...")
     total_new = 0
-
-    candidate_queue = "queue:normal"
 
     # Instantiate dedicated Phase 1 Search Engines
     global_search_engine = TelegramGlobalSearchEngine(
@@ -191,6 +203,7 @@ async def run_scavenger(
         total_new += stats_global.get("new_channels_found", 0)
 
     # ── Source 3: Telegram Public Post Search (channels.searchPosts) ──────────
+    # 3a. Hashtag search
     for tag in random.sample(POPULAR_HASHTAGS, min(5, len(POPULAR_HASHTAGS))):
         if shutdown_event.is_set():
             break
@@ -204,7 +217,22 @@ async def run_scavenger(
         )
         total_new += stats_tag.get("new_channels_found", 0)
 
+    # 3b. High-intent text queries search
+    for pq in random.sample(POPULAR_POST_QUERIES, min(2, len(POPULAR_POST_QUERIES))):
+        if shutdown_event.is_set():
+            break
+        await tg_manager.sleep_adaptive_jitter(session_name, shutdown_event)
+        logging.info(f"[Scavenger] Running Telegram Text Post Search for '{pq}'...")
+        stats_pq = await post_search_engine.search_query_paginated(
+            query=pq,
+            max_pages=2,
+            limit_per_page=50,
+            shutdown_event=shutdown_event
+        )
+        total_new += stats_pq.get("new_channels_found", 0)
+
     logging.info(f"Multi-Source Scavenging cycle complete. Total new candidate entities queued: {total_new}")
+    return total_new
 
 
 async def main():
@@ -260,10 +288,10 @@ async def main():
             await run_scavenger(
                 tg_manager=tg_manager,
                 redis_conn=redis_conn,
-                checkpoint_mgr=checkpoint_mgr,
-                provenance_mgr=provenance_mgr,
                 session_name=session_scavenger,
-                shutdown_event=shutdown_event
+                shutdown_event=shutdown_event,
+                checkpoint_mgr=checkpoint_mgr,
+                provenance_mgr=provenance_mgr
             )
         except Exception as e:
             logging.error(f"Error in scavenger discovery cycle: {e}", exc_info=True)
