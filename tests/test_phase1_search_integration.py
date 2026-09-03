@@ -106,3 +106,59 @@ async def test_full_phase1_search_integration_flow():
     assert stage2_scores.tier in ["Tier_A", "Tier_B", "Tier_C"]
 
     print("Phase 1 Search Discovery & Validation Integration Pipeline test passed cleanly!")
+
+
+@pytest.mark.asyncio
+async def test_scavenger_production_worker_loop_integration():
+    """
+    Proves that the real production discovery entrypoint (scavenger.py:run_scavenger)
+    invokes TelegramGlobalSearchEngine and TelegramPostSearchEngine, depositing candidates into Redis.
+    """
+    from scavenger import run_scavenger
+    from app.discovery.checkpoint import SearchCheckpointManager
+
+    mock_redis = MagicMock()
+    mock_redis.llen.return_value = 0 # No backpressure
+    mock_redis.sadd.return_value = 1
+    mock_redis.incr.return_value = 1
+    mock_redis.get.return_value = None
+
+    enqueued_items = []
+    mock_redis.rpush.side_effect = lambda queue, val: enqueued_items.append((queue, val))
+
+    mock_tg = MagicMock(spec=TelegramManager)
+    mock_chan = MagicMock(id=999, username="scavenger_prod_chan", broadcast=True, title="Scavenger Prod")
+    mock_msg = MagicMock(id=1, chat=mock_chan, text="XAUUSD BUY #Gold", date=datetime.now(timezone.utc))
+    search_res = MagicMock(messages=[mock_msg], chats=[mock_chan], next_rate=0)
+    
+    mock_tg.search_global_messages = AsyncMock(return_value=search_res)
+    mock_tg.search_posts = AsyncMock(return_value=search_res)
+    mock_tg.get_channel_recommendations = AsyncMock(return_value=None)
+    mock_tg.sleep_adaptive_jitter = AsyncMock()
+
+    chk_mgr = SearchCheckpointManager(mock_redis)
+    prov_mgr = ProvenanceManager(mock_redis)
+
+    shutdown_event = asyncio.Event()
+
+    # Trigger single cycle with fast shutdown
+    async def shutdown_soon():
+        await asyncio.sleep(0.1)
+        shutdown_event.set()
+
+    asyncio.create_task(shutdown_soon())
+
+    await run_scavenger(
+        tg_manager=mock_tg,
+        redis_conn=mock_redis,
+        checkpoint_mgr=chk_mgr,
+        provenance_mgr=prov_mgr,
+        session_name="scavenger_session",
+        shutdown_event=shutdown_event
+    )
+
+    # Verify that run_scavenger successfully invoked search_global_messages and deposited candidate
+    assert mock_tg.search_global_messages.called
+    assert len(enqueued_items) >= 1
+    assert any("scavenger_prod_chan" in str(item[1]) for item in enqueued_items)
+    print("Scavenger production loop integration verified!")

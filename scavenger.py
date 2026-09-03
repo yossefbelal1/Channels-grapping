@@ -1,16 +1,16 @@
 """
 scavenger.py — Production Multi-Source Discovery Engine (Worker C)
 
-Features:
-- Multi-Source Telegram Discovery:
-  1. Global Message Content Search (messages.searchGlobal)
-  2. Public Post & Hashtag Search (channels.searchPosts)
-  3. Similar Channel Recommendations (channels.getChannelRecommendations)
-  4. Public Directory & Contact Scavenging
-- Arabic NLP Keyword Taxonomy & Query Variant Generator
-- Resumable Search Pagination via SearchCheckpointManager
-- Candidate Identity & Provenance Tracking (ProvenanceManager)
-- Distributed Rate Limiting & Health Jitter via TelegramManager
+Production Flow:
+1. Global Message Content Search (app.discovery.telegram_global_search.TelegramGlobalSearchEngine)
+   - Discovers channels based on post content setups (messages.searchGlobal).
+   - Stateful pagination with offset_id, offset_rate, offset_peer.
+2. Public Channel Post & Hashtag Search (app.discovery.telegram_post_search.TelegramPostSearchEngine)
+   - Searches public posts by hashtags (#ذهب, #forex, #XAUUSD) and text queries (channels.searchPosts).
+   - Clean fallback to Global Search upon API restriction.
+3. Similar Channel Recommendations Expansion (channels.getChannelRecommendations)
+4. Multi-Source Provenance & Deduplication (app.discovery.provenance.ProvenanceManager)
+5. Shared Candidate Ingestion (queue:normal / queue:high -> validator.py)
 """
 
 import os
@@ -23,11 +23,11 @@ import random
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 import redis
-from telethon import functions, errors
-from telethon.tl.types import Chat, Channel
 from tg_manager import TelegramManager
 
-# Discovery Intelligence Modules
+# Discovery Intelligence & Search Engines
+from app.discovery.telegram_global_search import TelegramGlobalSearchEngine
+from app.discovery.telegram_post_search import TelegramPostSearchEngine
 from app.discovery.arabic_normalizer import generate_query_variants, normalize_arabic_text
 from app.discovery.taxonomy import get_all_keywords, KEYWORD_TAXONOMY
 from app.discovery.checkpoint import SearchCheckpointManager
@@ -48,158 +48,6 @@ POPULAR_HASHTAGS = [
     "توصيات_فوركس", "smc", "ict", "تحليل_فني", "سكالبينج",
     "حسابات_ممولة", "ادارة_محافظ", "نسخ_صفقات", "بيتكوين"
 ]
-
-
-async def run_global_message_search(
-    tg_manager: TelegramManager,
-    redis_conn: redis.Redis,
-    checkpoint_mgr: SearchCheckpointManager,
-    provenance_mgr: ProvenanceManager,
-    session_name: str,
-    keyword: str,
-    shutdown_event: asyncio.Event
-) -> int:
-    """
-    Executes a paginated global message search (messages.searchGlobal) for a given keyword query.
-    Extracts channels, groups, and message contexts, persisting checkpoints.
-    """
-    discovered_count = 0
-    query_variants = generate_query_variants(keyword, max_variants=3)
-
-    for query in query_variants:
-        if shutdown_event.is_set():
-            break
-
-        # Check existing checkpoint
-        cp = checkpoint_mgr.get_checkpoint("messages_search_global", query)
-        offset_id = cp.get("offset_id", 0) if cp else 0
-        offset_rate = cp.get("offset_rate", 0) if cp else 0
-
-        logging.info(f"Global Message Search: '{query}' (offset_id={offset_id})...")
-
-        try:
-            res = await tg_manager.search_global_messages(
-                session_name=session_name,
-                query=query,
-                offset_rate=offset_rate,
-                offset_id=offset_id,
-                limit=100,
-                shutdown_event=shutdown_event
-            )
-
-            if not res:
-                continue
-
-            # Process returned chats / channels
-            for chat in getattr(res, 'chats', []):
-                username = getattr(chat, 'username', None)
-                if not username:
-                    continue
-
-                is_group = isinstance(chat, Chat) or (isinstance(chat, Channel) and chat.megagroup)
-                channel_link = f"https://t.me/{username}"
-
-                is_new, count, sources = provenance_mgr.record_candidate_discovery(
-                    username_or_link=channel_link,
-                    source_type="global_search",
-                    keyword=query
-                )
-
-                payload = json.dumps({
-                    "link": channel_link,
-                    "source": query,
-                    "method": "global_search",
-                    "keyword": query,
-                    "is_group": is_group,
-                    "title": getattr(chat, 'title', ''),
-                    "member_count": getattr(chat, 'participants_count', 0),
-                    "discovered_count": count,
-                    "sources": sources
-                })
-
-                target_queue = "queue:normal" if not is_group else "discovered_groups"
-                redis_conn.rpush(target_queue, payload)
-                discovered_count += 1
-
-            # Process returned messages for mentioned entities
-            for msg in getattr(res, 'messages', []):
-                msg_text = getattr(msg, 'message', '') or ''
-                # Extract forward origin if present
-                if getattr(msg, 'fwd_from', None):
-                    fwd = msg.fwd_from
-                    if getattr(fwd, 'from_name', None):
-                        logging.debug(f"Observed forward from: {fwd.from_name}")
-
-            # Update checkpoint
-            next_offset_id = getattr(res, 'next_rate', None) or 0
-            checkpoint_mgr.save_checkpoint(
-                search_type="messages_search_global",
-                query_key=query,
-                offset_id=next_offset_id,
-                total_yield=discovered_count,
-                status="completed" if not next_offset_id else "in_progress"
-            )
-
-        except Exception as err:
-            logging.error(f"Error during global search for '{query}': {err}")
-
-    return discovered_count
-
-
-async def run_hashtag_post_search(
-    tg_manager: TelegramManager,
-    redis_conn: redis.Redis,
-    provenance_mgr: ProvenanceManager,
-    session_name: str,
-    hashtag: str,
-    shutdown_event: asyncio.Event
-) -> int:
-    """
-    Searches public posts matching specific Arabic trading hashtags.
-    """
-    discovered_count = 0
-    logging.info(f"Hashtag Post Search: #{hashtag}...")
-
-    try:
-        res = await tg_manager.search_posts(
-            session_name=session_name,
-            query="",
-            hashtag=hashtag,
-            limit=50,
-            shutdown_event=shutdown_event
-        )
-
-        if not res:
-            return 0
-
-        for chat in getattr(res, 'chats', []):
-            username = getattr(chat, 'username', None)
-            if not username:
-                continue
-
-            channel_link = f"https://t.me/{username}"
-            is_new, count, sources = provenance_mgr.record_candidate_discovery(
-                username_or_link=channel_link,
-                source_type="search_posts",
-                keyword=f"#{hashtag}"
-            )
-
-            payload = json.dumps({
-                "link": channel_link,
-                "source": f"#{hashtag}",
-                "method": "search_posts",
-                "keyword": f"#{hashtag}",
-                "title": getattr(chat, 'title', ''),
-                "discovered_count": count,
-                "sources": sources
-            })
-            redis_conn.rpush("queue:normal", payload)
-            discovered_count += 1
-
-    except Exception as err:
-        logging.error(f"Error in hashtag search #{hashtag}: {err}")
-
-    return discovered_count
 
 
 async def run_channel_recommendations_cycle(
@@ -231,8 +79,8 @@ async def run_channel_recommendations_cycle(
 
             logging.info(f"Fetching Similar Channel Recommendations for @{target_username}...")
             res = await tg_manager.get_channel_recommendations(
-                session_name=session_name,
                 channel_peer=target_username,
+                session_name=session_name,
                 shutdown_event=shutdown_event
             )
 
@@ -251,18 +99,11 @@ async def run_channel_recommendations_cycle(
                     referrer_channel_id=data.get("channel_id")
                 )
 
-                payload = json.dumps({
-                    "link": channel_link,
-                    "source": f"recommended_by_@{target_username}",
-                    "method": "recommendation",
-                    "referrer_channel": target_username,
-                    "title": getattr(chat, 'title', ''),
-                    "discovered_count": count,
-                    "sources": sources
-                })
-                redis_conn.rpush("queue:high", payload)
-                discovered_count += 1
-                logging.info(f"Discovered Recommended Channel: @{username} (via @{target_username})")
+                if is_new:
+                    # Enqueue candidate into shared candidate pipeline
+                    redis_conn.rpush("queue:high", username)
+                    discovered_count += 1
+                    logging.info(f"Discovered Recommended Channel: @{username} (via @{target_username})")
 
         except Exception as err:
             logging.warning(f"Failed to fetch recommendations: {err}")
@@ -279,19 +120,32 @@ async def run_scavenger(
     shutdown_event: asyncio.Event
 ):
     """
-    Executes a complete multi-source discovery cycle:
-    1. Global Message Search with taxonomy mutations & pagination.
-    2. Trending Hashtag Post Search.
-    3. Similar Channel Recommendations.
+    Executes a complete multi-source discovery cycle using the dedicated engines:
+    1. TelegramGlobalSearchEngine: Content-based search (messages.searchGlobal).
+    2. TelegramPostSearchEngine: Hashtag & query post search (channels.searchPosts).
+    3. Similar Channel Recommendations Expansion.
     """
     logging.info("Starting Multi-Source Scavenging & Discovery cycle...")
     total_new = 0
+
+    # Instantiate dedicated Phase 1 Search Engines
+    global_search_engine = TelegramGlobalSearchEngine(
+        tg_manager=tg_manager,
+        redis_conn=redis_conn,
+        candidate_queue="queue:normal"
+    )
+    post_search_engine = TelegramPostSearchEngine(
+        tg_manager=tg_manager,
+        redis_conn=redis_conn,
+        candidate_queue="queue:normal",
+        global_search_engine=global_search_engine
+    )
 
     all_keywords = get_all_keywords()
     random.shuffle(all_keywords)
 
     # 1. Global Message Search Cycle
-    for kw in all_keywords[:30]: # Process batch of 30 keywords per cycle
+    for kw in all_keywords[:20]: # Process batch of 20 high-yield keywords
         if shutdown_event.is_set():
             break
 
@@ -311,31 +165,29 @@ async def run_scavenger(
         # Adaptive health jitter
         await tg_manager.sleep_adaptive_jitter(session_name, shutdown_event)
 
-        discovered = await run_global_message_search(
-            tg_manager=tg_manager,
-            redis_conn=redis_conn,
-            checkpoint_mgr=checkpoint_mgr,
-            provenance_mgr=provenance_mgr,
-            session_name=session_name,
-            keyword=kw,
+        logging.info(f"[Scavenger] Running Global Message Search for '{kw}'...")
+        stats = await global_search_engine.search_query_paginated(
+            query=kw,
+            max_pages=3,
+            limit_per_page=50,
             shutdown_event=shutdown_event
         )
-        total_new += discovered
+        total_new += stats.get("new_channels_found", 0)
 
-    # 2. Hashtag Post Search Cycle
+    # 2. Hashtag & Query Post Search Cycle
     for tag in random.sample(POPULAR_HASHTAGS, min(5, len(POPULAR_HASHTAGS))):
         if shutdown_event.is_set():
             break
         await tg_manager.sleep_adaptive_jitter(session_name, shutdown_event)
-        discovered = await run_hashtag_post_search(
-            tg_manager=tg_manager,
-            redis_conn=redis_conn,
-            provenance_mgr=provenance_mgr,
-            session_name=session_name,
+
+        logging.info(f"[Scavenger] Running Post Search for hashtag #{tag}...")
+        stats_tag = await post_search_engine.search_hashtag_paginated(
             hashtag=tag,
+            max_pages=2,
+            limit_per_page=50,
             shutdown_event=shutdown_event
         )
-        total_new += discovered
+        total_new += stats_tag.get("new_channels_found", 0)
 
     # 3. Channel Recommendations Cycle
     recs_discovered = await run_channel_recommendations_cycle(
@@ -347,7 +199,7 @@ async def run_scavenger(
     )
     total_new += recs_discovered
 
-    logging.info(f"Multi-Source Scavenging cycle complete. Total candidate entities queued: {total_new}")
+    logging.info(f"Multi-Source Scavenging cycle complete. Total new candidate entities queued: {total_new}")
 
 
 async def main():
