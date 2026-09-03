@@ -30,6 +30,11 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s'
 )
 
+class SearchPostsUnsupportedError(Exception):
+    """Raised when channels.searchPosts is unsupported, restricted, or unavailable in the API."""
+    pass
+
+
 # ── Centralized Rate Limits ───────────────────────────────────────────────────
 DEFAULT_MAX_REQUESTS_PER_HOUR = int(os.getenv("TELEGRAM_MAX_REQUESTS_PER_HOUR", "300"))
 LOCK_TTL_SECONDS = int(os.getenv("TELEGRAM_SESSION_LOCK_TTL", "60"))
@@ -664,6 +669,7 @@ class TelegramManager:
         self,
         query: str,
         session_name: Optional[str] = None,
+        offset_peer: Any = None,
         offset_rate: int = 0,
         offset_id: int = 0,
         limit: int = 100,
@@ -679,13 +685,23 @@ class TelegramManager:
         active_session = session_name or (list(self.clients.keys())[0] if self.clients else "user_session")
 
         async def _req(cl):
+            actual_peer = InputPeerEmpty()
+            if offset_peer is not None:
+                if isinstance(offset_peer, (int, str)):
+                    try:
+                        actual_peer = await cl.get_input_entity(int(offset_peer))
+                    except Exception:
+                        actual_peer = InputPeerEmpty()
+                else:
+                    actual_peer = offset_peer
+
             return await cl(SearchGlobalRequest(
                 q=query,
                 filter=InputMessagesFilterEmpty(),
                 min_date=None,
                 max_date=None,
                 offset_rate=offset_rate,
-                offset_peer=InputPeerEmpty(),
+                offset_peer=actual_peer,
                 offset_id=offset_id,
                 limit=limit
             ))
@@ -715,6 +731,7 @@ class TelegramManager:
         query: Optional[str] = None,
         hashtag: Optional[str] = None,
         session_name: Optional[str] = None,
+        offset_peer: Any = None,
         offset_rate: int = 0,
         offset_id: int = 0,
         limit: int = 100,
@@ -722,36 +739,36 @@ class TelegramManager:
     ):
         """
         Executes native public channel post search (channels.searchPosts) by keyword or hashtag.
-        Falls back to messages.searchGlobal if channels.searchPosts is unsupported or restricted.
+        Raises SearchPostsUnsupportedError if unsupported or restricted.
         """
         from telethon.tl.functions.channels import SearchPostsRequest
         from telethon.tl.types import InputPeerEmpty
 
         active_session = session_name or (list(self.clients.keys())[0] if self.clients else "user_session")
-
         clean_hashtag = hashtag.lstrip('#') if hashtag else None
 
         async def _req(cl):
+            actual_peer = InputPeerEmpty()
+            if offset_peer is not None:
+                if isinstance(offset_peer, (int, str)):
+                    try:
+                        actual_peer = await cl.get_input_entity(int(offset_peer))
+                    except Exception:
+                        actual_peer = InputPeerEmpty()
+                else:
+                    actual_peer = offset_peer
+
             try:
                 return await cl(SearchPostsRequest(
                     hashtag=clean_hashtag,
                     query=query,
                     offset_rate=offset_rate,
-                    offset_peer=InputPeerEmpty(),
+                    offset_peer=actual_peer,
                     offset_id=offset_id,
                     limit=limit
                 ))
             except Exception as err:
-                logging.info(f"channels.searchPosts not supported/restricted ({err}); using messages.searchGlobal fallback.")
-                term = f"#{clean_hashtag}" if clean_hashtag else (query or "")
-                return await self.search_global_messages(
-                    query=term,
-                    session_name=active_session,
-                    offset_rate=offset_rate,
-                    offset_id=offset_id,
-                    limit=limit,
-                    shutdown_event=shutdown_event
-                )
+                raise SearchPostsUnsupportedError(f"channels.searchPosts failed/unsupported: {err}") from err
 
         return await self.execute_request(active_session, _req, shutdown_event=shutdown_event or asyncio.Event())
 

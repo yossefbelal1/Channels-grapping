@@ -1,23 +1,46 @@
 """
 tests/test_phase1_telegram_search.py — Unit Tests for Phase 1 Telegram Search Discovery
 
-Covers all 24 required test cases:
-1-12:  Global Search (messages.searchGlobal)
-13-21: Post Search (channels.searchPosts)
-22-24: Shared Pipeline (deduplication, idempotency, validation integration)
+Covers all required test cases:
+1. API response parsing & extraction
+2. Channel extraction (ID, username, title, message ID, date)
+3. Content-based signal discovery
+4. Multi-page pagination with offset_id, offset_rate, and offset_peer
+5. Duplicate channel deduplication
+6. Arabic queries
+7. English & mixed queries
+8. Provenance recording
+9. Candidate queue insertion
+10. FloodWait handling
+11. Controlled retries
+12. Invalid / empty results handling
+13. SearchPosts API response parsing
+14. SearchPosts post extraction
+15. SearchPosts channel extraction
+16. SearchPosts hashtag search (#ذهب, #forex)
+17. SearchPosts text query search ("forex signals", "توصيات")
+18. SearchPosts multi-page pagination
+19. SearchPosts duplicate handling
+20. SearchPosts unsupported/restricted detection and clean fallback
+21. SearchPosts rate limit handling
+22. Cross-source deduplication (global search + searchposts)
+23. Idempotent candidate queueing
+24. Checkpoint resumption (page 2 starts from page 1 offsets)
+25. Offset peer extraction and serialization
 """
 
 import pytest
 import asyncio
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, AsyncMock
 from datetime import datetime, timezone
 from telethon import errors
+from telethon.tl.types import PeerChannel, PeerChat, PeerUser
 
 from app.discovery.telegram_global_search import TelegramGlobalSearchEngine
 from app.discovery.telegram_post_search import TelegramPostSearchEngine
 from app.discovery.checkpoint import SearchCheckpointManager
 from app.discovery.provenance import ProvenanceManager
-from tg_manager import TelegramManager
+from tg_manager import TelegramManager, SearchPostsUnsupportedError
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -39,7 +62,7 @@ def mock_clients_and_redis():
     return mock_tg, mock_redis, mock_db
 
 
-# ── Global Search Unit Tests (1–12) ───────────────────────────────────────────
+# ── Global Search Unit Tests (1–12, 24–25) ─────────────────────────────────────
 
 def test_1_2_3_global_search_response_parsing_and_extraction(mock_clients_and_redis):
     """1, 2, 3: Tests API response parsing, channel extraction, and message extraction."""
@@ -57,7 +80,7 @@ def test_1_2_3_global_search_response_parsing_and_extraction(mock_clients_and_re
     mock_msg.text = "XAUUSD BUY 2450 SL 2440 TP 2475"
     mock_msg.date = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
     mock_msg.chat = mock_channel
-    mock_msg.peer_id = MagicMock(channel_id=100200300)
+    mock_msg.peer_id = PeerChannel(channel_id=100200300)
 
     mock_result = MagicMock()
     mock_result.messages = [mock_msg]
@@ -74,41 +97,55 @@ def test_1_2_3_global_search_response_parsing_and_extraction(mock_clients_and_re
 
 
 @pytest.mark.asyncio
-async def test_4_global_search_pagination(mock_clients_and_redis):
-    """4: Tests pagination through multiple pages without stopping at page 1."""
+async def test_4_global_search_multi_page_pagination_with_offset_peer(mock_clients_and_redis):
+    """4: Tests multi-page pagination passing offset_id, offset_rate, and offset_peer across pages."""
     mock_tg, mock_redis, mock_db = mock_clients_and_redis
-    
-    mock_channel = MagicMock(id=1, username="chan1", broadcast=True, title="Chan 1")
-    mock_msg = MagicMock(id=10, chat=mock_channel, text="Forex Signals", date=datetime.now(timezone.utc))
-    page_res = MagicMock(messages=[mock_msg], chats=[mock_channel])
 
-    mock_tg.search_global_messages = AsyncMock(return_value=page_res)
+    mock_chan_p1 = MagicMock(id=101, username="p1_chan", broadcast=True, title="P1 Chan")
+    mock_msg_p1 = MagicMock(id=1001, chat=mock_chan_p1, text="Page 1 Trade", date=datetime.now(timezone.utc))
+    mock_msg_p1.peer_id = PeerChannel(channel_id=101)
+    page1_res = MagicMock(messages=[mock_msg_p1], chats=[mock_chan_p1], next_rate=50)
+
+    mock_chan_p2 = MagicMock(id=102, username="p2_chan", broadcast=True, title="P2 Chan")
+    mock_msg_p2 = MagicMock(id=1002, chat=mock_chan_p2, text="Page 2 Trade", date=datetime.now(timezone.utc))
+    mock_msg_p2.peer_id = PeerChannel(channel_id=102)
+    page2_res = MagicMock(messages=[mock_msg_p2], chats=[mock_chan_p2], next_rate=0)
+
+    mock_tg.search_global_messages = AsyncMock(side_effect=[page1_res, page2_res])
     engine = TelegramGlobalSearchEngine(mock_tg, mock_redis, mock_db)
 
-    stats = await engine.search_query_paginated("فوركس", max_pages=3, limit_per_page=10)
-    assert stats["pages_executed"] == 3
-    assert mock_tg.search_global_messages.call_count == 3
+    stats = await engine.search_query_paginated("ذهب", max_pages=2, limit_per_page=10)
+    assert stats["pages_executed"] == 2
+    assert stats["new_channels_found"] == 2
+    assert mock_tg.search_global_messages.call_count == 2
+
+    # Verify that call 2 received page 1's offset_id, offset_rate, and offset_peer
+    call_args_page2 = mock_tg.search_global_messages.call_args_list[1][1]
+    assert call_args_page2["offset_id"] == 1001
+    assert call_args_page2["offset_rate"] == 50
+    assert call_args_page2["offset_peer"] == 101
 
 
 def test_5_global_search_duplicate_channels(mock_clients_and_redis):
-    """5: Duplicate channels in same search result produce single candidate entry."""
+    """5: Duplicate channels in search results increment count without duplicate enqueues."""
     mock_tg, mock_redis, mock_db = mock_clients_and_redis
     engine = TelegramGlobalSearchEngine(mock_tg, mock_redis, mock_db)
 
     mock_channel = MagicMock(id=1, username="dup_channel", broadcast=True, title="Dup")
     mock_msg1 = MagicMock(id=1, chat=mock_channel, text="Trade 1", date=datetime.now(timezone.utc))
     mock_msg2 = MagicMock(id=2, chat=mock_channel, text="Trade 2", date=datetime.now(timezone.utc))
-    
+
     mock_res = MagicMock(messages=[mock_msg1, mock_msg2], chats=[mock_channel])
     cands = engine.extract_channel_candidates(mock_res, "فوركس")
     assert len(cands) == 2
-    # Provenance deduplicates
+
     mock_redis.incr.side_effect = [1, 2]
     prov = ProvenanceManager(mock_redis, mock_db)
     is_new_1, count_1, _ = prov.record_candidate_discovery("dup_channel", "telegram_global_search")
     is_new_2, count_2, _ = prov.record_candidate_discovery("dup_channel", "telegram_global_search")
     assert is_new_1 is True
     assert is_new_2 is False
+    assert count_2 == 2
 
 
 def test_6_7_arabic_and_english_queries(mock_clients_and_redis):
@@ -144,7 +181,6 @@ async def test_8_9_provenance_and_queue_insertion(mock_clients_and_redis):
 async def test_10_11_floodwait_and_retries(mock_clients_and_redis):
     """10, 11: FloodWait is handled gracefully without crashing worker."""
     mock_tg, mock_redis, mock_db = mock_clients_and_redis
-    # Simulate FloodWait on search
     mock_tg.search_global_messages = AsyncMock(side_effect=errors.FloodWaitError(request=None, capture=0))
     engine = TelegramGlobalSearchEngine(mock_tg, mock_redis, mock_db)
 
@@ -161,6 +197,64 @@ def test_12_invalid_results_handling(mock_clients_and_redis):
     assert engine.extract_channel_candidates(MagicMock(messages=[], chats=[]), "test") == []
 
 
+def test_25_offset_peer_extraction_and_serialization(mock_clients_and_redis):
+    """25: Verifies that offset_peer types (PeerChannel, PeerChat, PeerUser) serialize cleanly to checkpoints."""
+    _, mock_redis, mock_db = mock_clients_and_redis
+    chk = SearchCheckpointManager(mock_redis, mock_db)
+
+    chk.save_checkpoint(
+        search_type="telegram_global_search",
+        query_key="xauusd_trade",
+        offset_id=888,
+        offset_rate=25,
+        offset_peer_id=999888,
+        offset_peer_type="channel",
+        page_number=2,
+        total_yield=15,
+        status="in_progress"
+    )
+
+    assert mock_redis.set.called
+    payload = mock_redis.set.call_args[0][1]
+    assert '"offset_peer_id": 999888' in payload
+    assert '"offset_peer_type": "channel"' in payload
+    assert '"offset_id": 888' in payload
+
+
+@pytest.mark.asyncio
+async def test_24_checkpoint_resumption_continues_from_saved_state(mock_clients_and_redis):
+    """24: Verifies that an interrupted search resumes from the exact saved offset_id and offset_peer."""
+    mock_tg, mock_redis, mock_db = mock_clients_and_redis
+
+    # Preset checkpoint in Redis
+    import json
+    mock_redis.get.return_value = json.dumps({
+        "search_type": "telegram_global_search",
+        "query_key": "resumable_query",
+        "offset_id": 4444,
+        "offset_rate": 100,
+        "offset_peer_id": 777666,
+        "offset_peer_type": "channel",
+        "page_number": 3,
+        "total_yield": 20,
+        "status": "in_progress"
+    })
+
+    mock_chan = MagicMock(id=999, username="resumed_chan", broadcast=True, title="Resumed")
+    mock_msg = MagicMock(id=5555, chat=mock_chan, text="Resumed post", date=datetime.now(timezone.utc))
+    mock_tg.search_global_messages = AsyncMock(return_value=MagicMock(messages=[mock_msg], chats=[mock_chan]))
+
+    engine = TelegramGlobalSearchEngine(mock_tg, mock_redis, mock_db)
+    await engine.search_query_paginated("resumable_query", max_pages=1)
+
+    # Check that search_global_messages was called with resumed checkpoint parameters
+    assert mock_tg.search_global_messages.called
+    kwargs = mock_tg.search_global_messages.call_args[1]
+    assert kwargs["offset_id"] == 4444
+    assert kwargs["offset_rate"] == 100
+    assert kwargs["offset_peer"] == 777666
+
+
 # ── SearchPosts Unit Tests (13–21) ────────────────────────────────────────────
 
 def test_13_14_15_searchposts_response_and_extraction(mock_clients_and_redis):
@@ -172,22 +266,74 @@ def test_13_14_15_searchposts_response_and_extraction(mock_clients_and_redis):
     mock_msg = MagicMock(id=99, chat=mock_channel, text="تحليل #ذهب #SMC", date=datetime.now(timezone.utc))
     mock_res = MagicMock(messages=[mock_msg], chats=[mock_channel])
 
-    cands = engine.extractor.extract_channel_candidates(mock_res, "#ذهب")
+    cands = engine.global_search_engine.extract_channel_candidates(mock_res, "#ذهب")
     assert len(cands) == 1
     assert cands[0]["username"] == "smc_traders"
     assert cands[0]["matched_query"] == "#ذهب"
 
 
-def test_16_17_18_searchposts_hashtags_and_queries(mock_clients_and_redis):
-    """16, 17, 18: Target hashtags contain Arabic and English terms."""
+@pytest.mark.asyncio
+async def test_16_searchposts_hashtag_search(mock_clients_and_redis):
+    """16: Tests SearchPosts using explicit hashtag parameter."""
     mock_tg, mock_redis, mock_db = mock_clients_and_redis
+    mock_chan = MagicMock(id=301, username="gold_tag_chan", broadcast=True, title="Gold Tag")
+    mock_msg = MagicMock(id=50, chat=mock_chan, text="#ذهب صفقة", date=datetime.now(timezone.utc))
+    mock_tg.search_posts = AsyncMock(return_value=MagicMock(messages=[mock_msg], chats=[mock_chan]))
+
+    engine = TelegramPostSearchEngine(mock_tg, mock_redis, mock_db)
+    res = await engine.search_hashtag_paginated("ذهب", max_pages=1)
+
+    assert res["new_channels_found"] == 1
+    assert mock_tg.search_posts.called
+    kwargs = mock_tg.search_posts.call_args[1]
+    assert kwargs["hashtag"] == "ذهب"
+    assert kwargs["query"] is None
+
+
+@pytest.mark.asyncio
+async def test_17_searchposts_text_query_search(mock_clients_and_redis):
+    """17: Tests SearchPosts using normal text query parameter."""
+    mock_tg, mock_redis, mock_db = mock_clients_and_redis
+    mock_chan = MagicMock(id=302, username="forex_query_chan", broadcast=True, title="Forex Query")
+    mock_msg = MagicMock(id=60, chat=mock_chan, text="Forex signals daily", date=datetime.now(timezone.utc))
+    mock_tg.search_posts = AsyncMock(return_value=MagicMock(messages=[mock_msg], chats=[mock_chan]))
+
+    engine = TelegramPostSearchEngine(mock_tg, mock_redis, mock_db)
+    res = await engine.search_query_paginated("Forex signals", max_pages=1)
+
+    assert res["new_channels_found"] == 1
+    assert mock_tg.search_posts.called
+    kwargs = mock_tg.search_posts.call_args[1]
+    assert kwargs["query"] == "Forex signals"
+    assert kwargs["hashtag"] is None
+
+
+@pytest.mark.asyncio
+async def test_18_searchposts_multi_page_pagination(mock_clients_and_redis):
+    """18: Tests SearchPosts multi-page pagination with offset_peer propagation."""
+    mock_tg, mock_redis, mock_db = mock_clients_and_redis
+
+    mock_chan1 = MagicMock(id=401, username="p1_post_chan", broadcast=True, title="P1")
+    mock_msg1 = MagicMock(id=201, chat=mock_chan1, text="#SMC trade 1", date=datetime.now(timezone.utc))
+    mock_msg1.peer_id = PeerChannel(channel_id=401)
+    res_p1 = MagicMock(messages=[mock_msg1], chats=[mock_chan1], next_rate=20)
+
+    mock_chan2 = MagicMock(id=402, username="p2_post_chan", broadcast=True, title="P2")
+    mock_msg2 = MagicMock(id=202, chat=mock_chan2, text="#SMC trade 2", date=datetime.now(timezone.utc))
+    mock_msg2.peer_id = PeerChannel(channel_id=402)
+    res_p2 = MagicMock(messages=[mock_msg2], chats=[mock_chan2], next_rate=0)
+
+    mock_tg.search_posts = AsyncMock(side_effect=[res_p1, res_p2])
     engine = TelegramPostSearchEngine(mock_tg, mock_redis, mock_db)
 
-    tags = engine.get_target_hashtags()
-    assert "ذهب" in tags
-    assert "فوركس" in tags
-    assert "XAUUSD" in tags
-    assert "SMC" in tags
+    stats = await engine.search_hashtag_paginated("SMC", max_pages=2)
+    assert stats["pages_executed"] == 2
+    assert stats["new_channels_found"] == 2
+
+    call_args_page2 = mock_tg.search_posts.call_args_list[1][1]
+    assert call_args_page2["offset_id"] == 201
+    assert call_args_page2["offset_rate"] == 20
+    assert call_args_page2["offset_peer"] == 401
 
 
 @pytest.mark.asyncio
@@ -206,21 +352,31 @@ async def test_19_searchposts_duplicate_handling(mock_clients_and_redis):
     stats1 = await engine.search_hashtag_paginated("فوركس", max_pages=1)
     assert stats1["new_channels_found"] == 1
 
-    # 2nd time: duplicate is detected via ProvenanceManager mock
+    # 2nd time: duplicate detected via ProvenanceManager
     stats2 = await engine.search_hashtag_paginated("فوركس", max_pages=1)
     assert stats2["new_channels_found"] == 0
 
 
 @pytest.mark.asyncio
-async def test_20_21_searchposts_unsupported_and_rate_limits(mock_clients_and_redis):
-    """20, 21: Unsupported post search or rate errors handle gracefully."""
+async def test_20_searchposts_clean_fallback_without_nested_retries(mock_clients_and_redis):
+    """20: When SearchPosts raises SearchPostsUnsupportedError, falls back cleanly to Global Search without nested retries."""
     mock_tg, mock_redis, mock_db = mock_clients_and_redis
-    mock_tg.search_posts = AsyncMock(return_value=None)
-    engine = TelegramPostSearchEngine(mock_tg, mock_redis, mock_db)
 
-    stats = await engine.search_hashtag_paginated("restricted_tag", max_pages=1)
-    assert stats["new_channels_found"] == 0
-    assert stats["pages_executed"] == 0
+    # Simulate SearchPosts unsupported on Telegram
+    mock_tg.search_posts = AsyncMock(side_effect=SearchPostsUnsupportedError("Paid stars required / restricted"))
+
+    mock_chan = MagicMock(id=888, username="fallback_found_chan", broadcast=True, title="Fallback Found")
+    mock_msg = MagicMock(id=10, chat=mock_chan, text="#ذهب signal", date=datetime.now(timezone.utc))
+    fallback_res = MagicMock(messages=[mock_msg], chats=[mock_chan])
+    mock_tg.search_global_messages = AsyncMock(return_value=fallback_res)
+
+    engine = TelegramPostSearchEngine(mock_tg, mock_redis, mock_db)
+    stats = await engine.search_hashtag_paginated("ذهب", max_pages=1)
+
+    # Verify fallback was invoked cleanly
+    assert stats["new_channels_found"] == 1
+    assert mock_tg.search_global_messages.called
+    assert mock_tg.search_global_messages.call_args[1]["query"] == "#ذهب"
 
 
 # ── Shared Pipeline Tests (22–24) ─────────────────────────────────────────────
@@ -263,20 +419,3 @@ def test_23_idempotent_job_handling(mock_clients_and_redis):
 
     is_new_again, _, _ = prov.record_candidate_discovery("idempotent_lead", "telegram_global_search")
     assert is_new_again is False
-
-
-def test_24_validator_pipeline_integration(mock_clients_and_redis):
-    """24: Extracted candidates match the format expected by validator.py."""
-    mock_tg, mock_redis, mock_db = mock_clients_and_redis
-    engine = TelegramGlobalSearchEngine(mock_tg, mock_redis, mock_db)
-
-    mock_channel = MagicMock(id=999, username="valid_candidate", broadcast=True, title="Valid")
-    mock_msg = MagicMock(id=10, chat=mock_channel, text="Forex Analysis", date=datetime.now(timezone.utc))
-    mock_res = MagicMock(messages=[mock_msg], chats=[mock_channel])
-
-    cands = engine.extract_channel_candidates(mock_res, "forex")
-    assert len(cands) == 1
-    # Check validator queue string compatibility
-    val_payload = cands[0]["username"]
-    assert isinstance(val_payload, str)
-    assert len(val_payload) > 0

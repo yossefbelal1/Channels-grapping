@@ -1,5 +1,10 @@
 """
 app/discovery/checkpoint.py — Resumable Search State Tracker & Pagination Checkpointer
+
+Persists complete pagination and offset states for Telegram global message searches,
+post searches, and web crawls to ensure seamless resumption across restarts.
+Stores offset_id, offset_rate, offset_peer, page number, query, and status.
+Backed by Redis for low-latency atomic updates and PostgreSQL for permanent audit.
 """
 
 import json
@@ -14,7 +19,6 @@ class SearchCheckpointManager:
     """
     Persists pagination and offset states for Telegram global message searches,
     post searches, and web crawls to ensure seamless resumption across restarts.
-    Backed by Redis for low-latency atomic updates and PostgreSQL for permanent audit.
     """
 
     def __init__(self, redis_conn, db_conn=None):
@@ -31,6 +35,8 @@ class SearchCheckpointManager:
         query_key: str,
         offset_id: int = 0,
         offset_rate: int = 0,
+        offset_peer_id: Optional[int] = None,
+        offset_peer_type: Optional[str] = None,
         offset_date: Optional[datetime] = None,
         page_number: int = 1,
         total_yield: int = 0,
@@ -38,16 +44,18 @@ class SearchCheckpointManager:
     ) -> None:
         """Saves current search offset state in Redis and PostgreSQL."""
         key = self._redis_key(search_type, query_key)
-        date_str = offset_date.isoformat() if offset_date else None
-        
+        date_str = offset_date.isoformat() if isinstance(offset_date, datetime) else (str(offset_date) if offset_date else None)
+
         payload = {
             "search_type": search_type,
             "query_key": query_key,
-            "offset_id": offset_id,
-            "offset_rate": offset_rate,
+            "offset_id": int(offset_id) if offset_id is not None else 0,
+            "offset_rate": int(offset_rate) if offset_rate is not None else 0,
+            "offset_peer_id": offset_peer_id,
+            "offset_peer_type": offset_peer_type,
             "offset_date": date_str,
-            "page_number": page_number,
-            "total_yield": total_yield,
+            "page_number": int(page_number),
+            "total_yield": int(total_yield),
             "status": status,
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
@@ -90,6 +98,8 @@ class SearchCheckpointManager:
         try:
             cached = self.redis.get(key)
             if cached:
+                if isinstance(cached, bytes):
+                    cached = cached.decode('utf-8')
                 return json.loads(cached)
         except Exception as err:
             logger.warning(f"Failed to read search checkpoint from Redis: {err}")
@@ -108,24 +118,29 @@ class SearchCheckpointManager:
                         return dict(row)
             except Exception as db_err:
                 logger.warning(f"Failed to read search checkpoint from DB: {db_err}")
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
 
         return None
 
-    def mark_completed(self, search_type: str, query_key: str, total_yield: int = 0) -> None:
-        """Marks a search checkpoint as fully traversed."""
-        self.save_checkpoint(
-            search_type=search_type,
-            query_key=query_key,
-            total_yield=total_yield,
-            status="completed"
-        )
+    def reset_checkpoint(self, search_type: str, query_key: str) -> None:
+        """Clears search checkpoint in Redis and marks completed in DB."""
+        key = self._redis_key(search_type, query_key)
+        try:
+            self.redis.delete(key)
+        except Exception as err:
+            logger.warning(f"Failed to delete search checkpoint in Redis: {err}")
 
-    def mark_rate_limited(self, search_type: str, query_key: str, last_offset_id: int, total_yield: int) -> None:
-        """Marks a search checkpoint as paused due to rate limits."""
-        self.save_checkpoint(
-            search_type=search_type,
-            query_key=query_key,
-            offset_id=last_offset_id,
-            total_yield=total_yield,
-            status="rate_limited"
-        )
+        if self.db:
+            try:
+                with self.db.cursor() as cur:
+                    cur.execute("""
+                        UPDATE discovery_checkpoints
+                        SET status = 'reset', updated_at = NOW()
+                        WHERE search_type = %s AND query_key = %s
+                    """, (search_type, query_key))
+                self.db.commit()
+            except Exception:
+                pass

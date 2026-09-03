@@ -4,6 +4,7 @@ app/discovery/telegram_global_search.py — Telegram Global Message Discovery En
 Implements native messages.searchGlobal discovery across public Telegram channels.
 Discovers channels based on post content signals (e.g. XAUUSD trade setups)
 even when channel titles lack Forex keywords.
+Maintains full pagination state (offset_id, offset_rate, offset_peer, page_number).
 """
 
 import logging
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 class TelegramGlobalSearchEngine:
     """
-    Executes content-based global message search with pagination,
+    Executes content-based global message search with stateful pagination,
     provenance tracking, deduplication, and candidate queueing.
     """
 
@@ -45,11 +46,9 @@ class TelegramGlobalSearchEngine:
         Gathers high-priority search queries across Arabic & English Forex taxonomy.
         """
         queries = []
-        # Core categories
         for cat in ["FOREX", "GOLD_XAUUSD", "SIGNALS", "SMC_ICT", "TRADING_STYLES"]:
             for kw in get_category_keywords(cat):
                 queries.append(kw)
-                # Controlled query variants
                 for var in generate_query_variants(kw):
                     if var not in queries:
                         queries.append(var)
@@ -89,7 +88,6 @@ class TelegramGlobalSearchEngine:
                 msg_id = getattr(msg, 'id', None)
                 msg_date = getattr(msg, 'date', None)
 
-                # Prioritize username or public handle
                 handle_or_link = username or f"channel_{channel_id}"
                 if handle_or_link:
                     candidates.append({
@@ -113,7 +111,7 @@ class TelegramGlobalSearchEngine:
         shutdown_event: Optional[asyncio.Event] = None
     ) -> Dict[str, Any]:
         """
-        Executes paginated global search for a query with offset checkpoint resumption.
+        Executes paginated global search for a query with full offset checkpoint resumption.
         Feeds newly discovered candidates directly into the candidate queue.
         """
         shutdown_event = shutdown_event or asyncio.Event()
@@ -123,17 +121,24 @@ class TelegramGlobalSearchEngine:
         cp = self.checkpoint_mgr.get_checkpoint(search_type, query)
         offset_id = cp.get("offset_id", 0) if cp else 0
         offset_rate = cp.get("offset_rate", 0) if cp else 0
+        offset_peer_id = cp.get("offset_peer_id", None) if cp else None
         page = cp.get("page_number", 1) if cp else 1
         total_discovered = cp.get("total_yield", 0) if cp else 0
 
         pages_executed = 0
         new_channels_found = 0
 
+        prev_state = None
+
         while pages_executed < max_pages and not shutdown_event.is_set():
-            logger.info(f"[GlobalSearch] Query '{query}' — Fetching page {page} (offset_id={offset_id})...")
+            logger.info(
+                f"[GlobalSearch] Query '{query}' — Fetching page {page} "
+                f"(offset_id={offset_id}, offset_rate={offset_rate}, offset_peer={offset_peer_id})..."
+            )
             try:
                 res = await self.tg.search_global_messages(
                     query=query,
+                    offset_peer=offset_peer_id,
                     offset_rate=offset_rate,
                     offset_id=offset_id,
                     limit=limit_per_page,
@@ -150,6 +155,8 @@ class TelegramGlobalSearchEngine:
                     query_key=query,
                     offset_id=0,
                     offset_rate=0,
+                    offset_peer_id=None,
+                    offset_peer_type=None,
                     page_number=page,
                     total_yield=total_discovered,
                     status="completed"
@@ -172,16 +179,41 @@ class TelegramGlobalSearchEngine:
                 )
 
                 if is_new:
-                    # Enqueue for Stage 1 cheap validation
                     self.redis.rpush(self.candidate_queue, cand["username"] or cand["handle_or_link"])
                     new_channels_found += 1
                     total_discovered += 1
 
-            # Update pagination offsets
+            # Extract next pagination state
             msgs = res.messages
             last_msg = msgs[-1]
-            offset_id = getattr(last_msg, 'id', 0)
-            offset_rate = getattr(res, 'next_rate', 0) if hasattr(res, 'next_rate') else 0
+            next_offset_id = getattr(last_msg, 'id', 0)
+            next_offset_rate = getattr(res, 'next_rate', 0) if hasattr(res, 'next_rate') else 0
+            
+            # Extract peer ID
+            next_peer_id = None
+            next_peer_type = None
+            peer_obj = getattr(last_msg, 'peer_id', None)
+            if peer_obj:
+                if hasattr(peer_obj, 'channel_id'):
+                    next_peer_id = peer_obj.channel_id
+                    next_peer_type = "channel"
+                elif hasattr(peer_obj, 'chat_id'):
+                    next_peer_id = peer_obj.chat_id
+                    next_peer_type = "chat"
+                elif hasattr(peer_obj, 'user_id'):
+                    next_peer_id = peer_obj.user_id
+                    next_peer_type = "user"
+
+            # Check for duplicate page loops
+            current_state = (next_offset_id, next_offset_rate, next_peer_id)
+            if current_state == prev_state:
+                logger.info(f"[GlobalSearch] Query '{query}' returned identical offset state. Ending pagination.")
+                break
+            prev_state = current_state
+
+            offset_id = next_offset_id
+            offset_rate = next_offset_rate
+            offset_peer_id = next_peer_id
             page += 1
             pages_executed += 1
 
@@ -190,17 +222,22 @@ class TelegramGlobalSearchEngine:
                 query_key=query,
                 offset_id=offset_id,
                 offset_rate=offset_rate,
+                offset_peer_id=offset_peer_id,
+                offset_peer_type=next_peer_type,
                 page_number=page,
                 total_yield=total_discovered,
                 status="in_progress"
             )
 
             # Polite throttle between search pages
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(1.5)
 
         return {
             "query": query,
             "pages_executed": pages_executed,
             "new_channels_found": new_channels_found,
-            "total_yield": total_discovered
+            "total_yield": total_discovered,
+            "last_offset_id": offset_id,
+            "last_offset_rate": offset_rate,
+            "last_offset_peer_id": offset_peer_id
         }
