@@ -712,7 +712,7 @@ class TelegramManager:
 
     async def search_posts(
         self,
-        query: str = "",
+        query: Optional[str] = None,
         hashtag: Optional[str] = None,
         session_name: Optional[str] = None,
         offset_rate: int = 0,
@@ -721,15 +721,37 @@ class TelegramManager:
         shutdown_event: Optional[asyncio.Event] = None
     ):
         """
-        Searches public posts with fallback to global message search if searchPosts is restricted.
+        Executes native public channel post search (channels.searchPosts) by keyword or hashtag.
+        Falls back to messages.searchGlobal if channels.searchPosts is unsupported or restricted.
         """
-        search_term = f"#{hashtag} {query}".strip() if hashtag else query
-        return await self.search_global_messages(
-            query=search_term,
-            session_name=session_name,
-            offset_rate=offset_rate,
-            offset_id=offset_id,
-            limit=limit,
-            shutdown_event=shutdown_event
-        )
+        from telethon.tl.functions.channels import SearchPostsRequest
+        from telethon.tl.types import InputPeerEmpty
+
+        active_session = session_name or (list(self.clients.keys())[0] if self.clients else "user_session")
+
+        clean_hashtag = hashtag.lstrip('#') if hashtag else None
+
+        async def _req(cl):
+            try:
+                return await cl(SearchPostsRequest(
+                    hashtag=clean_hashtag,
+                    query=query,
+                    offset_rate=offset_rate,
+                    offset_peer=InputPeerEmpty(),
+                    offset_id=offset_id,
+                    limit=limit
+                ))
+            except Exception as err:
+                logging.info(f"channels.searchPosts not supported/restricted ({err}); using messages.searchGlobal fallback.")
+                term = f"#{clean_hashtag}" if clean_hashtag else (query or "")
+                return await self.search_global_messages(
+                    query=term,
+                    session_name=active_session,
+                    offset_rate=offset_rate,
+                    offset_id=offset_id,
+                    limit=limit,
+                    shutdown_event=shutdown_event
+                )
+
+        return await self.execute_request(active_session, _req, shutdown_event=shutdown_event or asyncio.Event())
 
