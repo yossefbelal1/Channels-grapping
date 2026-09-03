@@ -36,7 +36,9 @@ class ForwardAnalyzer:
         if getattr(fwd, 'from_id', None):
             from telethon.tl.types import PeerChannel
             if isinstance(fwd.from_id, PeerChannel):
-                origin["channel_id"] = fwd.from_id.channel_id
+                origin["channel_id"] = str(fwd.from_id.channel_id)
+            elif isinstance(getattr(fwd.from_id, 'channel_id', None), (int, str)):
+                origin["channel_id"] = str(fwd.from_id.channel_id)
 
         return origin
 

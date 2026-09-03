@@ -11,8 +11,8 @@ def test_edge_relation_constants():
     assert EdgeRelation.MENTION == "mention"
     assert EdgeRelation.FORWARDED_FROM == "forwarded_from"
     assert EdgeRelation.PROMOTED == "promoted"
-    assert EdgeRelation.LINKED == "linked"
-    assert EdgeRelation.RECOMMENDED == "recommended"
+    assert EdgeRelation.LINK == "link"
+    assert EdgeRelation.RECOMMENDATION == "recommendation"
 
 
 def test_record_edge_mocked_db():

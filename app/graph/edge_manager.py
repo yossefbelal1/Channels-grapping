@@ -11,13 +11,17 @@ logger = logging.getLogger(__name__)
 
 
 class EdgeRelation:
+    LINK = "link"
+    LINKED = "link"                     # Alias
     MENTION = "mention"                 # @username mention in post text
     FORWARDED_FROM = "forwarded_from"   # Post forwarded from origin channel
     PROMOTED = "promoted"               # Sponsored or ad-exchange promotional post
-    LINKED = "linked"                   # Direct t.me URL or invite link in post/button
-    RECOMMENDED = "recommended"         # Telegram official similar channel recommendation
+    REFERENCED = "referenced"           # Reference to another channel/group
+    RECOMMENDATION = "recommendation"   # Telegram official similar channel recommendation
+    RECOMMENDED = "recommendation"       # Alias
+    EXTERNAL_SITE = "external_site"     # Link to broker, prop firm, landing page
 
-    ALL = [MENTION, FORWARDED_FROM, PROMOTED, LINKED, RECOMMENDED]
+    ALL = [LINK, MENTION, FORWARDED_FROM, PROMOTED, REFERENCED, RECOMMENDATION, EXTERNAL_SITE]
 
 
 class GraphEdgeManager:

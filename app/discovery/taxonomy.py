@@ -110,23 +110,21 @@ def get_category_keywords(category: str) -> List[str]:
     return KEYWORD_TAXONOMY.get(category, [])
 
 
-def classify_text_taxonomy(text: str) -> Dict[str, int]:
+def classify_text_taxonomy(text: str) -> Dict[str, List[str]]:
     """
     Scans a given text (bio, description, or post collection) against the keyword taxonomy.
-    Returns a dictionary of category -> hit_count.
+    Returns a dictionary of category -> list of matched keywords for scoring & evidence tracking.
     """
     if not text:
-        return {cat: 0 for cat in KEYWORD_TAXONOMY}
+        return {cat: [] for cat in KEYWORD_TAXONOMY}
 
     normalized_text = normalize_arabic_text(text.lower())
-    hits: Dict[str, int] = {}
+    matches: Dict[str, List[str]] = {cat: [] for cat in KEYWORD_TAXONOMY}
 
     for category, keywords in KEYWORD_TAXONOMY.items():
-        cat_hits = 0
         for kw in keywords:
             kw_norm = normalize_arabic_text(kw.lower())
             if kw_norm in normalized_text:
-                cat_hits += 1
-        hits[category] = cat_hits
+                matches[category].append(kw)
 
-    return hits
+    return matches

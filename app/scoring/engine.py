@@ -42,7 +42,7 @@ class LeadScoringEngine:
         # Run lightweight taxonomy check
         from app.discovery.taxonomy import classify_text_taxonomy
         tax_hits = classify_text_taxonomy(combined)
-        total_hits = sum(tax_hits.values())
+        total_hits = sum(len(terms) if isinstance(terms, list) else int(terms) for terms in tax_hits.values())
 
         if total_hits >= 1:
             return True, "Passed Stage 1 with relevant trading keywords", min(100, total_hits * 25)

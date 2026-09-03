@@ -662,8 +662,8 @@ class TelegramManager:
 
     async def search_global_messages(
         self,
-        session_name: str,
         query: str,
+        session_name: Optional[str] = None,
         offset_rate: int = 0,
         offset_id: int = 0,
         limit: int = 100,
@@ -675,6 +675,8 @@ class TelegramManager:
         """
         from telethon.tl.functions.messages import SearchGlobalRequest
         from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty
+
+        active_session = session_name or (list(self.clients.keys())[0] if self.clients else "user_session")
 
         async def _req(cl):
             return await cl(SearchGlobalRequest(
@@ -688,12 +690,12 @@ class TelegramManager:
                 limit=limit
             ))
 
-        return await self.execute_request(session_name, _req, shutdown_event=shutdown_event or asyncio.Event())
+        return await self.execute_request(active_session, _req, shutdown_event=shutdown_event or asyncio.Event())
 
     async def get_channel_recommendations(
         self,
-        session_name: str,
         channel_peer,
+        session_name: Optional[str] = None,
         shutdown_event: Optional[asyncio.Event] = None
     ):
         """
@@ -701,16 +703,18 @@ class TelegramManager:
         """
         from telethon.tl.functions.channels import GetChannelRecommendationsRequest
 
+        active_session = session_name or (list(self.clients.keys())[0] if self.clients else "user_session")
+
         async def _req(cl):
             return await cl(GetChannelRecommendationsRequest(channel=channel_peer))
 
-        return await self.execute_request(session_name, _req, shutdown_event=shutdown_event or asyncio.Event())
+        return await self.execute_request(active_session, _req, shutdown_event=shutdown_event or asyncio.Event())
 
     async def search_posts(
         self,
-        session_name: str,
-        query: str,
+        query: str = "",
         hashtag: Optional[str] = None,
+        session_name: Optional[str] = None,
         offset_rate: int = 0,
         offset_id: int = 0,
         limit: int = 100,
@@ -721,8 +725,8 @@ class TelegramManager:
         """
         search_term = f"#{hashtag} {query}".strip() if hashtag else query
         return await self.search_global_messages(
-            session_name=session_name,
             query=search_term,
+            session_name=session_name,
             offset_rate=offset_rate,
             offset_id=offset_id,
             limit=limit,

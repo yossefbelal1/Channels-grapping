@@ -2767,6 +2767,63 @@ async def api_emergency_resume():
     except Exception as e:
         return {"error": str(e)}
 
+
+@app.get("/metrics")
+async def get_prometheus_metrics():
+    """Prometheus-compatible plain text metrics endpoint."""
+    lines = []
+    try:
+        redis_conn = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'localhost'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            db=int(os.getenv('REDIS_DB', 0)),
+            decode_responses=True
+        )
+        
+        # 1. Queue Depths
+        for q in ['queue:critical', 'queue:high', 'queue:normal', 'queue:low', 'outreach:high', 'outreach:normal', 'outreach:low', 'recommendations:queue']:
+            depth = redis_conn.llen(q) or 0
+            lines.append(f'lead_queue_depth{{queue="{q}"}} {depth}')
+        
+        # 2. Seen Channels Count
+        seen_count = redis_conn.scard('seen_channels') or 0
+        lines.append(f'lead_seen_channels_total {seen_count}')
+    except Exception as re_err:
+        lines.append(f'# redis_metrics_error: {re_err}')
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Total leads
+        cur.execute("SELECT COUNT(*) as total FROM leads")
+        total_leads = cur.fetchone()['total']
+        lines.append(f'lead_channels_total {total_leads}')
+        
+        # Leads by Tier
+        cur.execute("SELECT tier, COUNT(*) as count FROM leads GROUP BY tier")
+        for row in cur.fetchall():
+            tier_name = row['tier'] or 'unclassified'
+            lines.append(f'lead_channels_by_tier{{tier="{tier_name}"}} {row["count"]}')
+        
+        # Total Graph Edges
+        cur.execute("SELECT COUNT(*) as total FROM channel_edges")
+        total_edges = cur.fetchone()['total']
+        lines.append(f'lead_graph_edges_total {total_edges}')
+        
+        # Total Snapshots
+        cur.execute("SELECT COUNT(*) as total FROM channel_snapshots")
+        total_snaps = cur.fetchone()['total']
+        lines.append(f'lead_snapshots_total {total_snaps}')
+        
+        conn.close()
+    except Exception as db_err:
+        lines.append(f'# db_metrics_error: {db_err}')
+
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("dashboard:app", host="0.0.0.0", port=port, log_level="info")

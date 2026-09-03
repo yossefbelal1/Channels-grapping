@@ -1,12 +1,13 @@
 """
-app/scoring/dimensions.py — 13-Dimension Lead Scoring Calculator
+app/scoring/dimensions.py — 13-Dimension Lead Scoring Calculator with Evidence Tracking
 """
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone, timedelta
 from app.discovery.arabic_normalizer import calculate_arabic_letter_ratio, normalize_arabic_text
 from app.discovery.taxonomy import classify_text_taxonomy
+from app.scoring.growth_analyzer import GrowthAnalyzer
 
 
 @dataclass
@@ -26,6 +27,7 @@ class ScoringDimensions:
     new_channel_score: int = 0
     final_score: int = 0
     tier: str = "Tier_D"
+    evidence: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -45,11 +47,13 @@ def calculate_all_dimensions(
     posts_7d: int = 0,
     posts_30d: int = 0,
     creation_date: Optional[datetime] = None,
-    is_group: bool = False
+    is_group: bool = False,
+    snapshots: Optional[List[Dict[str, Any]]] = None
 ) -> ScoringDimensions:
     """
     Computes all 13 scoring dimensions without subscriber-count bias.
     Actively rewards niche expertise, signal density, and new/growing channels.
+    Stores classification evidence dictionary detailing reasons for scores.
     """
     recent_posts = recent_posts or []
     contact_types = contact_types or []
@@ -59,88 +63,91 @@ def calculate_all_dimensions(
     arabic_ratio = calculate_arabic_letter_ratio(all_text)
     arabic_score = int(arabic_ratio * 100)
 
-    # 2. Taxonomy Breakdown
-    tax_hits = classify_text_taxonomy(all_text)
-    
-    # 3. Core Forex Score (0 to 100)
-    forex_hits = tax_hits.get("FOREX", 0)
-    forex_score = min(100, forex_hits * 15)
+    # 2. Taxonomy Intent Classification
+    tax_matches = classify_text_taxonomy(all_text)
 
-    # 4. Trading / Technical Analysis Score (0 to 100)
-    trading_hits = tax_hits.get("TRADING_STYLES", 0) + tax_hits.get("SMC_ICT", 0)
-    trading_score = min(100, trading_hits * 18)
+    # 3. Forex Intent Score (0 to 100)
+    forex_terms = tax_matches.get("FOREX", [])
+    forex_score = min(100, len(forex_terms) * 15)
 
-    # 5. Live Signals Score (0 to 100)
-    signal_hits = tax_hits.get("SIGNALS", 0)
-    signal_score = min(100, signal_hits * 20)
+    # 4. Gold / XAUUSD Score (0 to 100)
+    gold_terms = tax_matches.get("GOLD_XAUUSD", [])
+    gold_score = min(100, len(gold_terms) * 20)
 
-    # 6. Gold / XAUUSD Specialization Score (0 to 100)
-    gold_hits = tax_hits.get("GOLD_XAUUSD", 0)
-    gold_score = min(100, gold_hits * 22)
+    # 5. Trading Methodology & SMC/ICT Score (0 to 100)
+    trading_terms = tax_matches.get("TRADING_STYLES", [])
+    smc_terms = tax_matches.get("SMC_ICT", [])
+    trading_score = min(100, (len(trading_terms) * 12) + (len(smc_terms) * 18))
 
-    # 7. Commercial & Business Offerings Score (0 to 100)
-    commercial_hits = (
-        tax_hits.get("COMMERCIAL_SERVICES", 0) +
-        tax_hits.get("PROP_FIRMS", 0) +
-        tax_hits.get("BROKERS_PLATFORMS", 0)
-    )
-    commercial_score = min(100, commercial_hits * 16)
+    # 6. Signals Score (0 to 100)
+    signal_terms = tax_matches.get("SIGNALS", [])
+    signal_score = min(100, len(signal_terms) * 18)
 
-    # 8. Contact Availability Score (0 to 100)
+    # 7. Commercial Services Score (0 to 100)
+    comm_terms = tax_matches.get("COMMERCIAL_SERVICES", [])
+    prop_terms = tax_matches.get("PROP_FIRMS", [])
+    commercial_score = min(100, (len(comm_terms) * 15) + (len(prop_terms) * 15))
+
+    # 8. Contactability Score (0 to 100)
     contact_score = 0
     if has_contact:
         contact_score += 40
+    if "owner" in contact_types or "admin" in contact_types:
+        contact_score += 30
     if "whatsapp" in contact_types:
-        contact_score += 25
-    if "admin" in contact_types or "owner" in contact_types:
         contact_score += 20
-    if "website" in contact_types:
-        contact_score += 15
+    if "website" in contact_types or "linktree" in contact_types:
+        contact_score += 10
     contact_score = min(100, contact_score)
 
-    # 9. Activity Score (0 to 100)
+    # 9. Activity Velocity Score (0 to 100)
+    # Evaluates recent 24h/7d/30d posting frequency
     activity_score = 0
-    if posts_24h >= 3:
+    if posts_24h >= 5:
         activity_score += 50
     elif posts_24h >= 1:
-        activity_score += 35
-    elif posts_7d >= 5:
-        activity_score += 25
-
-    if posts_7d >= 15:
         activity_score += 30
     elif posts_7d >= 7:
         activity_score += 20
 
-    if posts_30d >= 30:
+    if posts_7d >= 20:
+        activity_score += 30
+    elif posts_7d >= 5:
+        activity_score += 15
+
+    if posts_30d >= 50:
         activity_score += 20
+    elif posts_30d >= 10:
+        activity_score += 10
     activity_score = min(100, activity_score)
 
     # 10. Freshness Score (0 to 100)
     now = datetime.now(timezone.utc)
     freshness_score = 0
     if last_post_at:
-        # Handle naive datetime
         if last_post_at.tzinfo is None:
             last_post_at = last_post_at.replace(tzinfo=timezone.utc)
-        diff_hours = (now - last_post_at).total_seconds() / 3600.0
-        if diff_hours <= 12:
+        hours_since_last = (now - last_post_at).total_seconds() / 3600.0
+        if hours_since_last <= 24:
             freshness_score = 100
-        elif diff_hours <= 24:
-            freshness_score = 85
-        elif diff_hours <= 72:
-            freshness_score = 60
-        elif diff_hours <= 168: # 7 days
-            freshness_score = 40
+        elif hours_since_last <= 72:
+            freshness_score = 80
+        elif hours_since_last <= 168: # 7 days
+            freshness_score = 50
+        elif hours_since_last <= 720: # 30 days
+            freshness_score = 25
         else:
-            freshness_score = 10
+            freshness_score = 5
+    elif posts_24h > 0:
+        freshness_score = 90
+    elif posts_7d > 0:
+        freshness_score = 60
 
-    # 11. Multi-Source Discovery Score (0 to 100)
-    discovery_score = min(100, discovery_count * 25)
+    # 11. Multi-Source Discovery Confidence Score (0 to 100)
+    discovery_score = min(100, 25 * max(1, discovery_count))
 
-    # 12. Small & New Channel Prioritization Score (0 to 100)
+    # 12. New & Small Channel Prioritization Score (0 to 100)
     new_channel_score = 0
-    # Channel age evaluation (boost if created in last 90 days or first seen recently)
     if creation_date:
         if creation_date.tzinfo is None:
             creation_date = creation_date.replace(tzinfo=timezone.utc)
@@ -163,18 +170,28 @@ def calculate_all_dimensions(
         new_channel_score += 30
     new_channel_score = min(100, new_channel_score)
 
-    # 13. Growth Score (Default heuristic, enriched via snapshots)
-    growth_score = 50
-    if posts_7d >= 10 and member_count >= 100:
-        growth_score = min(100, 50 + int(posts_7d * 2))
+    # 13. Growth Score (Observed snapshots delta or fallback activity)
+    if snapshots and len(snapshots) >= 2:
+        growth_score, growth_evidence = GrowthAnalyzer.calculate_growth_from_snapshots(snapshots)
+    else:
+        growth_score = 50
+        if posts_7d >= 10 and member_count >= 100:
+            growth_score = min(100, 50 + int(posts_7d * 2))
+        growth_evidence = {
+            "status": "UNOBSERVED_SNAPSHOTS",
+            "snapshot_count": len(snapshots) if snapshots else 0,
+            "growth_score": growth_score
+        }
 
     # 14. Legitimacy / Anti-Spam Score (0 to 100)
     legitimacy_score = 100
     lower_all = all_text.lower()
     spam_phrases = ["casino", "كازينو", "قمار", "betting", "مراهنات", "سكس", "اباحي", "شحن العاب", "hack"]
+    found_spam = []
     for sp in spam_phrases:
         if sp in lower_all:
             legitimacy_score -= 35
+            found_spam.append(sp)
     legitimacy_score = max(0, legitimacy_score)
 
     # ── Weighted Final Score ──────────────────────────────────────────────────
@@ -207,6 +224,21 @@ def calculate_all_dimensions(
     else:
         tier = "Tier_D"
 
+    # Evidence breakdown
+    evidence = {
+        "forex_terms_matched": forex_terms,
+        "gold_terms_matched": gold_terms,
+        "signals_terms_matched": signal_terms,
+        "trading_styles_matched": trading_terms,
+        "smc_ict_matched": smc_terms,
+        "arabic_character_ratio": round(arabic_ratio, 4),
+        "small_channel_bonus_applied": (50 <= member_count <= 2000),
+        "member_count": member_count,
+        "growth_analysis": growth_evidence,
+        "spam_penalties": found_spam,
+        "discovery_sources_count": discovery_count
+    }
+
     return ScoringDimensions(
         forex_score=forex_score,
         arabic_score=arabic_score,
@@ -222,5 +254,6 @@ def calculate_all_dimensions(
         freshness_score=freshness_score,
         new_channel_score=new_channel_score,
         final_score=final_score,
-        tier=tier
+        tier=tier,
+        evidence=evidence
     )
