@@ -9,14 +9,14 @@ from app.scoring.growth_analyzer import GrowthAnalyzer
 
 def test_growth_analyzer_insufficient_data():
     score, evidence = GrowthAnalyzer.calculate_growth_from_snapshots([])
-    assert score == 50
-    assert evidence["status"] == "INSUFFICIENT_DATA"
+    assert score == 0
+    assert evidence["status"] == "UNOBSERVED_SNAPSHOTS"
 
     score, evidence = GrowthAnalyzer.calculate_growth_from_snapshots([
         {"member_count": 200, "recorded_at": datetime.now(timezone.utc)}
     ])
-    assert score == 50
-    assert evidence["status"] == "INSUFFICIENT_DATA"
+    assert score == 0
+    assert evidence["status"] == "UNOBSERVED_SNAPSHOTS"
 
 
 def test_growth_analyzer_rapid_growth():

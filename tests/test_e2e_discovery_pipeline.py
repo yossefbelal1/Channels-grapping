@@ -77,9 +77,8 @@ def test_full_discovery_pipeline_simulation():
     # ── 5. Verify Scoring Engine Quality ──
     assert scores.gold_score >= 40
     assert scores.signal_score >= 30
-    assert scores.new_channel_score >= 50 # Small channel retained & boosted!
     assert scores.final_score >= 50
-    assert scores.tier in ["Tier_A", "Tier_B"]
+    assert scores.classification in ["HIGH_CONFIDENCE_FOREX", "LIKELY_FOREX"]
 
     # ── 6. Activity Classification & Crawl Scheduling ──
     act_class, interval, next_crawl = ActivityClassifier.classify_activity(

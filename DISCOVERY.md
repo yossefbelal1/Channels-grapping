@@ -47,6 +47,17 @@ Telegram Global Search / Post Search
 
 ---
 
+## 3. Multi-Edge Graph Expansion (Phase 2)
+
+Once a channel is discovered and validated, the `graph_expander.py` (Worker D) analyzes it to discover connected nodes. It traverses connections via multiple relation types:
+
+- **Similar Channel Recommendations**: Fetches Telegram's official algorithm recommendations.
+- **Forward Origin Detection**: Analyzes forwarded posts to find original signal providers.
+- **Cross-Promotions & Mentions**: Scans posts for `t.me/` links and `@username` mentions, mapping them as standard or promoted edges.
+- **Canonical Edge Deduplication**: Ensures unique `(source, target, relation_type)` edges with occurrence tracking and dynamic confidence scoring.
+
+----
+
 ## 3. Arabic Keyword Taxonomy
 
 The system organizes search queries into 9 distinct hierarchical categories defined in `app/discovery/taxonomy.py`:
@@ -83,6 +94,39 @@ Arabic Telegram channels frequently use various spellings, dialect markers, and 
 ## 5. Small Channel & New Channel Prioritization
 
 Traditional scrapers discard channels with few subscribers. In contrast, this engine applies:
-- **Zero Minimum Subscriber Filter**: Channels with 100–500 subscribers are retained and evaluated purely on signal density and content quality.
+- **Zero Minimum Subscriber Filter**: Channels with ~400 subscribers and above are retained and evaluated purely on signal density and content quality. **There is no subscriber-count minimum or maximum.**
 - **Niche Signal Boost**: Active small channels with verified Forex/Gold setups receive up to `+50` bonus points on `new_channel_score`.
 - **New Channel Boost**: Channels created within the last 30–90 days receive an automatic recency boost to accelerate discovery of high-growth newcomers.
+
+---
+
+## 6. Phase 3: Channel Intelligence & Smart Ranking
+
+Once a channel passes through the discovery pipeline, it is evaluated by the **12+ Dimension Scoring Engine** (`app/scoring/dimensions.py`).
+
+### Scoring Integration in Discovery Pipeline
+
+```
+Discovery Source (Global Search / Post Search / Graph Expansion)
+    ↓
+Candidate Extraction & Deduplication
+    ↓
+Stage 1: Cheap Validation (metadata-only taxonomy check)
+    ↓
+Stage 2: Deep Multi-Dimensional Scoring
+    ↓
+Classification: HIGH_CONFIDENCE_FOREX / LIKELY_FOREX / POSSIBLE_FOREX / LOW_CONFIDENCE
+    ↓
+Tier Assignment: Tier_A (75+) / Tier_B (55-74) / Tier_C (35-54) / Tier_D (0-34)
+    ↓
+Evidence Persistence (PostgreSQL JSONB)
+```
+
+### Key Design Principles
+- **Subscriber count = 0% weight** — no bias across 400 to 2,000,000+ members
+- **Activity = 5% ranking signal, never a gate** — dormant channels with Forex relevance are retained
+- **Per-post recurrence analysis** — prevents single-keyword false positives
+- **Zero-trading damping** — non-trading channels capped at score 15
+- **Structured JSONB evidence** — every scoring decision is transparent and auditable
+
+For full scoring documentation, see [`SCORING.md`](SCORING.md).

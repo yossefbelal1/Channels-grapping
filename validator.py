@@ -894,16 +894,36 @@ class DatabaseHelper:
                 return res['id']
         return None
 
-    def insert_snapshot(self, channel_id: str, member_count: int, post_count: int = 0, posts_24h: int = 0, posts_7d: int = 0, posts_30d: int = 0, avg_views: int = 0):
-        """Records metric snapshot for growth tracking."""
+    def insert_snapshot(
+        self,
+        channel_id: str,
+        member_count: int,
+        post_count: int = 0,
+        posts_24h: int = 0,
+        posts_7d: int = 0,
+        posts_30d: int = 0,
+        avg_views: int = 0,
+        lead_score: int = 0,
+        forex_score: int = 0,
+        activity_score: int = 0,
+        scores_dict: Optional[dict] = None
+    ):
+        """Records metric snapshot for growth tracking with score metrics."""
         self.check_connection()
+        scores_json = json.dumps(scores_dict or {})
         query = """
-        INSERT INTO channel_snapshots (channel_id, member_count, post_count, posts_24h, posts_7d, posts_30d, avg_views_per_post, recorded_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW());
+        INSERT INTO channel_snapshots (
+            channel_id, member_count, post_count, posts_24h, posts_7d, posts_30d,
+            avg_views_per_post, lead_score, forex_score, activity_score, scores, recorded_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, NOW());
         """
         try:
             with self.conn.cursor() as cur:
-                cur.execute(query, (channel_id, member_count, post_count, posts_24h, posts_7d, posts_30d, avg_views))
+                cur.execute(query, (
+                    channel_id, member_count, post_count, posts_24h, posts_7d, posts_30d,
+                    avg_views, lead_score, forex_score, activity_score, scores_json
+                ))
             self.conn.commit()
         except Exception as e:
             logging.warning(f"Failed to record channel snapshot: {e}")
@@ -911,6 +931,27 @@ class DatabaseHelper:
                 self.conn.rollback()
             except Exception:
                 pass
+
+    def get_channel_snapshots_by_username(self, username: str, limit: int = 20) -> list:
+        """Retrieves historical snapshots for a channel by its username."""
+        self.check_connection()
+        query = """
+        SELECT cs.id, cs.channel_id, cs.member_count, cs.post_count, cs.posts_24h,
+               cs.posts_7d, cs.posts_30d, cs.avg_views_per_post, cs.recorded_at,
+               cs.lead_score, cs.forex_score, cs.activity_score
+        FROM channel_snapshots cs
+        JOIN leads l ON cs.channel_id = l.id
+        WHERE LOWER(l.channel_username) = LOWER(%s)
+        ORDER BY cs.recorded_at ASC
+        LIMIT %s;
+        """
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(query, (username, limit))
+                return [dict(r) for r in cur.fetchall()]
+        except Exception as e:
+            logging.warning(f"Failed to fetch snapshots for @{username}: {e}")
+            return []
 
     def insert_structured_contact(self, channel_id: str, contact_type: str, value: str, confidence: int = 100, source: str = 'bio'):
         """Persists structured contact handle, whatsapp, or site."""
@@ -959,7 +1000,8 @@ class DatabaseHelper:
             website, email, whatsapp, contact_username, owner_username, admin_username,
             is_group, lead_score, tier, status, last_scan, discovery_source, discovery_method,
             forex_score, trading_score, signal_score, gold_score, activity_score, growth_score,
-            commercial_score, contact_score, legitimacy_score, discovery_score, new_channel_score,
+            commercial_score, contact_score, legitimacy_score, discovery_score, freshness_score,
+            confidence_score, new_channel_score, classification, scoring_evidence,
             activity_class, posts_24h, posts_7d, posts_30d, avg_posts_per_day, next_crawl_at
         ) VALUES (
             %s, %s, %s, 'Arabic', %s,
@@ -967,6 +1009,7 @@ class DatabaseHelper:
             FALSE, %s, %s::tier_level, %s, NOW(), %s, %s,
             %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s,
+            %s, %s, %s, %s::jsonb,
             %s, %s, %s, %s, %s, %s
         )
         ON CONFLICT (channel_username) DO UPDATE SET
@@ -993,7 +1036,11 @@ class DatabaseHelper:
             contact_score = EXCLUDED.contact_score,
             legitimacy_score = EXCLUDED.legitimacy_score,
             discovery_score = EXCLUDED.discovery_score,
+            freshness_score = EXCLUDED.freshness_score,
+            confidence_score = EXCLUDED.confidence_score,
             new_channel_score = EXCLUDED.new_channel_score,
+            classification = EXCLUDED.classification,
+            scoring_evidence = EXCLUDED.scoring_evidence,
             activity_class = EXCLUDED.activity_class,
             posts_24h = EXCLUDED.posts_24h,
             posts_7d = EXCLUDED.posts_7d,
@@ -1002,6 +1049,7 @@ class DatabaseHelper:
             next_crawl_at = EXCLUDED.next_crawl_at
         RETURNING id;
         """
+        evidence_json = json.dumps(scores.evidence or {})
         try:
             with self.conn.cursor() as cur:
                 cur.execute(query, (
@@ -1011,13 +1059,14 @@ class DatabaseHelper:
                     scores.final_score, scores.tier, status, discovery_source, discovery_method,
                     scores.forex_score, scores.trading_score, scores.signal_score, scores.gold_score,
                     scores.activity_score, scores.growth_score, scores.commercial_score, scores.contact_score,
-                    scores.legitimacy_score, scores.discovery_score, scores.new_channel_score,
+                    scores.legitimacy_score, scores.discovery_score, scores.freshness_score,
+                    scores.confidence_score, scores.new_channel_score, scores.classification, evidence_json,
                     activity_class, posts_24h, posts_7d, posts_30d, avg_posts_per_day, next_crawl_at
                 ))
                 res = cur.fetchone()
                 self.conn.commit()
                 channel_id = str(res['id']) if res else None
-                logging.info(f"Lead v5 upserted: @{channel_username} (Score={scores.final_score}, Tier={scores.tier}, Activity={activity_class}, SmallBonus={scores.new_channel_score})")
+                logging.info(f"Lead v5/v6 upserted: @{channel_username} (Score={scores.final_score}, Tier={scores.tier}, Class={scores.classification}, Forex={scores.forex_score})")
                 return channel_id
         except Exception as err:
             logging.error(f"Error in upsert_lead_v5 for @{channel_username}: {err}")
@@ -1349,23 +1398,8 @@ class LeadValidator:
             member_count = http_info.get("member_count", 0)
             is_group = http_info.get("is_group", False)
             
-            # Hard rejection for low members
-            if member_count < 100:
-                logging.info(f"HTTP fallback: Channel @{username} rejected (HARD): low member count ({member_count} < 100).")
-                self.db_helper.add_to_blacklist(actual_link, 'low_members')
-                self.db_helper.upsert_lead(
-                    channel_username=username, member_count=member_count, description=description,
-                    language='English/Other', arabic_ratio=0, website='', email='', whatsapp='', contact_username='',
-                    is_group=is_group, marketplace_score=0, vip=False, premium=False,
-                    subscription=False, monthly_plans=False, yearly_plans=False,
-                    account_management=False, copy_trading=False, funded_accounts=False,
-                    usdt_payments=False, binance_payments=False, lead_score=0,
-                    tier='Tier_D', ai_confidence=100, last_activity=None,
-                    discovery_source=discovery_source, discovery_method=discovery_method,
-                    arabic_score=0, region_score=0, status='rejected',
-                    forex_intent_score=0, forex_category='unknown', high_risk_fraud=False
-                )
-                return True
+            # Member count is context only, not a hard filter
+            logging.info(f"HTTP fallback: Channel @{username} metadata parsed (member_count={member_count}).")
 
             # Scrape messages from web preview
             url = f"https://t.me/s/{username}"
@@ -1414,34 +1448,9 @@ class LeadValidator:
             
             messages.sort(key=lambda x: x.date)
             
-            # Parse average views for HTTP fallback
+            # Parse average views for HTTP fallback (ranking signal only)
             channel_views = [msg.views for msg in messages if getattr(msg, 'views', 0) > 0]
             avg_views = int(sum(channel_views) / len(channel_views)) if channel_views else 0
-            
-            is_low_views = False
-            is_medium_views_penalty = False
-            if not is_group and member_count < 1000:
-                if avg_views < 50:
-                    is_low_views = True
-                elif avg_views < 100:
-                    is_medium_views_penalty = True
-
-            if is_low_views:
-                logging.info(f"HTTP fallback: Channel {actual_link} has low views ({avg_views}<50) for small channel. Saving as rejected.")
-                self.db_helper.upsert_lead(
-                    channel_username=username, member_count=member_count, description=description,
-                    language='Other', arabic_ratio=0, website=None, email=None, whatsapp=None, contact_username=None,
-                    is_group=is_group, marketplace_score=0, vip=False, premium=False,
-                    subscription=False, monthly_plans=False, yearly_plans=False,
-                    account_management=False, copy_trading=False, funded_accounts=False,
-                    usdt_payments=False, binance_payments=False, lead_score=0,
-                    tier='Tier_D', ai_confidence=100, last_activity=None,
-                    discovery_source=discovery_source, discovery_method=discovery_method,
-                    arabic_score=0, region_score=0,
-                    status='rejected', forex_intent_score=0, forex_category='Unclassified',
-                    high_risk_fraud=False
-                )
-                return True
             
             # Activity check
             is_inactive = False
@@ -1962,34 +1971,8 @@ class LeadValidator:
                     return
                     
                 if http_info["is_channel"]:
-                    # 1. Member count check (< 100) - HARD REJECTION
-                    if http_info["member_count"] < 100:
-                        logging.info(f"HTTP filter: Channel @{identifier} rejected (HARD): low member count ({http_info['member_count']} < 100).")
-                        self.db_helper.add_to_blacklist(actual_link, 'low_members')
-                        self.db_helper.upsert_lead(
-                            channel_username=identifier,
-                            member_count=http_info["member_count"],
-                            description=http_info["description"],
-                            language='English/Other',
-                            arabic_ratio=0,
-                            website='', email='', whatsapp='', contact_username='',
-                            is_group=False, marketplace_score=0, vip=False, premium=False,
-                            subscription=False, monthly_plans=False, yearly_plans=False,
-                            account_management=False, copy_trading=False, funded_accounts=False,
-                            usdt_payments=False, binance_payments=False, lead_score=0,
-                            tier='Tier_D', ai_confidence=100, last_activity=None,
-                            discovery_source=discovery_source, discovery_method=discovery_method,
-                            arabic_score=0, region_score=0, status='rejected',
-                            forex_intent_score=0, forex_category='unknown', high_risk_fraud=False
-                        )
-                        return
-
-                    # 2. Evaluate Soft Rejection Criteria
+                    # Member count is context only, never a hard rejection filter
                     failed_rules = []
-
-                    # Soft check A: Low views for small channels
-                    if http_info["member_count"] < 1000 and 0 < http_info["avg_views"] < 100:
-                        failed_rules.append("low_views")
 
                     # Soft check B: Arabic Language Check
                     arabic_regex = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]')
@@ -2099,29 +2082,7 @@ class LeadValidator:
 
             # ── Early-Rejection Filtering for Broadcast Channels ──
             if is_channel:
-                # 1. Member count check (< 100) - HARD REJECTION
-                if member_count < 100:
-                    logging.info(f"Channel @{username} rejected (HARD): low member count ({member_count} < 100).")
-                    self.db_helper.add_to_blacklist(actual_link, 'low_members')
-                    self.db_helper.upsert_lead(
-                        channel_username=username,
-                        member_count=member_count,
-                        description=description,
-                        language='English/Other',
-                        arabic_ratio=0,
-                        website='', email='', whatsapp='', contact_username='',
-                        is_group=False, marketplace_score=0, vip=False, premium=False,
-                        subscription=False, monthly_plans=False, yearly_plans=False,
-                        account_management=False, copy_trading=False, funded_accounts=False,
-                        usdt_payments=False, binance_payments=False, lead_score=0,
-                        tier='Tier_D', ai_confidence=100, last_activity=None,
-                        discovery_source=discovery_source, discovery_method=discovery_method,
-                        arabic_score=0, region_score=0, status='rejected',
-                        forex_intent_score=0, forex_category='unknown', high_risk_fraud=False
-                    )
-                    return
-
-                # 2. Evaluate Early Soft Rejection Criteria
+                # Member count is context only, never a hard rejection filter
                 early_failed_rules = []
 
                 # Soft check A: Arabic Language Check
@@ -2700,8 +2661,6 @@ class LeadValidator:
                 final_failed_rules.append("non_arabic")
             if not metadata['is_forex']:
                 final_failed_rules.append("non_forex")
-            if is_low_views:
-                final_failed_rules.append("low_views")
 
             failed_count = len(final_failed_rules)
             if failed_count >= 2:
@@ -2756,11 +2715,11 @@ class LeadValidator:
 
             logging.info(f"Scores for @{username}: arabic={arabic_score} forex_intent={forex_intent_score} region={region_score} category={forex_category}")
 
-            # ── PHASE 3: Arabic Gate (raised to 50) ───────────────────────────────
-            if arabic_score < 50:
-                logging.info(f"Channel {actual_link} has low Arabic score ({arabic_score}<50). Saving as rejected.")
+            # Softened Arabic Gate: Retain mixed Arabic/English trading channels as long as they have Arabic context or Forex intent
+            if arabic_score < 15 and not metadata['is_forex'] and forex_intent_score < 20:
+                logging.info(f"Channel {actual_link} has low Arabic score ({arabic_score}<15) and no Forex intent. Saving as rejected.")
                 self.db_helper.upsert_lead(
-                    channel_username=username, member_count=0, description=description,
+                    channel_username=username, member_count=member_count, description=description,
                     language='Other', arabic_ratio=metadata['arabic_ratio'],
                     website=None, email=None, whatsapp=None, contact_username=None,
                     is_group=False, marketplace_score=0,
@@ -2833,9 +2792,10 @@ class LeadValidator:
             tier = self.classify_tier(score)
             lang_str = "Arabic"
 
-            # ── 13-Dimension Scoring & Activity Intelligence (v5) ─────────────────
+            # ── 13-Dimension Scoring & Activity Intelligence (v5/v6) ─────────────
             last_activity_ts = last_activity_date.astimezone(timezone.utc) if last_activity_date else None
             post_texts = [m.text for m in messages if getattr(m, 'text', None)]
+            historical_snapshots = self.db_helper.get_channel_snapshots_by_username(username)
             scoring_dims = LeadScoringEngine.evaluate_stage_2(
                 title=title,
                 description=description,
@@ -2844,7 +2804,13 @@ class LeadValidator:
                 has_contact=bool(contacts.get('contact_username') or contacts.get('whatsapp')),
                 contact_types=[c['type'] for c in contacts.get('structured_contacts', [])],
                 discovery_count=1,
-                last_post_at=last_activity_ts
+                discovery_sources=[discovery_source] if discovery_source else [],
+                last_post_at=last_activity_ts,
+                posts_24h=msgs_72h,
+                posts_7d=msgs_7d,
+                posts_30d=len(messages),
+                avg_posts_per_day=round(len(messages) / 30.0, 2),
+                snapshots=historical_snapshots
             )
 
             # Activity Classification & Crawl Scheduling
@@ -2855,15 +2821,21 @@ class LeadValidator:
                 last_post_at=last_activity_ts
             )
 
-            # Pass Gate: Qualify channels based on multi-dimensional Forex relevance (NO subscriber minimum rejection)
-            if scoring_dims.forex_score >= 15 or scoring_dims.gold_score >= 15 or scoring_dims.signal_score >= 15 or score >= 10:
+            # Pass Gate: Qualify channels based on multi-dimensional Forex relevance (NO subscriber minimum or activity rejection)
+            if (
+                scoring_dims.classification in ('HIGH_CONFIDENCE_FOREX', 'LIKELY_FOREX', 'POSSIBLE_FOREX') or
+                scoring_dims.forex_score >= 15 or
+                scoring_dims.gold_score >= 15 or
+                scoring_dims.signal_score >= 15 or
+                scoring_dims.final_score >= 20
+            ):
                 status_val = 'new'
-                logging.info(f"Channel @{username} PASSED gate (FinalScore={scoring_dims.final_score}, Forex={scoring_dims.forex_score}, Gold={scoring_dims.gold_score}, Tier={scoring_dims.tier})")
+                logging.info(f"Channel @{username} PASSED gate (FinalScore={scoring_dims.final_score}, Class={scoring_dims.classification}, Forex={scoring_dims.forex_score}, Tier={scoring_dims.tier})")
             else:
                 status_val = 'rejected'
-                logging.info(f"Channel @{username} below qualification threshold. Marking rejected.")
+                logging.info(f"Channel @{username} below qualification threshold (FinalScore={scoring_dims.final_score}, Class={scoring_dims.classification}). Marking rejected.")
 
-            # Save to database using v5 schema (all 13 scoring dimensions + activity class)
+            # Save to database using v5/v6 schema (all scoring dimensions + activity class)
             channel_db_id = self.db_helper.upsert_lead_v5(
                 channel_username=username,
                 member_count=member_count,
@@ -2882,14 +2854,18 @@ class LeadValidator:
             )
 
             if channel_db_id:
-                # 1. Record snapshot for historical growth tracking
+                # 1. Record snapshot for historical growth tracking with score metrics
                 self.db_helper.insert_snapshot(
                     channel_id=channel_db_id,
                     member_count=member_count,
                     post_count=len(messages),
                     posts_24h=msgs_72h,
                     posts_7d=msgs_7d,
-                    posts_30d=len(messages)
+                    posts_30d=len(messages),
+                    lead_score=scoring_dims.final_score,
+                    forex_score=scoring_dims.forex_score,
+                    activity_score=scoring_dims.activity_score,
+                    scores_dict=scoring_dims.to_dict()
                 )
 
                 # 2. Record structured contacts

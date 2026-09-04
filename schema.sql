@@ -44,7 +44,33 @@ CREATE TABLE leads (
     last_graph_scan TIMESTAMP,
 
     -- Graph traversal depth (0 = seed/keyword, 1 = discovered from seed, etc.)
-    depth INT DEFAULT 0
+    depth INT DEFAULT 0,
+
+    -- Multi-Dimensional Scoring & Intelligence (v5 & v6)
+    forex_score INT DEFAULT 0,
+    trading_score INT DEFAULT 0,
+    signal_score INT DEFAULT 0,
+    gold_score INT DEFAULT 0,
+    activity_score INT DEFAULT 0,
+    growth_score INT DEFAULT 0,
+    commercial_score INT DEFAULT 0,
+    contact_score INT DEFAULT 0,
+    legitimacy_score INT DEFAULT 100,
+    discovery_score INT DEFAULT 0,
+    freshness_score INT DEFAULT 0,
+    confidence_score INT DEFAULT 0,
+    new_channel_score INT DEFAULT 0,
+    classification VARCHAR(50) DEFAULT 'POSSIBLE_FOREX',
+    scoring_evidence JSONB DEFAULT '{}'::jsonb,
+    activity_class VARCHAR(20) DEFAULT 'WARM',
+    posts_24h INT DEFAULT 0,
+    posts_7d INT DEFAULT 0,
+    posts_30d INT DEFAULT 0,
+    avg_posts_per_day NUMERIC(6,2) DEFAULT 0,
+    discovery_count INT DEFAULT 1,
+    first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    creation_date TIMESTAMP,
+    next_crawl_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE blacklist (
@@ -77,6 +103,38 @@ CREATE TABLE channel_graph (
     relation_type VARCHAR(100) NOT NULL, -- e.g. 'advertisement', 'mention', 'link'
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (source_channel_id, target_channel_id)
+);
+
+-- Advanced Graph Edges with Occurrence Tracking and Confidence
+CREATE TABLE channel_edges (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_channel_id UUID REFERENCES leads(id) ON DELETE CASCADE,
+    target_channel_id UUID REFERENCES leads(id) ON DELETE CASCADE,
+    relation_type VARCHAR(100) NOT NULL,
+    confidence INT DEFAULT 100,
+    evidence TEXT,
+    occurrence_count INT DEFAULT 1,
+    metadata JSONB,
+    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (source_channel_id, target_channel_id, relation_type)
+);
+
+-- Historical Metric Snapshots (Growth & Activity Tracking with Score Metrics)
+CREATE TABLE IF NOT EXISTS channel_snapshots (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    channel_id UUID REFERENCES leads(id) ON DELETE CASCADE,
+    member_count INT,
+    post_count INT,
+    posts_24h INT DEFAULT 0,
+    posts_7d INT DEFAULT 0,
+    posts_30d INT DEFAULT 0,
+    avg_views_per_post INT,
+    lead_score INT DEFAULT 0,
+    forex_score INT DEFAULT 0,
+    activity_score INT DEFAULT 0,
+    scores JSONB DEFAULT '{}'::jsonb,
+    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Keyword Frequency Engine table

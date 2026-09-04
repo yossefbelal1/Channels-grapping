@@ -1,7 +1,8 @@
-"""
-app/scoring/engine.py — Production Lead Scoring Engine with Two-Stage Evaluation
+﻿"""
+app/scoring/engine.py — Production Lead Scoring Engine with Two-Stage Evaluation (Phase 3)
 """
 
+import json
 import logging
 from typing import Dict, Any, List, Optional, Tuple
 from app.scoring.dimensions import ScoringDimensions, calculate_all_dimensions
@@ -64,13 +65,16 @@ class LeadScoringEngine:
         has_contact: bool = False,
         contact_types: Optional[List[str]] = None,
         discovery_count: int = 1,
+        discovery_sources: Optional[List[str]] = None,
         first_seen_at=None,
         last_post_at=None,
         posts_24h: int = 0,
         posts_7d: int = 0,
         posts_30d: int = 0,
+        avg_posts_per_day: Optional[float] = None,
         creation_date=None,
-        is_group: bool = False
+        is_group: bool = False,
+        snapshots: Optional[List[Dict[str, Any]]] = None
     ) -> ScoringDimensions:
         """
         Stage 2: Deep Validation & Multi-Dimensional Scoring.
@@ -84,20 +88,24 @@ class LeadScoringEngine:
             has_contact=has_contact,
             contact_types=contact_types,
             discovery_count=discovery_count,
+            discovery_sources=discovery_sources,
             first_seen_at=first_seen_at,
             last_post_at=last_post_at,
             posts_24h=posts_24h,
             posts_7d=posts_7d,
             posts_30d=posts_30d,
+            avg_posts_per_day=avg_posts_per_day,
             creation_date=creation_date,
-            is_group=is_group
+            is_group=is_group,
+            snapshots=snapshots
         )
 
     def persist_scores_to_db(self, channel_id: str, scores: ScoringDimensions) -> None:
-        """Saves all 13 scoring dimensions and tier to the leads table in PostgreSQL."""
+        """Saves all scoring dimensions, tier, classification, and evidence to PostgreSQL."""
         if not self.db or not channel_id:
             return
 
+        evidence_json = json.dumps(scores.evidence or {})
         try:
             with self.db.cursor() as cur:
                 cur.execute("""
@@ -115,7 +123,11 @@ class LeadScoringEngine:
                         contact_score = %s,
                         legitimacy_score = %s,
                         discovery_score = %s,
-                        new_channel_score = %s
+                        freshness_score = %s,
+                        confidence_score = %s,
+                        new_channel_score = %s,
+                        classification = %s,
+                        scoring_evidence = %s::jsonb
                     WHERE id = %s;
                 """, (
                     scores.final_score,
@@ -131,7 +143,11 @@ class LeadScoringEngine:
                     scores.contact_score,
                     scores.legitimacy_score,
                     scores.discovery_score,
+                    scores.freshness_score,
+                    scores.confidence_score,
                     scores.new_channel_score,
+                    scores.classification,
+                    evidence_json,
                     channel_id
                 ))
             self.db.commit()

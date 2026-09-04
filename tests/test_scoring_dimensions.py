@@ -7,10 +7,10 @@ import pytest
 from app.scoring.dimensions import calculate_all_dimensions, ScoringDimensions
 
 
-def test_small_channel_prioritization():
+def test_small_channel_not_biased():
     """
     Ensures a small channel (150 subscribers) with high Forex & Gold signals
-    scores high and is NOT rejected.
+    scores high based on evidence, NOT because it is small, and is NOT rejected.
     """
     scores = calculate_all_dimensions(
         title="توصيات الذهب والعملات اليومية",
@@ -31,7 +31,6 @@ def test_small_channel_prioritization():
     assert scores.forex_score >= 30
     assert scores.gold_score >= 30
     assert scores.signal_score >= 30
-    assert scores.new_channel_score >= 50 # Small channel bonus active
     assert scores.final_score >= 50
     assert scores.tier in ["Tier_A", "Tier_B"]
 
@@ -50,7 +49,7 @@ def test_new_channel_bonus():
     )
 
     assert scores.new_channel_score >= 40
-    assert scores.final_score >= 30
+    assert scores.final_score >= 20
 
 
 def test_anti_spam_legitimacy_penalty():

@@ -28,11 +28,11 @@ class GrowthAnalyzer:
             Tuple of (growth_score: int 0-100, evidence: Dict[str, Any])
         """
         if not snapshots or len(snapshots) < 2:
-            return 50, {
-                "status": "INSUFFICIENT_DATA",
+            return 0, {
+                "status": "UNOBSERVED_SNAPSHOTS",
                 "snapshot_count": len(snapshots) if snapshots else 0,
-                "growth_score": 50,
-                "reason": "Single snapshot or unobserved history; neutral baseline assigned."
+                "growth_score": 0,
+                "reason": "Historical snapshots not observed; assigned 0."
             }
 
         # Sort snapshots by recorded_at

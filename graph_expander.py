@@ -236,6 +236,30 @@ class GraphExpander:
                         "confidence": 70
                     })
 
+        # 4. Similar Channel Recommendations (Phase 2)
+        lead_score = row.get('lead_score')
+        # Target high-value validated channels (score >= 50) and public broadcasts
+        if lead_score is not None and lead_score >= 50 and getattr(entity, 'broadcast', False):
+            try:
+                logging.info(f"[GRAPH] Fetching similar channel recommendations for @{username}...")
+                recs = await self.tg_manager.get_channel_recommendations(
+                    channel_peer=entity,
+                    session_name=self.session_name,
+                    shutdown_event=self.shutdown_event
+                )
+                if recs and hasattr(recs, 'chats'):
+                    for chat in recs.chats:
+                        rec_username = getattr(chat, 'username', None)
+                        if rec_username:
+                            discovered_edges.append({
+                                "target_username": rec_username,
+                                "relation": EdgeRelation.RECOMMENDATION,
+                                "evidence": "Telegram official recommendation",
+                                "confidence": 90
+                            })
+            except Exception as e:
+                logging.warning(f"[GRAPH] Failed to fetch channel recommendations for @{username}: {e}")
+
         # Process and persist all discovered relationships
         new_queued = 0
         for edge in discovered_edges:
