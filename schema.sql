@@ -70,7 +70,16 @@ CREATE TABLE leads (
     discovery_count INT DEFAULT 1,
     first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     creation_date TIMESTAMP,
-    next_crawl_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    next_crawl_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    -- v7 Production Hardening Fields
+    last_scanned_message_id BIGINT DEFAULT 0,
+    graph_importance_score INT DEFAULT 0,
+    crawl_interval_minutes INT DEFAULT 1440,
+    consecutive_crawl_failures INT DEFAULT 0,
+    last_crawl_at TIMESTAMP,
+    last_successful_crawl_at TIMESTAMP,
+    scan_depth_tier VARCHAR(32) DEFAULT 'standard'
 );
 
 CREATE TABLE blacklist (
@@ -203,3 +212,44 @@ CREATE TABLE IF NOT EXISTS campaign_logs (
 
 CREATE INDEX idx_campaign_logs_status ON campaign_logs(status);
 CREATE INDEX idx_campaign_logs_campaign_id ON campaign_logs(campaign_id);
+
+-- v7 Production Hardening: Channel Memberships & Crawl Jobs
+CREATE TABLE IF NOT EXISTS channel_memberships (
+    id SERIAL PRIMARY KEY,
+    channel_id VARCHAR(64) NOT NULL,
+    channel_username VARCHAR(255),
+    account_session VARCHAR(128) NOT NULL,
+    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    leave_at TIMESTAMP,
+    membership_reason VARCHAR(64) DEFAULT 'deep_scan',
+    current_state VARCHAR(32) DEFAULT 'ACTIVE',
+    error_message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS crawl_jobs (
+    job_id UUID PRIMARY KEY,
+    channel_id VARCHAR(64) NOT NULL,
+    channel_username VARCHAR(255),
+    job_type VARCHAR(64) DEFAULT 'incremental',
+    activity_class VARCHAR(32) DEFAULT 'NORMAL',
+    priority VARCHAR(32) DEFAULT 'normal',
+    scheduled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    executed_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    status VARCHAR(32) DEFAULT 'pending',
+    error_message TEXT,
+    watermark_used BIGINT DEFAULT 0,
+    new_watermark BIGINT DEFAULT 0,
+    posts_scanned INT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_leads_next_crawl ON leads(next_crawl_at, activity_class, lead_score DESC) WHERE next_crawl_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_leads_last_scanned_msg ON leads(last_scanned_message_id);
+CREATE INDEX IF NOT EXISTS idx_leads_graph_importance ON leads(graph_importance_score DESC);
+CREATE INDEX IF NOT EXISTS idx_channel_memberships_state ON channel_memberships(current_state, leave_at);
+CREATE INDEX IF NOT EXISTS idx_channel_memberships_channel ON channel_memberships(channel_id, account_session);
+CREATE INDEX IF NOT EXISTS idx_crawl_jobs_status_sched ON crawl_jobs(status, scheduled_at);
+CREATE INDEX IF NOT EXISTS idx_crawl_jobs_channel ON crawl_jobs(channel_id, completed_at DESC);

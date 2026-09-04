@@ -24,6 +24,13 @@ from datetime import datetime, timezone
 import redis
 from telethon import TelegramClient, errors
 
+from app.core.telegram_pool import (
+    AccountState,
+    AccountPoolManager,
+    RetryPolicy,
+    MembershipManager
+)
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -190,6 +197,12 @@ class TelegramManager:
         self._lua_ratelimit = self.redis_conn.register_script(LUA_RATE_LIMIT)
         
         self.heartbeat_tasks = {}
+        
+        # Hardened account pool & retry components (v7)
+        self.pool_mgr = AccountPoolManager(self.redis_conn)
+        self.retry_policy = RetryPolicy()
+        self.membership_mgr = MembershipManager(redis_conn=self.redis_conn)
+
         self.load_account()
 
     def load_account(self):
@@ -523,39 +536,17 @@ class TelegramManager:
             if shutdown_event.is_set():
                 return None
 
-            # 1. Select healthiest available candidate
-            session_name = None
-            best_score = -1
+            # 1. Select healthiest, least-loaded available candidate (v7 Account Pool)
+            eligible_candidates = [
+                name for name in total_candidates
+                if name not in attempted_sessions and not self.is_account_banned(name)
+            ]
+            if not eligible_candidates:
+                break # All candidates exhausted
 
-            for name in total_candidates:
-                if name in attempted_sessions:
-                    continue
-                if self.is_account_banned(name):
-                    continue
-
-                # Check Redis cooldown
-                until_ts = self.redis_conn.get(f"health:{name}:rate_limited_until")
-                if until_ts:
-                    try:
-                        if time.time() < float(until_ts):
-                            continue
-                    except ValueError:
-                        pass
-
-                score = self.get_health_score(name)
-                if score > best_score:
-                    best_score = score
-                    session_name = name
-
-            # Fallback to preferred or next unattempted session
+            session_name = self.pool_mgr.select_least_loaded(eligible_candidates)
             if not session_name:
-                for name in total_candidates:
-                    if name not in attempted_sessions and not self.is_account_banned(name):
-                        session_name = name
-                        break
-
-            if not session_name:
-                break  # All candidates exhausted
+                session_name = eligible_candidates[0]
 
             attempted_sessions.add(session_name)
             client = self.clients.get(session_name)
@@ -582,18 +573,20 @@ class TelegramManager:
                     self.release_lock(session_name)
                     if "lock" not in str(conn_err).lower():
                         self.update_health_score(session_name, -50)
+                    self.pool_mgr.set_state(session_name, AccountState.UNAVAILABLE, ttl_seconds=300)
                     last_exception = conn_err
                     continue  # Try next session in loop
 
-            # 3. Inner bounded retry loop for transient issues
+            # 3. Inner bounded retry loop for transient issues with exponential backoff & jitter
             retries = 0
-            max_inner_retries = 3
+            max_inner_retries = self.retry_policy.max_retries
             session_success = False
 
             while retries < max_inner_retries and not shutdown_event.is_set():
                 # Check atomic rate limit
                 if not self.check_request_limit(session_name):
                     logging.warning(f"Hourly rate limit reached for '{session_name}'. Cooling down and rotating...")
+                    self.pool_mgr.set_state(session_name, AccountState.COOLDOWN, ttl_seconds=60)
                     self.redis_conn.set(f"health:{session_name}:rate_limited_until", time.time() + 60, ex=60)
                     break  # Rotate to next session
 
@@ -601,12 +594,17 @@ class TelegramManager:
                 if shutdown_event.is_set():
                     return None
 
+                self.pool_mgr.record_request_start(session_name)
                 try:
                     res = await request_func(client, *args, **target_kwargs)
                     self.update_health_score(session_name, 1)
+                    self.pool_mgr.record_request_end(session_name, success=True)
+                    self.pool_mgr.set_state(session_name, AccountState.HEALTHY)
                     return res
 
                 except errors.FloodWaitError as e:
+                    self.pool_mgr.record_flood_wait(session_name, e.seconds)
+                    self.pool_mgr.record_request_end(session_name, success=False, error_type="FloodWait")
                     if e.seconds <= 60:
                         logging.warning(f"Transient FloodWait ({e.seconds}s) on '{session_name}'. Sleeping...")
                         self.update_health_score(session_name, -5)
@@ -631,16 +629,29 @@ class TelegramManager:
                 except (errors.UserDeactivatedBanError, errors.AuthKeyUnregisteredError,
                         errors.AuthKeyInvalidError, errors.SessionRevokedError) as e:
                     self.mark_account_banned(session_name)
+                    self.pool_mgr.set_state(session_name, AccountState.UNAVAILABLE)
+                    self.pool_mgr.record_request_end(session_name, success=False, error_type=type(e).__name__)
                     logging.critical(f"🚨 Session '{session_name}' permanently banned/revoked: {e}")
                     last_exception = e
                     break  # Rotate to next session
 
                 except errors.RPCError as e:
-                    logging.warning(f"RPC call failed on session '{session_name}': {e}")
+                    self.pool_mgr.record_request_end(session_name, success=False, error_type=type(e).__name__)
+                    if self.retry_policy.is_permanent_error(e):
+                        logging.warning(f"Permanent RPC error on '{session_name}': {e}")
+                        raise e
+                    # Transient RPC error: backoff with jitter
+                    backoff_delay = self.retry_policy.compute_backoff(retries)
+                    logging.warning(f"Transient RPC call failed on session '{session_name}': {e}. Backing off {backoff_delay}s...")
+                    try:
+                        await asyncio.wait_for(shutdown_event.wait(), timeout=backoff_delay)
+                    except asyncio.TimeoutError:
+                        pass
+                    retries += 1
                     last_exception = e
-                    raise e
 
                 except (ValueError, TypeError) as e:
+                    self.pool_mgr.record_request_end(session_name, success=False, error_type=type(e).__name__)
                     logging.warning(f"Entity not found / invalid argument on '{session_name}': {e}")
                     last_exception = e
                     raise e

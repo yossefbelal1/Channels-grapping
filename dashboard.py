@@ -2781,13 +2781,19 @@ async def get_prometheus_metrics():
         )
         
         # 1. Queue Depths
-        for q in ['queue:critical', 'queue:high', 'queue:normal', 'queue:low', 'outreach:high', 'outreach:normal', 'outreach:low', 'recommendations:queue']:
+        for q in ['queue:critical', 'queue:high', 'queue:normal', 'queue:low', 'queue:dead_letter', 'outreach:high', 'outreach:normal', 'outreach:low', 'recommendations:queue']:
             depth = redis_conn.llen(q) or 0
             lines.append(f'lead_queue_depth{{queue="{q}"}} {depth}')
         
         # 2. Seen Channels Count
         seen_count = redis_conn.scard('seen_channels') or 0
         lines.append(f'lead_seen_channels_total {seen_count}')
+
+        # 3. Account pool health metrics
+        for acc_key in redis_conn.keys("health:*:score"):
+            acc_name = acc_key.split(":")[1] if isinstance(acc_key, str) else acc_key.decode().split(":")[1]
+            score_val = redis_conn.get(acc_key) or 100
+            lines.append(f'lead_account_health_score{{account="{acc_name}"}} {score_val}')
     except Exception as re_err:
         lines.append(f'# redis_metrics_error: {re_err}')
 
@@ -2815,6 +2821,11 @@ async def get_prometheus_metrics():
         cur.execute("SELECT COUNT(*) as total FROM channel_snapshots")
         total_snaps = cur.fetchone()['total']
         lines.append(f'lead_snapshots_total {total_snaps}')
+
+        # Crawl Jobs
+        cur.execute("SELECT status, COUNT(*) as count FROM crawl_jobs GROUP BY status")
+        for row in cur.fetchall():
+            lines.append(f'lead_crawl_jobs_total{{status="{row["status"]}"}} {row["count"]}')
         
         conn.close()
     except Exception as db_err:
@@ -2822,6 +2833,100 @@ async def get_prometheus_metrics():
 
     from fastapi.responses import PlainTextResponse
     return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
+
+
+@app.get("/health")
+@app.get("/api/health")
+async def get_system_health():
+    """
+    Public system-wide health and readiness probe endpoint (PART V).
+    Inspects PostgreSQL, Redis, Queue depths, DLQ, and Account pool status.
+    """
+    import time
+    from fastapi.responses import JSONResponse
+
+    health_data = {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "components": {
+            "database": {"status": "unknown"},
+            "redis": {"status": "unknown"},
+            "queues": {},
+            "account_pool": {}
+        }
+    }
+    is_healthy = True
+
+    # 1. Database Check
+    t0 = time.time()
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+            cur.fetchone()
+        conn.close()
+        db_latency_ms = round((time.time() - t0) * 1000, 2)
+        health_data["components"]["database"] = {
+            "status": "healthy",
+            "latency_ms": db_latency_ms
+        }
+    except Exception as db_e:
+        is_healthy = False
+        health_data["components"]["database"] = {
+            "status": "unhealthy",
+            "error": str(db_e)
+        }
+
+    # 2. Redis & Queue Check
+    t0 = time.time()
+    try:
+        redis_conn = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'localhost'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            db=int(os.getenv('REDIS_DB', 0)),
+            decode_responses=True,
+            socket_timeout=2.0
+        )
+        redis_conn.ping()
+        redis_latency_ms = round((time.time() - t0) * 1000, 2)
+        
+        # Check Queues
+        queues_checked = {}
+        for q in ['queue:critical', 'queue:high', 'queue:normal', 'queue:low', 'queue:dead_letter']:
+            queues_checked[q] = redis_conn.llen(q) or 0
+
+        health_data["components"]["redis"] = {
+            "status": "healthy",
+            "latency_ms": redis_latency_ms
+        }
+        health_data["components"]["queues"] = queues_checked
+
+        # Check Account Pool
+        account_statuses = {}
+        for state_key in redis_conn.keys("account:pool:*:state"):
+            s_name = state_key.split(":")[2]
+            state_val = redis_conn.get(state_key)
+            account_statuses[s_name] = state_val
+        health_data["components"]["account_pool"] = account_statuses or {"status": "no_active_sessions_tracked"}
+
+    except Exception as redis_e:
+        is_healthy = False
+        health_data["components"]["redis"] = {
+            "status": "unhealthy",
+            "error": str(redis_e)
+        }
+
+    if not is_healthy:
+        health_data["status"] = "unhealthy"
+        return JSONResponse(status_code=503, content=health_data)
+
+    # Check for degraded queue backpressure
+    dlq_depth = health_data["components"]["queues"].get("queue:dead_letter", 0)
+    if dlq_depth > 100:
+        health_data["status"] = "degraded"
+        health_data["warning"] = f"Dead letter queue contains {dlq_depth} poisoned jobs."
+
+    return JSONResponse(status_code=200, content=health_data)
 
 
 if __name__ == "__main__":

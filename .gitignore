@@ -38,6 +38,8 @@ telegram-saas-key.pem
 !migrate_v3_graph_engine.sql
 !migrate_outreach_engine.sql
 !migrate_v5_graph_engine.sql
+!migrate_v6_channel_intelligence.sql
+!migrate_v7_production_hardening.sql
 db_backups/
 postgres_data/
 redis_data/

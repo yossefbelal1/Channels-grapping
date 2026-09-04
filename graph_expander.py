@@ -24,6 +24,8 @@ from validator import DatabaseHelper, normalize_telegram_link, parse_telegram_li
 # Graph & Provenance Modules
 from app.graph.edge_manager import GraphEdgeManager, EdgeRelation
 from app.graph.forward_analyzer import ForwardAnalyzer
+from app.graph.graph_importance import GraphImportanceCalculator
+from app.scheduler.watermark_manager import WatermarkManager
 from app.discovery.provenance import ProvenanceManager
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -195,20 +197,30 @@ class GraphExpander:
         for msg in messages:
             msg_text = getattr(msg, 'message', '') or ''
             
-            # 1. Forward Origin Inspection
+            # 1. Forward Origin Inspection (Hardened v7)
             fwd = ForwardAnalyzer.extract_forward_origin(msg)
-            if fwd and fwd.get("from_name"):
-                fwd_name = fwd["from_name"].strip()
-                if fwd_name and not fwd_name.lower().endswith("bot"):
-                    clean_fwd = normalize_telegram_link(fwd_name)
-                    link_type, fwd_user = parse_telegram_link(clean_fwd)
-                    if fwd_user:
-                        discovered_edges.append({
-                            "target_username": fwd_user,
-                            "relation": EdgeRelation.FORWARDED_FROM,
-                            "evidence": f"Forwarded message ID {getattr(msg, 'id', '')}",
-                            "confidence": 95
-                        })
+            if fwd:
+                target_ident = None
+                if fwd.get("from_name"):
+                    fwd_name = fwd["from_name"].strip()
+                    if fwd_name and not (fwd_name.lower().endswith("bot") or fwd_name.lower().endswith("_bot")):
+                        clean_fwd = normalize_telegram_link(fwd_name)
+                        link_type, fwd_user = parse_telegram_link(clean_fwd)
+                        target_ident = fwd_user or fwd_name
+                elif fwd.get("channel_id"):
+                    target_ident = fwd["channel_id"]
+                elif fwd.get("peer_id"):
+                    target_ident = fwd["peer_id"]
+
+                if target_ident:
+                    evidence_payload = fwd.get("evidence")
+                    evidence_str = json.dumps(evidence_payload) if isinstance(evidence_payload, dict) else f"Forwarded message ID {getattr(msg, 'id', '')}"
+                    discovered_edges.append({
+                        "target_username": target_ident,
+                        "relation": EdgeRelation.FORWARDED_FROM,
+                        "evidence": evidence_str,
+                        "confidence": 95
+                    })
 
             # 2. Telegram Link Regex
             for raw_link in TELEGRAM_LINK_REGEX.findall(msg_text):
@@ -303,6 +315,11 @@ class GraphExpander:
 
         logging.info(f"[GRAPH] @{username} crawl complete: {len(messages)} posts -> {len(discovered_edges)} edges -> {new_queued} new candidates queued.")
         self.update_last_graph_scan(username)
+
+        # Compute and update graph importance score (PART J)
+        if hasattr(self, 'importance_calc') and self.importance_calc:
+            self.importance_calc.compute_and_update_channel(source_id)
+
         return True
 
     async def run_expansion_cycle(self):
@@ -341,6 +358,8 @@ class GraphExpander:
 
         self.edge_mgr = GraphEdgeManager(db_conn=self.db_helper.conn, redis_conn=self.redis_conn)
         self.provenance_mgr = ProvenanceManager(redis_conn=self.redis_conn, db_conn=self.db_helper.conn)
+        self.watermark_mgr = WatermarkManager(redis_conn=self.redis_conn, db_conn=self.db_helper.conn)
+        self.importance_calc = GraphImportanceCalculator(db_conn=self.db_helper.conn)
 
         logging.info(f"Initializing Telegram Manager for session '{self.session_name}'...")
         self.tg_manager = TelegramManager(self.redis_conn, session_name=self.session_name, worker_type="graph_expander")
