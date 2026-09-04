@@ -9,7 +9,7 @@ import re
 import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List, Set
+from typing import Dict, Any, Optional, List, Set, Tuple
 
 
 class Platform:
@@ -42,6 +42,69 @@ class RelationType:
     EXTERNAL_SITE = "external_site"
 
     ALL = [LINK, MENTION, FORWARDED_FROM, PROMOTED, RECOMMENDATION, SOCIAL_LINK, EXTERNAL_SITE]
+
+
+class CandidateStatus:
+    DISCOVERED = "discovered"
+    VERIFYING = "verifying"
+    VERIFIED = "verified"
+    REJECTED = "rejected"
+    EXPANDED = "expanded"
+
+    ALL = [DISCOVERED, VERIFYING, VERIFIED, REJECTED, EXPANDED]
+
+
+GENERIC_DOMAIN_BLACKLIST: Set[str] = {
+    "google.com", "bing.com", "yahoo.com", "duckduckgo.com", "yandex.com",
+    "wikipedia.org", "wikimedia.org", "amazon.com", "amazon.fr", "amazon.co.uk", "amazon.de",
+    "apple.com", "microsoft.com", "cloudflare.com", "youtube.com", "youtu.be",
+    "twitter.com", "x.com", "instagram.com", "linkedin.com", "pinterest.com",
+    "reddit.com", "quora.com", "medium.com", "github.com", "gitlab.com",
+    "play.google.com", "apps.apple.com", "support.google.com"
+}
+
+GENERIC_HANDLE_BLACKLIST: Set[str] = {
+    "help", "support", "admin", "login", "register", "privacy", "terms",
+    "contact", "about", "rules", "faq", "share", "channel", "group",
+    "joinchat", "addlist", "bot", "proxy", "socks", "home", "search",
+    "user", "profile", "settings", "notifications"
+}
+
+
+FINANCIAL_FOREX_KEYWORDS: List[str] = [
+    # Arabic high-intent trading / forex terms
+    "تداول", "فوركس", "ذهب", "عملات", "أسهم", "توصيات", "تحليل فني", "إشارات",
+    "صفقات", "حساب إسلامي", "حساب اسلامي", "رافعة مالية", "سكالبينج", "سوينج",
+    "أكاديمية تداول", "اكاديمية تداول", "نسخ صفقات", "إدارة محافظ", "ادارة محافظ",
+    "مؤشرات", "بونص تداول", "سوق العملات", "تداول الذهب", "توصيات vip",
+    # English terms
+    "forex", "trading", "gold", "xauusd", "crypto", "signals", "broker",
+    "pips", "daytrading", "investing", "scalping", "swing trading", "prop firm",
+    "funded account", "copy trading", "technical analysis", "stocks", "market analysis"
+]
+
+
+def evaluate_candidate_relevance(title: str = "", description: str = "", raw_text: str = "") -> Tuple[bool, int, List[str]]:
+    """
+    Evaluates whether a candidate profile, page, or website is genuinely related
+    to Forex, Gold, or Financial Trading.
+    Returns: (is_relevant: bool, relevance_score: int 0-100, matched_terms: List[str])
+    """
+    corpus = f"{title} {description} {raw_text}".lower()
+    if not corpus.strip():
+        return False, 0, []
+
+    matched = []
+    for kw in FINANCIAL_FOREX_KEYWORDS:
+        if kw in corpus:
+            matched.append(kw)
+
+    if not matched:
+        return False, 0, []
+
+    # Score calculation: 20 pts base + 10 pts per additional unique term (capped at 100)
+    score = min(100, 20 + len(matched) * 10)
+    return True, score, matched
 
 
 class CanonicalIdentity:
@@ -192,4 +255,63 @@ class DiscoveredRelationship:
             "confidence": self.confidence,
             "evidence": self.evidence,
             "metadata": self.metadata
+        }
+
+
+@dataclass
+class DiscoveryCandidate:
+    """
+    Normalized candidate data contract across all platforms.
+    Every platform (Telegram, TikTok, Facebook, Web) produces candidates conforming
+    to this contract before entering the verification and relevance pipeline.
+    """
+    platform: str
+    native_identifier: str
+    canonical_id: str
+    canonical_url: str
+    source_entity: Optional[str] = None
+    discovery_method: str = "search"
+    provenance: Dict[str, Any] = field(default_factory=dict)
+    evidence: str = ""
+    confidence: int = 100
+    relationship_type: str = RelationType.LINK
+    status: str = CandidateStatus.DISCOVERED
+    relevance_score: int = 0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    discovered_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def to_entity(self, title: str = "", description: str = "") -> DiscoveredEntity:
+        e_type = EntityType.CHANNEL if self.platform == Platform.TELEGRAM else (
+            EntityType.PAGE if self.platform == Platform.FACEBOOK else (
+                EntityType.ACCOUNT if self.platform == Platform.TIKTOK else EntityType.WEBSITE
+            )
+        )
+        return DiscoveredEntity(
+            platform=self.platform,
+            entity_type=e_type,
+            canonical_id=self.canonical_id,
+            username=self.native_identifier,
+            title=title,
+            description=description,
+            url=self.canonical_url,
+            metadata=self.metadata,
+            discovered_at=self.discovered_at
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "platform": self.platform,
+            "native_identifier": self.native_identifier,
+            "canonical_id": self.canonical_id,
+            "canonical_url": self.canonical_url,
+            "source_entity": self.source_entity,
+            "discovery_method": self.discovery_method,
+            "provenance": self.provenance,
+            "evidence": self.evidence,
+            "confidence": self.confidence,
+            "relationship_type": self.relationship_type,
+            "status": self.status,
+            "relevance_score": self.relevance_score,
+            "metadata": self.metadata,
+            "discovered_at": self.discovered_at.isoformat() if self.discovered_at else None
         }

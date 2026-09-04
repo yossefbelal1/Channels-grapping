@@ -37,11 +37,14 @@ class CommercialInferenceEngine:
         "ربط حسابات", "تداول آلي", "بوت نسخ"
     ]
 
-    BM_BROKER_AFFILIATE = [
+    BM_EXPLICIT_AFFILIATE = [
         "رابط تسجيل", "رابط الوكالة", "وكيل معتمد", "وسيط معتمد", "افتح حسابك برعايتنا",
-        "كاش باك", "بونص إيداع", "كود وكالة", "تحت وكالتنا", "سجل تحت وكالتنا",
-        "exness", "xm", "ic markets", "fxtm", "avatrade", "tickmill", "windsor",
-        "ib", "introducing broker"
+        "كاش باك", "بونص إيداع", "كود وكالة", "تحت وكالتنا", "سجل تحت وكالتنا", "سجل برعايتنا",
+        "شريك معتمد", "حساب تحت رعايتنا", "introducing broker"
+    ]
+
+    KNOWN_BROKER_NAMES = [
+        "exness", "xm", "ic markets", "fxtm", "avatrade", "tickmill", "windsor", "vantage", "multibank"
     ]
 
     BM_PROP_FIRM = [
@@ -73,7 +76,7 @@ class CommercialInferenceEngine:
         "لفتح حساب تواصل", "سجل معنا عبر", "تواصل مع خدمة العملاء", "تواصل مع الدعم",
         "للاستفسار عن الباقات", "ارسل رسالة للاشتراك", "كلمني خاص للاشتراك",
         "انضم للـ vip", "انضم للقناة الخاصة", "تواصل مع الإدارة", "تواصل مع الادارة",
-        "لربط حسابك", "لإدارة حسابك", "للتواصل"
+        "لربط حسابك", "لإدارة حسابك", "تواصل للاشتراك"
     ]
 
     # ── Operational Complexity Indicators ─────────────────────────────────────
@@ -152,7 +155,21 @@ class CommercialInferenceEngine:
             detected_models.append("copy_trading_portfolio")
             bm_score += 10
 
-        has_broker = any(kw in combined_corpus for kw in cls.BM_BROKER_AFFILIATE)
+        # Broker Affiliate IB: Requires explicit partnership keywords, or IB with context, or broker name with registration context
+        has_explicit_affiliate = any(kw in combined_corpus for kw in cls.BM_EXPLICIT_AFFILIATE)
+        has_ib_keyword = False
+        if re.search(r'\b(ib|introducing\s*broker)\b', combined_corpus):
+            if any(ctx in combined_corpus for ctx in ["broker", "forex", "وسيط", "وكيل", "شريك", "حساب", "affiliate", "عمولة", "rebate", "تداول"]):
+                has_ib_keyword = True
+
+        has_broker_with_context = False
+        has_any_broker_name = any(re.search(rf'\b{re.escape(b)}\b', combined_corpus) for b in cls.KNOWN_BROKER_NAMES)
+        if has_any_broker_name:
+            affiliate_context = ["رابط", "تسجيل", "افتح حساب", "برعايتنا", "وكالة", "بونص", "كود", "link", "register", "open account", "affiliate", "partner"]
+            if any(ctx in combined_corpus for ctx in affiliate_context):
+                has_broker_with_context = True
+
+        has_broker = has_explicit_affiliate or has_ib_keyword or has_broker_with_context
         if has_broker:
             detected_models.append("broker_affiliate_ib")
             bm_score += 10
@@ -176,14 +193,20 @@ class CommercialInferenceEngine:
         evidence_snippets = []
         freshest_commercial_date: Optional[datetime] = None
 
+        all_standard_bm_kws = cls.BM_VIP + cls.BM_COPY_TRADING + cls.BM_PROP_FIRM + cls.BM_ACADEMY
+
         for rec in message_records:
             t = rec["lower"]
             is_promo = any(kw in t for kw in cls.COMM_PROMOTIONS)
             is_cta = any(kw in t for kw in cls.COMM_CTAS)
             found_payments = [pm for pm in cls.COMM_PAYMENT_METHODS if pm in t]
             
-            all_bm_kws = cls.BM_VIP + cls.BM_COPY_TRADING + cls.BM_BROKER_AFFILIATE + cls.BM_PROP_FIRM + cls.BM_ACADEMY
-            has_bm_in_msg = any(kw in t for kw in all_bm_kws)
+            has_msg_broker = (
+                any(kw in t for kw in cls.BM_EXPLICIT_AFFILIATE) or
+                (bool(re.search(r'\b(ib|introducing\s*broker)\b', t)) and any(c in t for c in ["broker", "forex", "وسيط", "وكيل", "شريك", "حساب"])) or
+                (any(re.search(rf'\b{re.escape(b)}\b', t) for b in cls.KNOWN_BROKER_NAMES) and any(c in t for c in ["رابط", "تسجيل", "افتح", "برعايتنا", "وكالة", "link", "register"]))
+            )
+            has_bm_in_msg = any(kw in t for kw in all_standard_bm_kws) or has_msg_broker
             
             if is_promo or is_cta or found_payments or has_bm_in_msg:
                 if is_promo or has_bm_in_msg:

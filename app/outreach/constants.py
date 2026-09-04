@@ -62,9 +62,10 @@ class OutreachPriority:
     P2 = 'P2'  # Relevant Forex business channel with moderate commercial signals
     P3 = 'P3'  # Relevant Forex channel, but generic/educational/community (low commercial signals)
     P4 = 'P4'  # Minimal commercial fit / non-business channel
+    PENDING = 'PENDING'  # Awaiting commercial intelligence evaluation
 
-    ALL = [P0, P1, P2, P3, P4]
-    ORDER = {'P0': 0, 'P1': 1, 'P2': 2, 'P3': 3, 'P4': 4}
+    ALL = [P0, P1, P2, P3, P4, PENDING]
+    ORDER = {'P0': 0, 'P1': 1, 'P2': 2, 'P3': 3, 'P4': 4, 'PENDING': 5}
 
 
 class ServiceNeedType:

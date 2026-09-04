@@ -70,18 +70,16 @@ class OutreachPriorityEngine:
         # Scaled from 0-100 forex_relevance_score
         forex_pts = min(15, max(0, int(forex_relevance_score * 0.15)))
 
-        # 3. Audience Context Points (0-5)
-        # Context signal only: Never overrides business signals
-        if member_count >= 100_000:
-            audience_pts = 5
-        elif member_count >= 10_000:
-            audience_pts = 4
-        elif member_count >= 1_000:
+        # 3. Audience Context Points (0-3)
+        # Context/tie-break signal only: strictly bounded so audience size never flips a priority tier
+        if member_count >= 10_000:
             audience_pts = 3
-        elif member_count >= 300:
+        elif member_count >= 1_000:
             audience_pts = 2
-        else:
+        elif member_count >= 100:
             audience_pts = 1
+        else:
+            audience_pts = 0
 
         # 4. Contactability Points (0-5)
         contact_pts = 0
@@ -178,15 +176,23 @@ class OutreachPriorityEngine:
         if not db_conn or not campaign_id:
             return {}
 
-        counts = {OutreachPriority.P0: 0, OutreachPriority.P1: 0, OutreachPriority.P2: 0, OutreachPriority.P3: 0, OutreachPriority.P4: 0}
+        counts = {
+            OutreachPriority.P0: 0,
+            OutreachPriority.P1: 0,
+            OutreachPriority.P2: 0,
+            OutreachPriority.P3: 0,
+            OutreachPriority.P4: 0,
+            OutreachPriority.PENDING: 0
+        }
         try:
             with db_conn.cursor() as cur:
                 # Update campaign_logs from current leads commercial intelligence
+                # If lead has not been evaluated, explicitly flag as PENDING (not P3)
                 cur.execute("""
                     UPDATE campaign_logs cl
-                    SET priority = COALESCE(l.outreach_priority, 'P3'),
-                        priority_score = COALESCE(l.outreach_priority_score, 25),
-                        priority_reason = l.outreach_priority_reason,
+                    SET priority = COALESCE(l.outreach_priority, 'PENDING'),
+                        priority_score = COALESCE(l.outreach_priority_score, 0),
+                        priority_reason = COALESCE(l.outreach_priority_reason, 'Pending commercial intelligence evaluation'),
                         intent_type = l.commercial_intent_type,
                         intent_evidence = l.commercial_intent_evidence
                     FROM leads l
@@ -198,7 +204,7 @@ class OutreachPriorityEngine:
 
                 # Query updated tier breakdown
                 cur.execute("""
-                    SELECT COALESCE(priority, 'P3') as p_tier, COUNT(*) as cnt
+                    SELECT COALESCE(priority, 'PENDING') as p_tier, COUNT(*) as cnt
                     FROM campaign_logs
                     WHERE campaign_id = %s AND status = 'pending'
                     GROUP BY priority;

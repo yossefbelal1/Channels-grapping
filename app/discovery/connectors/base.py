@@ -19,7 +19,9 @@ from bs4 import BeautifulSoup
 import requests
 from app.discovery.entity_model import (
     Platform, EntityType, RelationType, CanonicalIdentity,
-    DiscoveredEntity, DiscoveredRelationship
+    DiscoveredEntity, DiscoveredRelationship, DiscoveryCandidate,
+    CandidateStatus, GENERIC_DOMAIN_BLACKLIST, GENERIC_HANDLE_BLACKLIST,
+    evaluate_candidate_relevance
 )
 
 logger = logging.getLogger(__name__)
@@ -236,14 +238,9 @@ class BaseDiscoveryConnector(ABC):
 
         # 1. Telegram Links
         tg_matches = TELEGRAM_LINK_REGEX.findall(text)
-        GENERIC_TELEGRAM_IGNORES = {
-            "joinchat", "share", "addlist", "bot", "username", "contact",
-            "channel", "group", "admin", "help", "support", "s", "m", "c",
-            "proxy", "socks", "login", "home", "privacy", "terms", "about"
-        }
         for username in tg_matches:
             clean_u = username.strip().lstrip('@').lower()
-            if clean_u and clean_u not in GENERIC_TELEGRAM_IGNORES and not clean_u.endswith("bot") and len(clean_u) >= 4:
+            if clean_u and clean_u not in GENERIC_HANDLE_BLACKLIST and not clean_u.endswith("bot") and len(clean_u) >= 4:
                 target_can = f"telegram:{clean_u}"
                 if target_can != source_canonical_id and target_can not in seen_targets:
                     seen_targets.add(target_can)
@@ -270,7 +267,7 @@ class BaseDiscoveryConnector(ABC):
         tt_matches = TIKTOK_LINK_REGEX.findall(text)
         for tt_user in tt_matches:
             clean_tt = tt_user.strip().lstrip('@').lower()
-            if clean_tt:
+            if clean_tt and clean_tt not in GENERIC_HANDLE_BLACKLIST and len(clean_tt) >= 3:
                 target_can = f"tiktok:{clean_tt}"
                 if target_can != source_canonical_id and target_can not in seen_targets:
                     seen_targets.add(target_can)
@@ -297,7 +294,7 @@ class BaseDiscoveryConnector(ABC):
         fb_matches = FACEBOOK_LINK_REGEX.findall(text)
         for fb_slug in fb_matches:
             clean_fb = fb_slug.strip().lower()
-            if clean_fb and clean_fb not in ("pages", "groups", "share", "watch", "login"):
+            if clean_fb and clean_fb not in GENERIC_HANDLE_BLACKLIST and len(clean_fb) >= 3:
                 target_can = f"facebook:{clean_fb}"
                 if target_can != source_canonical_id and target_can not in seen_targets:
                     seen_targets.add(target_can)
@@ -319,6 +316,45 @@ class BaseDiscoveryConnector(ABC):
                         evidence=f"Discovered via social link in {source_canonical_id}"
                     )
                     relationships.append(rel)
+
+        # 4. Outbound Financial Website Links
+        web_matches = WEB_URL_REGEX.findall(text)
+        for raw_url in web_matches:
+            full_url = raw_url if raw_url.startswith(('http://', 'https://')) else f'https://{raw_url}'
+            try:
+                parsed = urllib.parse.urlparse(full_url)
+                domain = parsed.netloc.lower().lstrip("www.")
+                # Filter out generic domains and social network domains that have native extractors
+                if domain and len(domain) >= 4 and "." in domain:
+                    is_blacklisted = domain in GENERIC_DOMAIN_BLACKLIST or any(
+                        domain.endswith('.' + b) or domain == b for b in GENERIC_DOMAIN_BLACKLIST
+                    )
+                    is_social = any(s in domain for s in ["t.me", "telegram.me", "tiktok.com", "facebook.com", "wa.me", "whatsapp.com"])
+                    if not is_blacklisted and not is_social:
+                        target_can = f"web:{domain}"
+                        if target_can != source_canonical_id and target_can not in seen_targets:
+                            seen_targets.add(target_can)
+                            clean_site_url = f"{parsed.scheme}://{domain}"
+                            ent = DiscoveredEntity(
+                                platform=Platform.WEB,
+                                entity_type=EntityType.WEBSITE,
+                                canonical_id=target_can,
+                                username=domain,
+                                url=clean_site_url
+                            )
+                            entities.append(ent)
+                            rel = DiscoveredRelationship(
+                                source_canonical_id=source_canonical_id,
+                                target_canonical_id=target_can,
+                                source_platform=source_platform,
+                                target_platform=Platform.WEB,
+                                relation_type=RelationType.EXTERNAL_SITE,
+                                confidence=90,
+                                evidence=f"Discovered via outbound website link in {source_canonical_id}"
+                            )
+                            relationships.append(rel)
+            except Exception:
+                pass
 
         return entities, relationships
 

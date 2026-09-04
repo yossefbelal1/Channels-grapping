@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 
 from app.discovery.entity_model import (
     Platform, EntityType, RelationType, CanonicalIdentity,
-    DiscoveredEntity, DiscoveredRelationship
+    DiscoveredEntity, DiscoveredRelationship, evaluate_candidate_relevance
 )
 from app.discovery.connectors.base import (
     BaseDiscoveryConnector, ConnectorSearchResult, RateLimitPolicy,
@@ -114,6 +114,9 @@ class FacebookDiscoveryConnector(BaseDiscoveryConnector):
             source_platform=Platform.FACEBOOK
         )
 
+        # Evaluate financial relevance
+        is_rel, rel_score, matched_kws = evaluate_candidate_relevance(title, description, all_text[:2000])
+
         main_entity = DiscoveredEntity(
             platform=Platform.FACEBOOK,
             entity_type=EntityType.PAGE,
@@ -124,7 +127,10 @@ class FacebookDiscoveryConnector(BaseDiscoveryConnector):
             url=page_url,
             metadata={
                 "has_description": bool(description),
-                "bridges_count": len(cross_entities)
+                "bridges_count": len(cross_entities),
+                "is_relevant": is_rel,
+                "relevance_score": rel_score,
+                "matched_terms": matched_kws
             },
             raw_content=description
         )

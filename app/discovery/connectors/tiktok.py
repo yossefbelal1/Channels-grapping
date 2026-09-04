@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 
 from app.discovery.entity_model import (
     Platform, EntityType, RelationType, CanonicalIdentity,
-    DiscoveredEntity, DiscoveredRelationship
+    DiscoveredEntity, DiscoveredRelationship, evaluate_candidate_relevance
 )
 from app.discovery.connectors.base import (
     BaseDiscoveryConnector, ConnectorSearchResult, RateLimitPolicy,
@@ -117,7 +117,9 @@ class TikTokDiscoveryConnector(BaseDiscoveryConnector):
             source_platform=Platform.TIKTOK
         )
 
-        # 3. Construct the main TikTok entity
+        # 3. Evaluate financial relevance
+        is_rel, rel_score, matched_kws = evaluate_candidate_relevance(title, description, all_text[:2000])
+
         main_entity = DiscoveredEntity(
             platform=Platform.TIKTOK,
             entity_type=EntityType.ACCOUNT,
@@ -128,7 +130,10 @@ class TikTokDiscoveryConnector(BaseDiscoveryConnector):
             url=profile_url,
             metadata={
                 "has_bio": bool(description),
-                "bridges_count": len(cross_entities)
+                "bridges_count": len(cross_entities),
+                "is_relevant": is_rel,
+                "relevance_score": rel_score,
+                "matched_terms": matched_kws
             },
             raw_content=description
         )

@@ -51,7 +51,7 @@ class RecursiveSpider:
         self.budget_per_hop = budget_per_hop
 
     def is_visited(self, canonical_id: str) -> bool:
-        """Checks if an entity canonical ID has already been crawled in the current cycle."""
+        """Checks if an entity canonical ID has already been crawled."""
         if not self.redis or not canonical_id:
             return False
         try:
@@ -60,27 +60,48 @@ class RecursiveSpider:
             return False
 
     def mark_visited(self, canonical_id: str, depth: int) -> None:
-        """Marks an entity as visited with TTL and records the visit depth."""
+        """Marks an entity as visited with TTL."""
         if not self.redis or not canonical_id:
             return
         try:
-            key = f"spider:visited:{canonical_id}"
-            self.redis.set(key, depth, ex=VISITED_TTL_SECONDS)
+            self.redis.set(f"spider:visited:{canonical_id}", depth, ex=VISITED_TTL_SECONDS)
         except Exception:
             pass
 
+    def try_claim_visit(self, canonical_id: str, depth: int) -> bool:
+        """
+        Atomically checks and claims visited status using Redis SET NX.
+        Prevents race conditions between concurrent spider workers.
+        """
+        if not canonical_id:
+            return False
+        if not self.redis:
+            # Fallback to local set if Redis unavailable
+            return True
+        try:
+            key = f"spider:visited:{canonical_id}"
+            claimed = self.redis.set(key, depth, nx=True, ex=VISITED_TTL_SECONDS)
+            return bool(claimed)
+        except Exception:
+            return True
+
     def enqueue_for_validation(self, entity: DiscoveredEntity) -> bool:
         """
-        Routes newly discovered candidates to the appropriate Redis queue.
-        Telegram entities go to queue:normal or queue:high for the validator.
+        Routes newly discovered candidates to the appropriate Redis queue with atomic deduplication.
+        Telegram entities go to queue:normal or queue:high.
         Cross-platform entities go to queue:cross_platform.
         """
         if not self.redis or not entity.canonical_id:
             return False
 
         try:
+            # Atomic queue deduplication (prevents queue bloat)
+            q_dedup_key = f"spider:enqueued:{entity.canonical_id}"
+            is_new = self.redis.set(q_dedup_key, 1, nx=True, ex=86400)
+            if not is_new:
+                return False
+
             if entity.platform == Platform.TELEGRAM:
-                # Telegram channels go to standard validator queues
                 clean_u = entity.username or entity.canonical_id.replace("telegram:", "")
                 payload = json.dumps({
                     "username": clean_u,
@@ -89,7 +110,6 @@ class RecursiveSpider:
                     "method": "spider_hop",
                     "depth": entity.depth
                 })
-                # If discovered via a high-value bridge (e.g. direct VIP TikTok profile), route to queue:high
                 q_name = "queue:high" if entity.depth <= 1 else "queue:normal"
                 self.redis.rpush(q_name, payload)
                 logger.info(f"🕸️ [SPIDER] Queued Telegram candidate @{clean_u} to {q_name} (depth={entity.depth})")
@@ -138,11 +158,9 @@ class RecursiveSpider:
             except Exception:
                 pass
 
-        # Loop check: if visited, we don't re-crawl content to prevent loops
-        if self.is_visited(entity.canonical_id):
+        # Atomic loop check: if already visited/claimed, skip to prevent loops and concurrent race conditions
+        if not self.try_claim_visit(entity.canonical_id, entity.depth):
             return []
-
-        self.mark_visited(entity.canonical_id, entity.depth)
 
         # Select appropriate connector to inspect outbound links
         connector = self.connectors.get(entity.platform)

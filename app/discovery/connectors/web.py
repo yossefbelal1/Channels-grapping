@@ -13,7 +13,8 @@ from bs4 import BeautifulSoup
 
 from app.discovery.entity_model import (
     Platform, EntityType, RelationType, CanonicalIdentity,
-    DiscoveredEntity, DiscoveredRelationship
+    DiscoveredEntity, DiscoveredRelationship, GENERIC_DOMAIN_BLACKLIST,
+    evaluate_candidate_relevance
 )
 from app.discovery.connectors.base import (
     BaseDiscoveryConnector, ConnectorSearchResult, RateLimitPolicy,
@@ -81,11 +82,14 @@ class WebDiscoveryConnector(BaseDiscoveryConnector):
                     if clean_u and not clean_u.endswith("bot") and clean_u not in ("joinchat", "share", "username", "contact"):
                         tg_links.add(f"https://t.me/{clean_u}")
 
-                # Also capture external websites for bridge crawling
+                # Also capture external websites for bridge crawling (excluding blacklisted generic domains)
                 u = item['url']
                 parsed = urllib.parse.urlparse(u)
-                if parsed.netloc and not any(k in parsed.netloc for k in ["t.me", "telegram.me", "bing.com", "microsoft.com", "google.com"]):
-                    websites.add(f"{parsed.scheme}://{parsed.netloc}")
+                domain = parsed.netloc.lower().lstrip("www.")
+                if domain and "." in domain and not any(k in domain for k in ["t.me", "telegram.me", "bing.com", "microsoft.com", "google.com"]):
+                    is_blacklisted = domain in GENERIC_DOMAIN_BLACKLIST or any(domain.endswith('.' + b) or domain == b for b in GENERIC_DOMAIN_BLACKLIST)
+                    if not is_blacklisted:
+                        websites.add(f"{parsed.scheme}://{domain}")
         except Exception as err:
             logger.debug(f"[web] Bing search engine notice: {err}")
 
@@ -142,6 +146,9 @@ class WebDiscoveryConnector(BaseDiscoveryConnector):
             source_platform=Platform.WEB
         )
 
+        # Evaluate financial relevance
+        is_rel, rel_score, matched_kws = evaluate_candidate_relevance(title, description, all_text[:2000])
+
         main_entity = DiscoveredEntity(
             platform=Platform.WEB,
             entity_type=EntityType.WEBSITE,
@@ -151,7 +158,10 @@ class WebDiscoveryConnector(BaseDiscoveryConnector):
             url=website_url,
             metadata={
                 "domain": domain,
-                "social_bridges_count": len(cross_entities)
+                "social_bridges_count": len(cross_entities),
+                "is_relevant": is_rel,
+                "relevance_score": rel_score,
+                "matched_terms": matched_kws
             },
             raw_content=description
         )

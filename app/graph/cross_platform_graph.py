@@ -64,24 +64,34 @@ class CrossPlatformGraphManager(GraphEdgeManager):
                     return lead_id
 
                 # 2. Insert new lead
+                is_rel = entity.metadata.get("is_relevant", True if entity.platform == Platform.TELEGRAM else False)
+                cand_status = "verified" if is_rel else "rejected"
+                lead_status = "new" if entity.platform == Platform.TELEGRAM else ("verified" if is_rel else "rejected")
+                rel_score = int(entity.metadata.get("relevance_score") or (75 if entity.platform == Platform.TELEGRAM else 0))
+
                 cur.execute("""
                     INSERT INTO leads (
                         id, channel_username, platform, entity_type, canonical_id,
-                        url, description, status, discovered_at, discovery_source,
+                        url, description, status, candidate_status, relevance_score,
+                        verified_at, discovered_at, discovery_source,
                         discovery_method, depth, metadata
                     ) VALUES (
                         gen_random_uuid(), %s, %s, %s, %s,
-                        %s, %s, 'new', NOW(), %s,
+                        %s, %s, %s, %s, %s,
+                        NOW(), NOW(), %s,
                         'cross_platform_discovery', %s, %s::jsonb
                     )
                     ON CONFLICT (channel_username) DO UPDATE SET
                         canonical_id = EXCLUDED.canonical_id,
                         platform = EXCLUDED.platform,
+                        candidate_status = EXCLUDED.candidate_status,
+                        relevance_score = EXCLUDED.relevance_score,
                         url = COALESCE(leads.url, EXCLUDED.url)
                     RETURNING id;
                 """, (
                     username_field, entity.platform, entity.entity_type, entity.canonical_id,
-                    entity.url, entity.description or "", entity.metadata.get("source", "cross_platform"),
+                    entity.url, entity.description or "", lead_status, cand_status, rel_score,
+                    entity.metadata.get("source", "cross_platform"),
                     entity.depth, meta_json
                 ))
                 inserted = cur.fetchone()
