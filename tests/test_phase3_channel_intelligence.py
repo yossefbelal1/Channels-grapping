@@ -253,11 +253,19 @@ def test_10_growth_calculation():
     assert evidence["growth_percentage"] == 30.0
     assert evidence["status"] == "OBSERVED"
 
-    # Test unobserved growth
+    # Test unobserved growth (0 snapshots)
     growth_score_unobserved, evidence_unobserved = GrowthAnalyzer.calculate_growth_from_snapshots([])
     assert growth_score_unobserved == 0
     assert evidence_unobserved["status"] == "UNOBSERVED_SNAPSHOTS"
     assert evidence_unobserved["growth_score"] == 0
+
+    # Test unobserved growth (1 snapshot)
+    growth_score_one, evidence_one = GrowthAnalyzer.calculate_growth_from_snapshots([
+        {"member_count": 1000, "recorded_at": t0}
+    ])
+    assert growth_score_one == 0
+    assert evidence_one["status"] == "UNOBSERVED_SNAPSHOTS"
+    assert evidence_one["growth_score"] == 0
 
 
 def test_11_freshness_calculation():
@@ -569,3 +577,87 @@ def test_19_end_to_end_fixture_channels_a_through_f():
     ranked = sorted(candidates, key=lambda c: c["score"], reverse=True)
     # Channel E should be at the very bottom
     assert ranked[-1]["name"] == "Channel E (300k)"
+
+
+def test_20_all_nine_required_rules():
+    """
+    Direct verification of all 9 Phase 3 rules:
+    1. 400-member relevant channel is retained.
+    2. 2,000,000-member relevant channel is retained.
+    3. Same content/evidence with different member counts does NOT receive a member-count bonus.
+    4. Member count does not directly change the score.
+    5. No snapshots => growth_score is neutral/no-evidence (0).
+    6. One snapshot => growth_score is neutral/no-evidence (0).
+    7. Two snapshots showing growth => positive growth_score (>0).
+    8. Activity can increase activity_score without increasing growth_score when snapshots are absent.
+    9. Low activity does not reject a relevant Forex channel.
+    """
+    now = datetime.now(timezone.utc)
+    common_content = {
+        "title": "فوركس وذهب مباشر",
+        "description": "توصيات يومية وصفقات سكالبينج على العملات والذهب XAUUSD",
+        "recent_posts": [
+            "صفقة شراء XAUUSD الهدف 2670 وقف 2640",
+            "تحليل فوركس زوج EURUSD دخول 1.0920"
+        ]
+    }
+
+    # Rule 1: 400-member channel is retained
+    s_400 = calculate_all_dimensions(**common_content, member_count=400, has_contact=True)
+    assert s_400.final_score >= 35
+    assert s_400.classification in ["HIGH_CONFIDENCE_FOREX", "LIKELY_FOREX"]
+
+    # Rule 2: 2,000,000-member channel is retained
+    s_2m = calculate_all_dimensions(**common_content, member_count=2000000, has_contact=True)
+    assert s_2m.final_score >= 35
+    assert s_2m.classification in ["HIGH_CONFIDENCE_FOREX", "LIKELY_FOREX"]
+
+    # Rule 3 & 4: Same content with different member counts does NOT receive a member-count bonus, score is identical
+    s_4k = calculate_all_dimensions(**common_content, member_count=4000, has_contact=True)
+    s_40k = calculate_all_dimensions(**common_content, member_count=40000, has_contact=True)
+    s_400k = calculate_all_dimensions(**common_content, member_count=400000, has_contact=True)
+    assert s_400.final_score == s_4k.final_score == s_40k.final_score == s_400k.final_score == s_2m.final_score
+    assert s_400.new_channel_score == s_2m.new_channel_score == 0
+
+    # Rule 5: No snapshots => growth_score is neutral/no-evidence (0)
+    s_no_snap = calculate_all_dimensions(**common_content, snapshots=[])
+    assert s_no_snap.growth_score == 0
+    assert s_no_snap.evidence["growth_analysis"]["status"] == "UNOBSERVED_SNAPSHOTS"
+    assert s_no_snap.evidence["growth_analysis"]["growth_score"] == 0
+
+    # Rule 6: One snapshot => growth_score is neutral/no-evidence (0)
+    s_one_snap = calculate_all_dimensions(**common_content, snapshots=[{"member_count": 500, "recorded_at": now}])
+    assert s_one_snap.growth_score == 0
+    assert s_one_snap.evidence["growth_analysis"]["status"] == "UNOBSERVED_SNAPSHOTS"
+    assert s_one_snap.evidence["growth_analysis"]["growth_score"] == 0
+
+    # Rule 7: Two snapshots showing growth => positive growth_score (>0)
+    s_growth = calculate_all_dimensions(**common_content, snapshots=[
+        {"member_count": 500, "recorded_at": now - timedelta(days=7)},
+        {"member_count": 750, "recorded_at": now}
+    ])
+    assert s_growth.growth_score > 0
+    assert s_growth.evidence["growth_analysis"]["status"] == "OBSERVED"
+
+    # Rule 8: Activity can increase activity_score without increasing growth_score when snapshots are absent
+    s_idle = calculate_all_dimensions(**common_content, posts_24h=0, posts_7d=0, posts_30d=0, snapshots=[])
+    s_busy = calculate_all_dimensions(**common_content, posts_24h=10, posts_7d=50, posts_30d=200, snapshots=[])
+    assert s_busy.activity_score > s_idle.activity_score
+    assert s_busy.growth_score == 0
+    assert s_idle.growth_score == 0
+    assert s_busy.evidence["growth_analysis"]["status"] == "UNOBSERVED_SNAPSHOTS"
+
+    # Rule 9: Low activity does not reject a relevant Forex channel
+    s_low_act = calculate_all_dimensions(
+        title="توصيات فوركس طويلة المدى",
+        description="تحليلات فوركس نادرة على العملات",
+        recent_posts=["توصية شراء EURUSD هدف 100 نقطة"],
+        posts_24h=0,
+        posts_7d=0,
+        posts_30d=1,
+        last_post_at=now - timedelta(days=25)
+    )
+    assert s_low_act.activity_score <= 35
+    assert s_low_act.forex_score >= 30
+    assert s_low_act.classification != "LOW_CONFIDENCE"
+    assert s_low_act.final_score >= 20
