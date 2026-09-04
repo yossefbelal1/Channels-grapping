@@ -63,24 +63,30 @@ def check_eligibility(
         if db_cursor.fetchone():
             return "BLOCKED", "Contact is blacklisted"
             
-        # 3. Lead status is not 'rejected'
-        db_cursor.execute("SELECT status, next_eligible_at, risk_score FROM leads WHERE id = %s", (lead_id,))
+        # 3. Lead status is not 'rejected' and not marked inactive
+        db_cursor.execute("SELECT status, next_eligible_at, risk_score, description FROM leads WHERE id = %s", (lead_id,))
         lead_row = db_cursor.fetchone()
         status = None
         next_eligible = None
         lead_risk_score = None
+        lead_desc = None
         if lead_row:
             if isinstance(lead_row, dict):
                 status = lead_row.get('status')
                 next_eligible = lead_row.get('next_eligible_at')
                 lead_risk_score = lead_row.get('risk_score')
+                lead_desc = lead_row.get('description')
             elif isinstance(lead_row, (list, tuple)):
                 status = lead_row[0] if len(lead_row) > 0 else None
                 next_eligible = lead_row[1] if len(lead_row) > 1 else None
                 lead_risk_score = lead_row[2] if len(lead_row) > 2 else None
+                lead_desc = lead_row[3] if len(lead_row) > 3 else None
 
         if status == 'rejected':
             return "BLOCKED", "Lead is rejected"
+            
+        if lead_desc and str(lead_desc).strip().lower().startswith('inactive channel'):
+            return "BLOCKED", "Channel marked inactive"
                 
         # 4. Not already contacted in this campaign
         db_cursor.execute("""

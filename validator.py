@@ -4404,7 +4404,7 @@ class LeadValidator:
                         continue
                     
                     # ── Outreach Engine: Dry Run Check ─────────────────────
-                    if is_dry_run():
+                    if is_dry_run(self.redis_conn):
                         decision = log_dry_run_decision(
                             str(lead_id), str(campaign_id), contact_username or '',
                             'user_session', risk_level, 'ELIGIBLE',
@@ -4511,7 +4511,7 @@ class LeadValidator:
                     error_message = None
                     
                     try:
-                        peer = await user_client.get_input_entity(target_username)
+                        peer = await user_client.get_entity(target_username)
                         media_files = self._resolve_media_list(media_path)
                         if media_files:
                             try:

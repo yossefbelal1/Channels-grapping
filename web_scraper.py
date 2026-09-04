@@ -1,8 +1,9 @@
 """
-web_scraper.py — Production Pluggable Web & Directory Scraper (Worker E)
+web_scraper.py — Production Cross-Platform Unified Discovery Worker (Worker E)
 
-Discovers public Arabic Forex / Trading channels from search engines,
-directories, and blogs, pushing deduplicated leads to Redis validation queues.
+Discovers public Arabic Forex / Trading channels, accounts, and communities
+across Web, TikTok, Facebook, and Telegram, constructs the multi-edge cross-platform
+graph, and routes newly discovered Telegram leads into the validation queues.
 """
 
 import os
@@ -11,87 +12,22 @@ import json
 import asyncio
 import signal
 import logging
-import random
 from dotenv import load_dotenv
 import redis
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
-# Discovery Modules
-from app.discovery.taxonomy import get_all_keywords, KEYWORD_TAXONOMY
-from app.discovery.arabic_normalizer import generate_query_variants
-from app.discovery.provenance import ProvenanceManager
-from app.web_discovery.engines import WebDiscoveryEngine
+# Core & Discovery Modules
+from app.core.db import get_db_pool
+from app.discovery.cross_platform_engine import CrossPlatformDiscoveryEngine
+from app.discovery.query_generator import QueryGenerator
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [WEB-SCRAPER] [%(levelname)s] %(message)s',
+    format='%(asctime)s [CROSS-DISCOVERY] [%(levelname)s] %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-
-
-async def run_web_scraping_cycle(
-    engine: WebDiscoveryEngine,
-    redis_conn: redis.Redis,
-    provenance_mgr: ProvenanceManager,
-    shutdown_event: asyncio.Event
-):
-    """
-    Runs a complete web discovery pass across all taxonomy queries.
-    """
-    logging.info("Starting Web Discovery cycle...")
-    all_keywords = get_all_keywords()
-    random.shuffle(all_keywords)
-
-    total_discovered = 0
-
-    for kw in all_keywords[:25]: # Process 25 keywords per cycle
-        if shutdown_event.is_set():
-            break
-
-        # Check queue backpressure
-        try:
-            q_len = redis_conn.llen("queue:normal") + redis_conn.llen("queue:high")
-            while q_len >= 1000 and not shutdown_event.is_set():
-                logging.warning(f"Backpressure active ({q_len} queued). Pausing web discovery...")
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    pass
-                q_len = redis_conn.llen("queue:normal") + redis_conn.llen("queue:high")
-        except Exception:
-            pass
-
-        logging.info(f"Scraping web for: '{kw}'...")
-        links = engine.discover_channels_for_query(kw)
-
-        for link in links:
-            is_new, count, sources = provenance_mgr.record_candidate_discovery(
-                username_or_link=link,
-                source_type="web",
-                keyword=kw
-            )
-
-            if is_new:
-                payload = json.dumps({
-                    "link": link,
-                    "source": f"web_search:{kw}",
-                    "method": "web",
-                    "keyword": kw,
-                    "discovered_count": count,
-                    "sources": sources
-                })
-                redis_conn.rpush("queue:normal", payload)
-                total_discovered += 1
-                logging.info(f"Web Discovered: {link} (Query: '{kw}')")
-
-        # Anti-scraping jitter between search queries
-        delay = random.uniform(5.0, 12.0)
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=delay)
-        except asyncio.TimeoutError:
-            pass
-
-    logging.info(f"Web discovery cycle finished. Found and queued {total_discovered} new candidates.")
 
 
 async def main():
@@ -102,8 +38,15 @@ async def main():
     redis_db = int(os.getenv("REDIS_DB", 0))
     redis_password = os.getenv("REDIS_PASSWORD", None)
 
-    interval = int(os.getenv("WEB_SCRAPER_INTERVAL_SECONDS", 7200)) # 2 hours default
+    db_host = os.getenv("DB_HOST", "localhost")
+    db_port = int(os.getenv("DB_PORT", 5432))
+    db_name = os.getenv("DB_NAME", "leadhunter_db")
+    db_user = os.getenv("DB_USER", "postgres")
+    db_password = os.getenv("DB_PASSWORD", "")
 
+    interval = int(os.getenv("WEB_SCRAPER_INTERVAL_SECONDS", 1800))  # 30 minutes default
+
+    # 1. Connect to Redis
     try:
         redis_conn = redis.Redis(
             host=redis_host,
@@ -113,18 +56,43 @@ async def main():
             decode_responses=True
         )
         redis_conn.ping()
-        logging.info("Redis connected successfully.")
+        logging.info("Connected to Redis successfully.")
     except Exception as e:
         logging.error(f"Failed to connect to Redis: {e}")
         sys.exit(1)
 
-    engine = WebDiscoveryEngine()
-    provenance_mgr = ProvenanceManager(redis_conn)
+    # 2. Connect to PostgreSQL
+    db_conn = None
+    try:
+        db_conn = psycopg2.connect(
+            host=db_host,
+            port=db_port,
+            dbname=db_name,
+            user=db_user,
+            password=db_password,
+            cursor_factory=RealDictCursor
+        )
+        logging.info("Connected to PostgreSQL successfully.")
+    except Exception as e:
+        logging.warning(f"PostgreSQL direct connection failed, attempting pool: {e}")
+        try:
+            pool = get_db_pool()
+            db_conn = pool.getconn()
+        except Exception as pool_err:
+            logging.error(f"Failed to connect to PostgreSQL: {pool_err}")
+
+    # 3. Initialize Cross-Platform Discovery Engine
+    query_gen = QueryGenerator()
+    engine = CrossPlatformDiscoveryEngine(
+        redis_conn=redis_conn,
+        db_conn=db_conn,
+        query_generator=query_gen
+    )
 
     shutdown_event = asyncio.Event()
 
     def stop():
-        logging.info("Web scraper shutdown initiated.")
+        logging.info("Cross-platform discovery shutdown initiated.")
         shutdown_event.set()
 
     loop = asyncio.get_running_loop()
@@ -134,22 +102,37 @@ async def main():
     except NotImplementedError:
         pass
 
-    logging.info("Web Scraper Worker is active.")
+    logging.info("Cross-Platform Unified Discovery Worker is active.")
 
     while not shutdown_event.is_set():
         try:
-            await run_web_scraping_cycle(engine, redis_conn, provenance_mgr, shutdown_event)
-        except Exception as e:
-            logging.error(f"Error in web scraper cycle: {e}", exc_info=True)
+            # Ensure DB connection is alive
+            if db_conn and db_conn.closed:
+                try:
+                    db_conn = psycopg2.connect(
+                        host=db_host, port=db_port, dbname=db_name,
+                        user=db_user, password=db_password, cursor_factory=RealDictCursor
+                    )
+                    engine.db = db_conn
+                    engine.graph_mgr.db = db_conn
+                    engine.spider.db = db_conn
+                except Exception:
+                    pass
 
-        logging.info(f"Sleeping for {interval}s until next web scraping cycle...")
+            await engine.run_discovery_cycle(shutdown_event)
+        except Exception as e:
+            logging.error(f"Error in cross-platform discovery cycle: {e}", exc_info=True)
+
+        logging.info(f"Sleeping for {interval}s until next cross-platform discovery cycle...")
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
         except asyncio.TimeoutError:
             pass
 
     redis_conn.close()
-    logging.info("Web scraper worker stopped.")
+    if db_conn and not db_conn.closed:
+        db_conn.close()
+    logging.info("Cross-platform discovery worker stopped.")
 
 
 if __name__ == "__main__":

@@ -8,13 +8,21 @@ from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
 
-def is_dry_run() -> bool:
+def is_dry_run(redis_conn=None) -> bool:
     """
-    Check if the outreach engine is in dry-run mode via environment variable.
+    Check if the outreach engine is in dry-run mode via Redis or environment variable.
     
     Returns:
         bool: True if in dry-run mode, False otherwise.
     """
+    if redis_conn:
+        try:
+            val = redis_conn.get("outreach:dry_run")
+            if val is not None:
+                val_str = val.decode('utf-8') if isinstance(val, bytes) else str(val)
+                return val_str.lower() in ('1', 'true')
+        except Exception:
+            pass
     return os.environ.get("OUTREACH_DRY_RUN", "false").lower() == "true"
 
 def log_dry_run_decision(
