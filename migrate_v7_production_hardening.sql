@@ -47,8 +47,18 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
     watermark_used BIGINT DEFAULT 0,
     new_watermark BIGINT DEFAULT 0,
     posts_scanned INT DEFAULT 0,
+    target_queue VARCHAR(64) DEFAULT 'queue:normal',
+    payload TEXT,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+
+DO $$
+BEGIN
+    ALTER TABLE crawl_jobs ADD COLUMN IF NOT EXISTS target_queue VARCHAR(64) DEFAULT 'queue:normal';
+    ALTER TABLE crawl_jobs ADD COLUMN IF NOT EXISTS payload TEXT;
+EXCEPTION
+    WHEN duplicate_column THEN NULL;
+END $$;
 
 -- 4. Indexes for Optimized Scheduling, Graph and Watermark Queries
 CREATE INDEX IF NOT EXISTS idx_leads_next_crawl ON leads(next_crawl_at, activity_class, lead_score DESC) WHERE next_crawl_at IS NOT NULL;

@@ -75,6 +75,7 @@ class SchedulerWorker:
         self.scheduler = None
         self.backpressure_mgr = None
         self.shutdown_event = asyncio.Event()
+        self.cycle_count = 0
 
     def connect(self):
         logger.info(f"Connecting to Redis at {self.redis_host}:{self.redis_port}...")
@@ -125,52 +126,87 @@ class SchedulerWorker:
     async def run_schedule_cycle(self) -> int:
         """
         Executes one complete scheduling cycle:
-        1. Evaluates backpressure
-        2. Queries due channels from PostgreSQL
-        3. Dynamically calculates interval, tier, depth, and watermark
-        4. Enqueues crawl jobs into Redis priority queues
+        1. Acquires distributed leader lock to prevent competing schedulers
+        2. Emits Redis heartbeat for monitoring
+        3. Reconciles any un-enqueued outbox jobs and stale running jobs
+        4. Evaluates backpressure
+        5. Queries due channels from PostgreSQL
+        6. Dynamically calculates interval, tier, depth, and watermark
+        7. Enqueues crawl jobs into Redis priority queues
         """
-        # 1. Check Backpressure
-        pressure = self.backpressure_mgr.get_composite_pressure()
-        if pressure == BackpressureLevel.CRITICAL:
-            logger.warning("System backpressure CRITICAL (downstream queues saturated). Pausing crawl scheduling...")
+        # 1. Acquire distributed leader lock
+        lock_acquired = self.scheduler.acquire_leader_lock(ttl_seconds=45)
+        if not lock_acquired:
+            logger.info("Another scheduler holds the leader lock. Skipping cycle.")
             return 0
 
-        concurrency_factor = self.backpressure_mgr.recommended_concurrency_factor()
-        effective_batch = max(5, int(self.batch_size * concurrency_factor))
+        try:
+            self.cycle_count += 1
 
-        # 2. Fetch due channels
-        self.db_helper.check_connection()
-        due_channels = self.scheduler.get_channels_due_for_crawl(batch_size=effective_batch)
-        if not due_channels:
-            logger.debug("No channels currently due for crawl.")
-            return 0
+            # 2. Update Heartbeat in Redis
+            if self.redis_conn:
+                try:
+                    self.redis_conn.setex(
+                        "heartbeat:worker:scheduler",
+                        60,
+                        datetime.now(timezone.utc).isoformat()
+                    )
+                except Exception as hb_err:
+                    logger.debug(f"Heartbeat update warning: {hb_err}")
 
-        logger.info(f"Found {len(due_channels)} channels due for scheduled crawl. Dispatching jobs...")
-        enqueued_count = 0
+            # 3. Run Outbox Reconciliation & Stale Job Recovery
+            try:
+                self.scheduler.reconcile_outbox_jobs(batch_size=20)
+                if self.cycle_count % 10 == 0:
+                    self.scheduler.reconcile_stale_running_jobs(timeout_minutes=30)
+            except Exception as rec_err:
+                logger.warning(f"Reconciliation cycle warning: {rec_err}")
 
-        # 3. Schedule and dispatch each due channel
-        for ch in due_channels:
-            if self.shutdown_event.is_set():
-                break
+            # 4. Check Backpressure
+            pressure = self.backpressure_mgr.get_composite_pressure()
+            if pressure == BackpressureLevel.CRITICAL:
+                logger.warning("System backpressure CRITICAL (downstream queues saturated). Pausing crawl scheduling...")
+                return 0
 
-            channel_id = str(ch.get("id"))
-            username = ch.get("channel_username")
-            if not username:
-                continue
+            concurrency_factor = self.backpressure_mgr.recommended_concurrency_factor()
+            effective_batch = max(5, int(self.batch_size * concurrency_factor))
 
-            job_id = self.scheduler.schedule_channel_crawl(
-                channel_id=channel_id,
-                channel_username=username,
-                channel_data=ch,
-                job_type="incremental" if ch.get("last_scanned_message_id", 0) > 0 else "deep_scan"
-            )
+            # 5. Fetch due channels
+            self.db_helper.check_connection()
+            due_channels = self.scheduler.get_channels_due_for_crawl(batch_size=effective_batch)
+            if not due_channels:
+                logger.debug("No channels currently due for crawl.")
+                return 0
 
-            if job_id:
-                enqueued_count += 1
+            logger.info(f"Found {len(due_channels)} channels due for scheduled crawl. Dispatching jobs...")
+            enqueued_count = 0
 
-        logger.info(f"Crawl scheduling cycle complete: {enqueued_count}/{len(due_channels)} jobs dispatched.")
-        return enqueued_count
+            # 6. Schedule and dispatch each due channel
+            for ch in due_channels:
+                if self.shutdown_event.is_set():
+                    break
+
+                channel_id = str(ch.get("id"))
+                username = ch.get("channel_username")
+                if not username:
+                    continue
+
+                job_id = self.scheduler.schedule_channel_crawl(
+                    channel_id=channel_id,
+                    channel_username=username,
+                    channel_data=ch,
+                    job_type="incremental" if ch.get("last_scanned_message_id", 0) > 0 else "deep_scan"
+                )
+
+                if job_id:
+                    enqueued_count += 1
+
+            logger.info(f"Crawl scheduling cycle complete: {enqueued_count}/{len(due_channels)} jobs dispatched.")
+            return enqueued_count
+
+        finally:
+            self.scheduler.release_leader_lock()
+
 
     async def start(self):
         self.connect()

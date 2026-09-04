@@ -72,6 +72,8 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    environment:
+      - ENABLE_EMBEDDED_SCHEDULER=false
     volumes:
       - sessions_data:/app/sessions
       - media_data:/app/media
@@ -127,6 +129,9 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    environment:
+      - SCHEDULER_POLL_INTERVAL_SECONDS=30
+      - SCHEDULER_BATCH_SIZE=50
 
   dashboard:
     build: .

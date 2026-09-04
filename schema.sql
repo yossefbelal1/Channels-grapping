@@ -243,6 +243,8 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
     watermark_used BIGINT DEFAULT 0,
     new_watermark BIGINT DEFAULT 0,
     posts_scanned INT DEFAULT 0,
+    target_queue VARCHAR(64) DEFAULT 'queue:normal',
+    payload TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

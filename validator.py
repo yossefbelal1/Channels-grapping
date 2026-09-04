@@ -1890,12 +1890,24 @@ class LeadValidator:
                     max_posts_budget = int(data.get("max_posts_budget") or 100)
                 except Exception:
                     pass
+
+            # Mark crawl job as running in PostgreSQL outbox
+            if crawl_job_id and hasattr(self, 'scheduler') and self.scheduler:
+                try:
+                    self.scheduler.mark_job_running(crawl_job_id)
+                except Exception:
+                    pass
             
             # First extract name to run database caching check and get identifier/username
             link_type, identifier = parse_telegram_link(actual_link)
             if not link_type or not identifier:
                 logging.info(f"Link {actual_link} failed parsing (invalid format or junk/email domain/bot). Skipping.")
                 self.db_helper.add_to_blacklist(actual_link, 'invalid_link_format')
+                if crawl_job_id and hasattr(self, 'scheduler') and self.scheduler:
+                    try:
+                        self.scheduler.record_crawl_result(crawl_job_id, identifier or "invalid", success=False, error_message="invalid_link_format")
+                    except Exception:
+                        pass
                 return
 
             # Lookup existing watermark if not passed in payload
@@ -1924,6 +1936,11 @@ class LeadValidator:
                     arabic_score=0, region_score=0, status='rejected',
                     forex_intent_score=0, forex_category='unknown', high_risk_fraud=False
                 )
+                if crawl_job_id and hasattr(self, 'scheduler') and self.scheduler:
+                    try:
+                        self.scheduler.record_crawl_result(crawl_job_id, identifier, success=False, error_message="blacklisted")
+                    except Exception:
+                        pass
                 return
             
             # Fast short-circuit: if the source is a rejected group, skip validation immediately to save API limits
@@ -2291,6 +2308,17 @@ class LeadValidator:
                         discovery_source=discovery_source, discovery_method=discovery_method, arabic_score=arabic_score,
                         region_score=0, status='new', forex_intent_score=forex_intent_score, forex_category='unknown', high_risk_fraud=False
                     )
+                    if crawl_job_id and hasattr(self, 'scheduler') and self.scheduler:
+                        try:
+                            self.scheduler.record_crawl_result(
+                                crawl_job_id,
+                                identifier,
+                                success=True,
+                                new_watermark=crawl_watermark,
+                                posts_scanned=len(messages) if messages else 0
+                            )
+                        except Exception:
+                            pass
                 else:
                     logging.info(f"Inactive channel {actual_link} failed niche filters (is_forex={is_forex}, arabic_score={arabic_score}, forbidden={has_forbidden}). Rejecting.")
                     self.db_helper.upsert_lead(
@@ -2304,6 +2332,17 @@ class LeadValidator:
                         discovery_source=discovery_source, discovery_method=discovery_method, arabic_score=arabic_score,
                         region_score=0, status='rejected', forex_intent_score=forex_intent_score, forex_category='unknown', high_risk_fraud=False
                     )
+                    if crawl_job_id and hasattr(self, 'scheduler') and self.scheduler:
+                        try:
+                            self.scheduler.record_crawl_result(
+                                crawl_job_id,
+                                identifier,
+                                success=False,
+                                posts_scanned=len(messages) if messages else 0,
+                                error_message=inactive_reason
+                            )
+                        except Exception:
+                            pass
                 return
                 
             # Compile messages sample text
@@ -2448,6 +2487,11 @@ class LeadValidator:
                 if not is_group_forex:
                     logging.info(f"Group @{username} is NOT a Forex group (Forex score: {forex_intent_score}). Rejecting, adding to rejected_groups_set, and skipping link extraction.")
                     self.redis_conn.sadd("rejected_groups_set", username.lower())
+                    if crawl_job_id and hasattr(self, 'scheduler') and self.scheduler:
+                        try:
+                            self.scheduler.record_crawl_result(crawl_job_id, identifier, success=False, error_message="non_forex_group")
+                        except Exception:
+                            pass
                     return
 
                 # Track discovery source analytics for group
@@ -3096,26 +3140,35 @@ class LeadValidator:
                         await asyncio.sleep(60)
                         continue
 
-                # Query and schedule due channels via PriorityScheduler
+                # Query and schedule due channels via PriorityScheduler with leader lock
                 if hasattr(self, 'scheduler') and self.scheduler:
-                    self.db_helper.check_connection()
-                    due_channels = self.scheduler.get_channels_due_for_crawl(batch_size=30)
-                    if due_channels:
-                        logging.info(f"PriorityScheduler found {len(due_channels)} channels due for crawl. Dispatching...")
-                        for ch in due_channels:
-                            channel_id = str(ch.get("id"))
-                            username = ch.get("channel_username")
-                            if not username:
-                                continue
-                            wm = int(ch.get("last_scanned_message_id") or 0)
-                            job_id = self.scheduler.schedule_channel_crawl(
-                                channel_id=channel_id,
-                                channel_username=username,
-                                channel_data=ch,
-                                job_type="incremental" if wm > 0 else "deep_scan"
-                            )
-                            if job_id:
-                                logging.debug(f"Scheduled crawl job {job_id} for @{username} (watermark={wm})")
+                    lock_ok = self.scheduler.acquire_leader_lock(ttl_seconds=30)
+                    if not lock_ok:
+                        logging.debug("Embedded scheduler: leader lock held by another worker. Skipping cycle.")
+                        await asyncio.sleep(15)
+                        continue
+
+                    try:
+                        self.db_helper.check_connection()
+                        due_channels = self.scheduler.get_channels_due_for_crawl(batch_size=30)
+                        if due_channels:
+                            logging.info(f"PriorityScheduler found {len(due_channels)} channels due for crawl. Dispatching...")
+                            for ch in due_channels:
+                                channel_id = str(ch.get("id"))
+                                username = ch.get("channel_username")
+                                if not username:
+                                    continue
+                                wm = int(ch.get("last_scanned_message_id") or 0)
+                                job_id = self.scheduler.schedule_channel_crawl(
+                                    channel_id=channel_id,
+                                    channel_username=username,
+                                    channel_data=ch,
+                                    job_type="incremental" if wm > 0 else "deep_scan"
+                                )
+                                if job_id:
+                                    logging.debug(f"Scheduled crawl job {job_id} for @{username} (watermark={wm})")
+                    finally:
+                        self.scheduler.release_leader_lock()
                 
             except Exception as e:
                 logging.error(f"Error in rescan scheduler loop: {e}", exc_info=True)
@@ -4482,8 +4535,13 @@ class LeadValidator:
         except Exception as oe_err:
             logging.error(f"Engine initialization error (non-fatal): {oe_err}")
 
-        # Start the periodic rescan scheduler
-        asyncio.create_task(self.rescan_scheduler_loop())
+        # Crawl Scheduling: Single source of truth is worker_scheduler (scheduler_worker.py).
+        # Only start embedded loop if explicitly enabled for single-process development.
+        if os.getenv("ENABLE_EMBEDDED_SCHEDULER", "false").lower() == "true":
+            logging.info("Embedded rescan scheduler ENABLED by configuration.")
+            asyncio.create_task(self.rescan_scheduler_loop())
+        else:
+            logging.info("Embedded rescan scheduler DISABLED. Dedicated worker_scheduler handles scheduling.")
         
         # Initialize the shared user client for auto-joiner and campaign dispatcher
         has_user_client = await self.init_user_client()

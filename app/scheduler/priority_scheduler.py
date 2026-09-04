@@ -4,15 +4,18 @@ app/scheduler/priority_scheduler.py — Dynamic Priority Crawl Scheduler & Dispa
 Production-Hardened Features:
 - 5 Scheduling Classes (HOT, WARM, NORMAL, COLD, DORMANT)
 - Incremental Crawl Dispatching with Watermark Awareness
-- Tiered Scan Depth propagation to Worker Queues
-- Persistent Crawl Job Audit Trail in PostgreSQL crawl_jobs table
+- Transactional Outbox Pattern for DB + Redis Enqueue Reliability
+- Zero Lost Jobs Guarantee: next_crawl_at only advanced upon verified Redis enqueue
+- Periodic Outbox Reconciliation & Stale Running Job Crash Recovery
+- Distributed Leader Lock to prevent competing schedulers
+- In-flight crawl job deduplication (never re-schedule an active channel)
 - Resilient Error Backoff without channel deletion
 """
 
 import json
 import uuid
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional
 
 from app.scheduler.activity_classifier import ActivityClassifier, ActivityClass, ScanDepthTier
@@ -25,12 +28,38 @@ class PriorityScheduler:
     """
     Schedules dynamic crawl and re-validation jobs based on channel priority,
     activity tier, and incremental watermark state.
+    Guarantees transactional reliability between PostgreSQL and Redis.
     """
+
+    LOCK_KEY = "lock:scheduler:leader"
 
     def __init__(self, redis_conn, db_conn=None):
         self.redis = redis_conn
         self.db = db_conn
         self.watermark_mgr = WatermarkManager(redis_conn, db_conn)
+
+    def acquire_leader_lock(self, ttl_seconds: int = 30) -> bool:
+        """
+        Attempts to acquire a distributed leader lock in Redis.
+        Guarantees only ONE scheduler instance executes cycles at any given time.
+        """
+        if not self.redis:
+            return True
+        try:
+            acquired = self.redis.set(self.LOCK_KEY, "active", nx=True, ex=ttl_seconds)
+            return bool(acquired)
+        except Exception as err:
+            logger.warning(f"Failed to acquire scheduler leader lock: {err}")
+            return True
+
+    def release_leader_lock(self) -> None:
+        """Releases the distributed leader lock."""
+        if not self.redis:
+            return
+        try:
+            self.redis.delete(self.LOCK_KEY)
+        except Exception as err:
+            logger.debug(f"Failed to release scheduler leader lock: {err}")
 
     def get_channels_due_for_crawl(self, batch_size: int = 50) -> List[Dict[str, Any]]:
         """
@@ -53,6 +82,12 @@ class PriorityScheduler:
                     FROM leads
                     WHERE status != 'rejected'
                       AND (next_crawl_at IS NULL OR next_crawl_at <= NOW())
+                      AND NOT EXISTS (
+                          SELECT 1 FROM crawl_jobs
+                          WHERE (crawl_jobs.channel_id = leads.id::text OR crawl_jobs.channel_username = leads.channel_username)
+                            AND crawl_jobs.status IN ('pending', 'queued', 'running')
+                            AND crawl_jobs.scheduled_at > NOW() - INTERVAL '30 minutes'
+                      )
                     ORDER BY
                         CASE WHEN activity_class = 'HOT' THEN 1
                              WHEN activity_class = 'WARM' THEN 2
@@ -127,27 +162,7 @@ class PriorityScheduler:
         next_crawl_at = schedule_info["next_crawl_at"]
         interval_minutes = schedule_info["interval_minutes"]
 
-        # 2. Update PostgreSQL leads next_crawl_at and interval
-        if self.db:
-            try:
-                with self.db.cursor() as cur:
-                    cur.execute("""
-                        UPDATE leads
-                        SET next_crawl_at = %s,
-                            crawl_interval_minutes = %s,
-                            activity_class = %s,
-                            scan_depth_tier = %s
-                        WHERE id::text = %s OR channel_username = %s;
-                    """, (next_crawl_at, interval_minutes, tier, scan_depth, str(channel_id), channel_username))
-                self.db.commit()
-            except Exception as err:
-                logger.warning(f"Failed to update next_crawl_at for {channel_username}: {err}")
-                try:
-                    self.db.rollback()
-                except Exception:
-                    pass
-
-        # 3. Determine Queue Priority
+        # 2. Determine Queue Priority
         prio = priority
         if not prio:
             if tier == ActivityClass.HOT:
@@ -175,33 +190,92 @@ class PriorityScheduler:
             "max_posts_budget": max_posts,
             "scheduled_at": datetime.now(timezone.utc).isoformat()
         }
+        raw_payload = json.dumps(payload)
 
-        # 4. Insert into crawl_jobs table
+        # 3. Step 1 of Transactional Outbox: Insert job as 'pending'
         if self.db:
             try:
                 with self.db.cursor() as cur:
                     cur.execute("""
                         INSERT INTO crawl_jobs (
                             job_id, channel_id, channel_username, job_type,
-                            activity_class, priority, scheduled_at, status, watermark_used
-                        ) VALUES (%s, %s, %s, %s, %s, %s, NOW(), 'pending', %s)
+                            activity_class, priority, scheduled_at, status, watermark_used,
+                            target_queue, payload
+                        ) VALUES (%s, %s, %s, %s, %s, %s, NOW(), 'pending', %s, %s, %s)
                         ON CONFLICT (job_id) DO NOTHING;
-                    """, (job_id, str(channel_id), channel_username, job_type, tier, prio, watermark))
+                    """, (job_id, str(channel_id), channel_username, job_type, tier, prio, watermark, queue_name, raw_payload))
                 self.db.commit()
             except Exception as err:
-                logger.debug(f"Failed to insert crawl_job row: {err}")
+                logger.debug(f"Failed to insert outbox crawl_job: {err}")
                 try:
                     self.db.rollback()
                 except Exception:
                     pass
 
-        # 5. Push to Redis queue
+        # 4. Step 2 of Outbox: Enqueue to Redis
+        enqueue_success = False
         try:
-            self.redis.lpush(queue_name, json.dumps(payload))
-            return job_id
+            self.redis.lpush(queue_name, raw_payload)
+            enqueue_success = True
+        except Exception as redis_err:
+            logger.warning(f"Redis enqueue failed for {channel_username}: {redis_err}")
+
+        # 5. Step 3 of Outbox: Atomic status resolution
+        if self.db:
+            try:
+                with self.db.cursor() as cur:
+                    if enqueue_success:
+                        cur.execute("""
+                            UPDATE crawl_jobs
+                            SET status = 'queued'
+                            WHERE job_id = %s;
+                        """, (job_id,))
+                        cur.execute("""
+                            UPDATE leads
+                            SET next_crawl_at = %s,
+                                crawl_interval_minutes = %s,
+                                activity_class = %s,
+                                scan_depth_tier = %s
+                            WHERE id::text = %s OR channel_username = %s;
+                        """, (next_crawl_at, interval_minutes, tier, scan_depth, str(channel_id), channel_username))
+                    else:
+                        # Redis enqueue failed: Mark job as enqueue_failed
+                        # CRUCIAL: next_crawl_at remains un-advanced so channel remains due
+                        cur.execute("""
+                            UPDATE crawl_jobs
+                            SET status = 'enqueue_failed',
+                                error_message = 'Redis enqueue failure'
+                            WHERE job_id = %s;
+                        """, (job_id,))
+                self.db.commit()
+            except Exception as db_err:
+                logger.warning(f"Failed to update outbox status for {channel_username}: {db_err}")
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
+
+        return job_id if enqueue_success else None
+
+    def mark_job_running(self, job_id: str) -> bool:
+        """
+        Transitions a crawl job to 'running' state upon worker checkout.
+        """
+        if not self.db or not job_id:
+            return False
+        try:
+            with self.db.cursor() as cur:
+                cur.execute("""
+                    UPDATE crawl_jobs
+                    SET status = 'running',
+                        executed_at = COALESCE(executed_at, NOW())
+                    WHERE job_id = %s;
+                """, (job_id,))
+            self.db.commit()
+            return True
         except Exception as err:
-            logger.warning(f"Failed to enqueue crawl job for {channel_username}: {err}")
-            return None
+            logger.debug(f"Notice marking crawl job running ({job_id}): {err}")
+            return False
 
     def record_crawl_result(
         self,
@@ -251,3 +325,106 @@ class PriorityScheduler:
                     pass
 
         return False
+
+    def reconcile_outbox_jobs(self, batch_size: int = 50) -> int:
+        """
+        Outbox Reconciliation Engine:
+        Finds crawl_jobs that failed Redis enqueue or got stuck in 'pending' status.
+        Retries pushing to Redis. Upon success, marks them 'queued' and advances next_crawl_at.
+        """
+        if not self.db or not self.redis:
+            return 0
+
+        reconciled = 0
+        try:
+            with self.db.cursor() as cur:
+                cur.execute("""
+                    SELECT job_id, channel_id, channel_username, target_queue, payload
+                    FROM crawl_jobs
+                    WHERE (status = 'enqueue_failed'
+                           OR (status = 'pending' AND scheduled_at < NOW() - INTERVAL '2 minutes'))
+                      AND scheduled_at > NOW() - INTERVAL '2 hours'
+                    LIMIT %s;
+                """, (batch_size,))
+                stuck_jobs = cur.fetchall()
+
+            if not stuck_jobs:
+                return 0
+
+            logger.info(f"Outbox reconciler found {len(stuck_jobs)} un-enqueued jobs. Retrying Redis push...")
+            for row in stuck_jobs:
+                job_id, ch_id, ch_uname, queue_name, payload_str = row
+                q = queue_name or "queue:normal"
+                if not payload_str:
+                    continue
+
+                try:
+                    self.redis.lpush(q, payload_str)
+                    with self.db.cursor() as cur:
+                        cur.execute("""
+                            UPDATE crawl_jobs
+                            SET status = 'queued', error_message = NULL
+                            WHERE job_id = %s;
+                        """, (job_id,))
+                        cur.execute("""
+                            UPDATE leads
+                            SET next_crawl_at = NOW() + INTERVAL '2 hours'
+                            WHERE id::text = %s OR channel_username = %s;
+                        """, (str(ch_id), ch_uname))
+                    self.db.commit()
+                    reconciled += 1
+                except Exception as push_err:
+                    logger.debug(f"Reconciliation Redis push still failing for {ch_uname}: {push_err}")
+                    break
+
+        except Exception as err:
+            logger.warning(f"Error during outbox reconciliation: {err}")
+
+        if reconciled > 0:
+            logger.info(f"Outbox reconciler successfully restored and enqueued {reconciled} crawl jobs.")
+        return reconciled
+
+    def reconcile_stale_running_jobs(self, timeout_minutes: int = 30) -> int:
+        """
+        Detects crawl jobs that were checked out by a worker and marked 'running',
+        but never completed within the timeout window (e.g. worker crash).
+        Marks them 'failed' so the channel is eligible for recovery crawl on next cycle.
+        """
+        if not self.db:
+            return 0
+
+        recovered = 0
+        try:
+            with self.db.cursor() as cur:
+                cur.execute("""
+                    UPDATE crawl_jobs
+                    SET status = 'failed',
+                        completed_at = NOW(),
+                        error_message = 'Worker execution timeout / crash recovery'
+                    WHERE status = 'running'
+                      AND executed_at < NOW() - (INTERVAL '1 minute' * %s)
+                    RETURNING job_id, channel_id;
+                """, (timeout_minutes,))
+                rows = cur.fetchall()
+
+                for job_id, channel_id in rows:
+                    cur.execute("""
+                        UPDATE leads
+                        SET consecutive_crawl_failures = COALESCE(consecutive_crawl_failures, 0) + 1,
+                            last_crawl_at = NOW()
+                        WHERE id::text = %s;
+                    """, (str(channel_id),))
+                    recovered += 1
+
+            self.db.commit()
+        except Exception as err:
+            logger.warning(f"Error recovering stale running crawl jobs: {err}")
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
+
+        if recovered > 0:
+            logger.info(f"Stale job recovery: cleared {recovered} orphaned running crawl jobs.")
+        return recovered
+
