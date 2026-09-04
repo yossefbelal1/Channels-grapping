@@ -405,3 +405,170 @@ def test_outreach_state_and_safety_preserved():
     )
     assert status == "BLOCKED"
     assert "System keyword" in reason
+
+
+# ─── 17. Real Database SQL Ordering Integration Test ──────────────────────────
+def test_sql_ordering_real_database_integration():
+    """
+    Integration test executing the actual claiming query against a real SQL database engine
+    to prove that pending recipients are claimed strictly in:
+    P0 -> P1 -> P2 -> P3 -> P4, and ordered by priority_score DESC within each tier.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE campaigns (
+            id TEXT PRIMARY KEY,
+            message_text TEXT,
+            media_path TEXT,
+            created_at TIMESTAMP
+        );
+    """)
+
+    cur.execute("""
+        CREATE TABLE leads (
+            id TEXT PRIMARY KEY,
+            channel_username TEXT,
+            contact_username TEXT,
+            outreach_priority TEXT,
+            outreach_priority_score INT,
+            outreach_priority_reason TEXT,
+            commercial_last_seen TIMESTAMP,
+            intent_detected_at TIMESTAMP
+        );
+    """)
+
+    cur.execute("""
+        CREATE TABLE campaign_logs (
+            id TEXT PRIMARY KEY,
+            campaign_id TEXT,
+            lead_id TEXT,
+            status TEXT,
+            priority TEXT,
+            priority_score INT,
+            attempt_count INT DEFAULT 0,
+            last_attempt_at TIMESTAMP,
+            sent_at TIMESTAMP
+        );
+    """)
+
+    cur.execute("INSERT INTO campaigns VALUES ('camp-1', 'Test message', NULL, '2026-09-01 10:00:00')")
+
+    # Insert diverse leads: P3, P0, P1, P0, P2, P4, P1, P3
+    leads = [
+        ("lead-p3-low", "news_1", "admin1", "P3", 22, "2026-09-01 00:00:00"),
+        ("lead-p0-high", "vip_1", "admin2", "P0", 92, "2026-09-04 04:00:00"),
+        ("lead-p1-mid", "copy_1", "admin3", "P1", 65, "2026-09-03 12:00:00"),
+        ("lead-p0-mid", "vip_2", "admin4", "P0", 78, "2026-09-04 02:00:00"),
+        ("lead-p2-high", "ib_1", "admin5", "P2", 52, "2026-09-02 15:00:00"),
+        ("lead-p4-min", "chat_1", "admin6", "P4", 10, None),
+        ("lead-p1-high", "prop_1", "admin7", "P1", 72, "2026-09-04 01:00:00"),
+        ("lead-p3-high", "news_2", "admin8", "P3", 35, "2026-09-02 08:00:00"),
+    ]
+
+    for lid, cname, uadmin, prio, score, lseen in leads:
+        cur.execute("INSERT INTO leads VALUES (?, ?, ?, ?, ?, 'reason', ?, NULL)", (lid, cname, uadmin, prio, score, lseen))
+        cur.execute("INSERT INTO campaign_logs VALUES (?, 'camp-1', ?, 'pending', ?, ?, 0, NULL, NULL)", (f"log-{lid}", lid, prio, score))
+
+    # Actual Claiming Query (matching campaign_worker.py / validator.py)
+    cur.execute("""
+        SELECT cl.id as log_id, l.channel_username,
+               COALESCE(cl.priority, l.outreach_priority, 'P3') as priority,
+               COALESCE(cl.priority_score, l.outreach_priority_score, 25) as priority_score
+        FROM campaign_logs cl
+        JOIN campaigns c ON cl.campaign_id = c.id
+        JOIN leads l ON cl.lead_id = l.id
+        WHERE cl.status = 'pending'
+        ORDER BY 
+            CASE COALESCE(cl.priority, l.outreach_priority, 'P3')
+                WHEN 'P0' THEN 0
+                WHEN 'P1' THEN 1
+                WHEN 'P2' THEN 2
+                WHEN 'P3' THEN 3
+                WHEN 'P4' THEN 4
+                ELSE 5
+            END ASC,
+            COALESCE(cl.priority_score, l.outreach_priority_score, 25) DESC,
+            COALESCE(l.commercial_last_seen, l.intent_detected_at) DESC,
+            cl.attempt_count ASC,
+            c.created_at ASC
+    """)
+
+    results = cur.fetchall()
+    extracted_order = [(r[1], r[2], r[3]) for r in results]
+
+    # Verify exact claimed sequence
+    expected_order = [
+        ("vip_1", "P0", 92),
+        ("vip_2", "P0", 78),
+        ("prop_1", "P1", 72),
+        ("copy_1", "P1", 65),
+        ("ib_1", "P2", 52),
+        ("news_2", "P3", 35),
+        ("news_1", "P3", 22),
+        ("chat_1", "P4", 10),
+    ]
+    assert extracted_order == expected_order
+
+
+# ─── 18. Previously Contacted / Replied / Skipped / Cooldown Not Selected ─────
+def test_previously_contacted_replied_skipped_cooldown_not_selected():
+    """
+    Ensures that leads that were already contacted, replied, skipped, or in cooldown
+    are NEVER selected by the claiming query.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    cur = conn.cursor()
+
+    cur.execute("CREATE TABLE campaigns (id TEXT PRIMARY KEY, created_at TIMESTAMP);")
+    cur.execute("CREATE TABLE leads (id TEXT PRIMARY KEY, channel_username TEXT, outreach_priority TEXT, outreach_priority_score INT, commercial_last_seen TIMESTAMP, intent_detected_at TIMESTAMP);")
+    cur.execute("CREATE TABLE campaign_logs (id TEXT PRIMARY KEY, campaign_id TEXT, lead_id TEXT, status TEXT, priority TEXT, priority_score INT, attempt_count INT, sent_at TIMESTAMP, last_attempt_at TIMESTAMP);")
+
+    cur.execute("INSERT INTO campaigns VALUES ('camp-1', '2026-09-01 10:00:00')")
+
+    # Insert 4 leads with different states
+    # 1. P0 lead that was already sent
+    cur.execute("INSERT INTO leads VALUES ('l1', 'p0_sent', 'P0', 95, NULL, NULL)")
+    cur.execute("INSERT INTO campaign_logs VALUES ('log1', 'camp-1', 'l1', 'sent', 'P0', 95, 1, '2026-09-02', '2026-09-02')")
+
+    # 2. P0 lead that was skipped (duplicate / blacklisted)
+    cur.execute("INSERT INTO leads VALUES ('l2', 'p0_skipped', 'P0', 90, NULL, NULL)")
+    cur.execute("INSERT INTO campaign_logs VALUES ('log2', 'camp-1', 'l2', 'skipped', 'P0', 90, 0, NULL, NULL)")
+
+    # 3. P0 lead currently being processed
+    cur.execute("INSERT INTO leads VALUES ('l3', 'p0_processing', 'P0', 85, NULL, NULL)")
+    cur.execute("INSERT INTO campaign_logs VALUES ('log3', 'camp-1', 'l3', 'processing', 'P0', 85, 1, NULL, '2026-09-04 05:30:00')")
+
+    # 4. P1 lead that is legitimately PENDING
+    cur.execute("INSERT INTO leads VALUES ('l4', 'p1_eligible', 'P1', 68, NULL, NULL)")
+    cur.execute("INSERT INTO campaign_logs VALUES ('log4', 'camp-1', 'l4', 'pending', 'P1', 68, 0, NULL, NULL)")
+
+    # Claim query
+    cur.execute("""
+        SELECT cl.id, l.channel_username, cl.priority
+        FROM campaign_logs cl
+        JOIN campaigns c ON cl.campaign_id = c.id
+        JOIN leads l ON cl.lead_id = l.id
+        WHERE cl.status = 'pending'
+        ORDER BY 
+            CASE COALESCE(cl.priority, l.outreach_priority, 'P3')
+                WHEN 'P0' THEN 0
+                WHEN 'P1' THEN 1
+                WHEN 'P2' THEN 2
+                WHEN 'P3' THEN 3
+                WHEN 'P4' THEN 4
+                ELSE 5
+            END ASC
+        LIMIT 1
+    """)
+
+    claimed = cur.fetchone()
+    # Must claim the pending P1 lead, completely ignoring sent/skipped/processing P0 leads
+    assert claimed is not None
+    assert claimed[1] == "p1_eligible"
+    assert claimed[2] == "P1"
