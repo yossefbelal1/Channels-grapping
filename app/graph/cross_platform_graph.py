@@ -66,7 +66,7 @@ class CrossPlatformGraphManager(GraphEdgeManager):
                 # 2. Insert new lead
                 is_rel = entity.metadata.get("is_relevant", True if entity.platform == Platform.TELEGRAM else False)
                 cand_status = "verified" if is_rel else "rejected"
-                lead_status = "new" if entity.platform == Platform.TELEGRAM else ("verified" if is_rel else "rejected")
+                lead_status = "new" if is_rel else "rejected"
                 rel_score = int(entity.metadata.get("relevance_score") or (75 if entity.platform == Platform.TELEGRAM else 0))
 
                 cur.execute("""
