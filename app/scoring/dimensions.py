@@ -293,9 +293,7 @@ def calculate_all_dimensions(
     # ──────────────────────────────────────────────────────────────────────────
     # 12. Growth Score (0 to 100) — Observed snapshots or 0 baseline
     # ──────────────────────────────────────────────────────────────────────────
-    if snapshots and len(snapshots) >= 2:
-        growth_score, growth_evidence = GrowthAnalyzer.calculate_growth_from_snapshots(snapshots)
-    else:
+    if snapshots is None or len(snapshots) < 2:
         growth_score = 0 # No evidence -> 0 points
         growth_evidence = {
             "status": "UNOBSERVED_SNAPSHOTS",
@@ -303,6 +301,8 @@ def calculate_all_dimensions(
             "growth_score": 0,
             "reason": "Historical snapshots not observed; assigned 0."
         }
+    else:
+        growth_score, growth_evidence = GrowthAnalyzer.calculate_growth_from_snapshots(snapshots)
 
     # ──────────────────────────────────────────────────────────────────────────
     # 13. Confidence Score (0 to 100) — Assessment Evidence Depth
@@ -351,7 +351,7 @@ def calculate_all_dimensions(
             first_seen_at = first_seen_at.replace(tzinfo=timezone.utc)
         seen_days = (now - first_seen_at).days
         if seen_days <= 14:
-            new_channel_score += 30
+            new_channel_score += 35
 
     new_channel_score = min(100, new_channel_score)
 
