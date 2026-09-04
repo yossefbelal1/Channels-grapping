@@ -4886,7 +4886,7 @@ class LeadValidator:
                 self.redis_conn, self.db_helper.conn
             )
             # Run schema migrations safely
-            for mig_file in ['migrate_outreach_engine.sql', 'migrate_v6_channel_intelligence.sql', 'migrate_v7_production_hardening.sql', 'migrate_v8_outreach_intelligence.sql']:
+            for mig_file in ['migrate_channel_edges.sql', 'migrate_outreach_engine.sql', 'migrate_v6_channel_intelligence.sql', 'migrate_v7_production_hardening.sql', 'migrate_v8_outreach_intelligence.sql']:
                 try:
                     migration_path = os.path.join(os.path.dirname(__file__), mig_file)
                     if os.path.exists(migration_path):
