@@ -54,31 +54,41 @@ class ActivityClassifier:
     to dynamically schedule incremental and deep channel crawling.
     """
 
+    @classmethod
+    def get_crawl_interval_seconds(cls, act_class: str) -> int:
+        """Returns the crawl interval in seconds for a given activity class."""
+        interval = ActivityClass.CRAWL_INTERVALS.get(act_class, timedelta(days=3))
+        return int(interval.total_seconds())
+
     @staticmethod
     def classify_activity(
         posts_24h: int,
         posts_7d: int,
         posts_30d: int,
-        last_post_at: Optional[datetime] = None
+        last_post_at: Optional[datetime] = None,
+        days_since_last_post: Optional[float] = None,
+        days_since_last_activity: Optional[float] = None
     ) -> Tuple[str, timedelta, datetime]:
         """
-        Backward-compatible legacy classification based on post frequency.
+        Classification based on post frequency and recency.
         """
         now = datetime.now(timezone.utc)
 
-        if last_post_at:
+        days_since = days_since_last_post if days_since_last_post is not None else days_since_last_activity
+        if days_since is None and last_post_at:
             if last_post_at.tzinfo is None:
                 last_post_at = last_post_at.replace(tzinfo=timezone.utc)
-            days_since_last_post = (now - last_post_at).total_seconds() / 86400.0
-            if days_since_last_post > 30:
-                interval = ActivityClass.CRAWL_INTERVALS[ActivityClass.DORMANT]
-                return ActivityClass.DORMANT, interval, now + interval
+            days_since = (now - last_post_at).total_seconds() / 86400.0
+
+        if days_since is not None and days_since > 30 and posts_7d == 0 and posts_24h == 0:
+            interval = ActivityClass.CRAWL_INTERVALS[ActivityClass.DORMANT]
+            return ActivityClass.DORMANT, interval, now + interval
 
         if posts_24h >= 5 or (posts_7d >= 35):
             act_class = ActivityClass.HOT
         elif posts_24h >= 1 or (posts_7d >= 7) or (posts_30d >= 20):
             act_class = ActivityClass.WARM
-        elif posts_7d >= 1 or (posts_30d >= 4):
+        elif posts_7d >= 1 or posts_30d >= 1 or (days_since is not None and days_since <= 30):
             act_class = ActivityClass.COLD
         else:
             act_class = ActivityClass.DORMANT

@@ -126,10 +126,10 @@ class GraphImportanceCalculator:
                 inbound_rows = cur.fetchall()
 
                 in_degree = sum(r[1] for r in inbound_rows)
-                rel_types = set(r[0] for r in inbound_rows)
-                recs_in = sum(r[1] for r in inbound_rows if r[0] == 'RECOMMENDATION')
-                fwds_in = sum(r[1] for r in inbound_rows if r[0] == 'FORWARDED_FROM')
-                mentions_in = sum(r[1] for r in inbound_rows if r[0] == 'MENTION')
+                rel_types = set(str(r[0]).lower() for r in inbound_rows)
+                recs_in = sum(r[1] for r in inbound_rows if str(r[0]).lower() in ('recommendation', 'recommended'))
+                fwds_in = sum(r[1] for r in inbound_rows if str(r[0]).lower() in ('forwarded_from', 'forward', 'forwarded'))
+                mentions_in = sum(r[1] for r in inbound_rows if str(r[0]).lower() in ('mention', 'channel_mention'))
 
                 # Outbound edges
                 cur.execute("""

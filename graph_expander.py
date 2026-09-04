@@ -249,9 +249,8 @@ class GraphExpander:
                     })
 
         # 4. Similar Channel Recommendations (Phase 2)
-        lead_score = row.get('lead_score')
-        # Target high-value validated channels (score >= 50) and public broadcasts
-        if lead_score is not None and lead_score >= 50 and getattr(entity, 'broadcast', False):
+        # Target validated public broadcast channels (any member count 400 to 2M+)
+        if getattr(entity, 'broadcast', False):
             try:
                 logging.info(f"[GRAPH] Fetching similar channel recommendations for @{username}...")
                 recs = await self.tg_manager.get_channel_recommendations(
@@ -322,7 +321,115 @@ class GraphExpander:
 
         return True
 
+    async def process_recommendations_queue(self, max_items: int = 10) -> int:
+        """
+        Consumes channels queued to recommendations:queue, calls Telegram's
+        get_channel_recommendations, records RECOMMENDATION edges in channel_edges,
+        and pushes new candidates to queue:high.
+        """
+        if not self.redis_conn:
+            return 0
+
+        processed = 0
+        for _ in range(max_items):
+            if self.shutdown_event.is_set():
+                break
+
+            raw = self.redis_conn.lpop("recommendations:queue")
+            if not raw:
+                break
+
+            try:
+                data = json.loads(raw) if isinstance(raw, str) else raw
+                target_user = data.get("username")
+                source_ch_id = data.get("channel_id")
+                if not target_user:
+                    continue
+
+                target_clean = str(target_user).lstrip('@').strip()
+                logging.info(f"[GRAPH-REC] Processing recommendation request for @{target_clean}...")
+
+                # Fetch entity
+                async def resolve_peer(cl):
+                    return await cl.get_entity(target_clean)
+
+                entity = await self.tg_manager.execute_request(
+                    self.session_name,
+                    resolve_peer,
+                    shutdown_event=self.shutdown_event
+                )
+                if not entity or not getattr(entity, 'broadcast', False):
+                    continue
+
+                # Fetch similar recommendations
+                recs = await self.tg_manager.get_channel_recommendations(
+                    channel_peer=entity,
+                    session_name=self.session_name,
+                    shutdown_event=self.shutdown_event
+                )
+                if not recs or not hasattr(recs, 'chats'):
+                    continue
+
+                new_queued = 0
+                for chat in recs.chats:
+                    rec_username = getattr(chat, 'username', None)
+                    if not rec_username or rec_username.lower() == target_clean.lower():
+                        continue
+
+                    # Insert stub lead
+                    target_id = self.insert_or_get_target_lead(rec_username, 1, target_clean)
+                    if target_id and source_ch_id:
+                        self.edge_mgr.record_edge(
+                            source_channel_id=str(source_ch_id),
+                            target_channel_id=str(target_id),
+                            relation_type=EdgeRelation.RECOMMENDATION,
+                            confidence=90,
+                            evidence="Telegram official recommendation"
+                        )
+
+                    # Record provenance
+                    channel_link = f"https://t.me/{rec_username}"
+                    is_new = True
+                    if self.provenance_mgr:
+                        try:
+                            is_new, count, sources = self.provenance_mgr.record_candidate_discovery(
+                                username_or_link=channel_link,
+                                source_type="recommendation",
+                                referrer_channel_id=str(source_ch_id)
+                            )
+                        except Exception as prov_err:
+                            logging.debug(f"[GRAPH-REC] Provenance error: {prov_err}")
+
+                    # Deduplicate in seen_channels and enqueue to queue:high
+                    if is_new and not self.redis_conn.sismember("seen_channels", channel_link):
+                        self.redis_conn.sadd("seen_channels", channel_link)
+                        payload = json.dumps({
+                            "link": channel_link,
+                            "source": f"@{target_clean}",
+                            "method": "recommendation",
+                            "relation": EdgeRelation.RECOMMENDATION,
+                            "depth": 1,
+                            "discovery_source": "telegram_recommendations"
+                        })
+                        self.redis_conn.rpush("queue:high", payload)
+                        new_queued += 1
+
+                logging.info(f"[GRAPH-REC] @{target_clean} recommendations complete: {len(recs.chats)} found -> {new_queued} new queued to queue:high")
+                processed += 1
+                await asyncio.sleep(1)
+            except Exception as err:
+                logging.warning(f"[GRAPH-REC] Error processing recommendation item: {err}")
+
+        return processed
+
     async def run_expansion_cycle(self):
+        # 1. First drain and process any freshly validated channels waiting for recommendations
+        try:
+            await self.process_recommendations_queue(max_items=10)
+        except Exception as q_err:
+            logging.warning(f"[GRAPH] Error draining recommendations:queue: {q_err}")
+
+        # 2. Regular batch expansion from database
         rows = self.get_channels_for_expansion(batch_size=self.batch_size)
         if not rows:
             logging.info("[GRAPH] No entities ready for graph expansion. Sleeping...")

@@ -41,6 +41,7 @@ from app.scheduler.activity_classifier import ActivityClassifier, ActivityClass
 from app.scheduler.priority_scheduler import PriorityScheduler
 from app.scheduler.watermark_manager import WatermarkManager
 from app.graph.edge_manager import GraphEdgeManager, EdgeRelation
+from app.graph.forward_analyzer import ForwardAnalyzer
 from app.discovery.provenance import ProvenanceManager
 from app.discovery.taxonomy import classify_text_taxonomy
 from app.discovery.arabic_normalizer import calculate_arabic_letter_ratio, normalize_arabic_text
@@ -659,6 +660,29 @@ class DatabaseHelper:
                     quality_score INT DEFAULT 0
                 );
                 """)
+
+                # Ensure channel_edges exists and sync historical edges from channel_graph
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS channel_edges (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    source_channel_id UUID REFERENCES leads(id) ON DELETE CASCADE,
+                    target_channel_id UUID REFERENCES leads(id) ON DELETE CASCADE,
+                    relation_type VARCHAR(50) NOT NULL,
+                    confidence INT DEFAULT 100,
+                    evidence TEXT,
+                    occurrence_count INT DEFAULT 1,
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    CONSTRAINT uq_channel_edge UNIQUE (source_channel_id, target_channel_id, relation_type)
+                );
+                """)
+                cur.execute("""
+                INSERT INTO channel_edges (source_channel_id, target_channel_id, relation_type, confidence, occurrence_count, first_seen, last_seen)
+                SELECT source_channel_id, target_channel_id, relation_type, 100, 1, created_at, created_at
+                FROM channel_graph
+                ON CONFLICT (source_channel_id, target_channel_id, relation_type) DO NOTHING;
+                """)
             logging.info("Connected to PostgreSQL database successfully.")
         except Exception as e:
             logging.error(f"Failed to connect to PostgreSQL database: {e}")
@@ -1131,16 +1155,52 @@ class DatabaseHelper:
             logging.error(f"Error querying channels for graph expansion: {e}", exc_info=True)
             return []
 
-    def insert_relationship(self, source_id: str, target_id: str, relation_type: str):
+    def insert_relationship(
+        self,
+        source_id: str,
+        target_id: str,
+        relation_type: str,
+        confidence: int = 100,
+        evidence: str = "",
+        metadata: Optional[Dict[str, Any]] = None
+    ):
         self.check_connection()
-        query = """
-        INSERT INTO channel_graph (source_channel_id, target_channel_id, relation_type, created_at)
-        VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
-        ON CONFLICT (source_channel_id, target_channel_id) 
-        DO UPDATE SET relation_type = EXCLUDED.relation_type;
-        """
-        with self.conn.cursor() as cur:
-            cur.execute(query, (source_id, target_id, relation_type))
+        if not source_id or not target_id or str(source_id) == str(target_id):
+            return
+
+        meta_json = json.dumps(metadata or {})
+        try:
+            with self.conn.cursor() as cur:
+                # 1. Primary Graph Intelligence Source of Truth: channel_edges
+                try:
+                    cur.execute("""
+                        INSERT INTO channel_edges (
+                            source_channel_id, target_channel_id, relation_type,
+                            confidence, evidence, occurrence_count, first_seen, last_seen, metadata
+                        ) VALUES (%s, %s, %s, %s, %s, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, %s::jsonb)
+                        ON CONFLICT (source_channel_id, target_channel_id, relation_type)
+                        DO UPDATE SET
+                            occurrence_count = channel_edges.occurrence_count + 1,
+                            last_seen = CURRENT_TIMESTAMP,
+                            evidence = CASE WHEN EXCLUDED.evidence != '' THEN EXCLUDED.evidence ELSE channel_edges.evidence END,
+                            confidence = LEAST(100, channel_edges.confidence + 5),
+                            metadata = channel_edges.metadata || EXCLUDED.metadata;
+                    """, (source_id, target_id, relation_type, confidence, (evidence or '')[:1000], meta_json))
+                except Exception as ce_err:
+                    logging.debug(f"channel_edges insert notice: {ce_err}")
+
+                # 2. Legacy table for backward compatibility
+                try:
+                    cur.execute("""
+                        INSERT INTO channel_graph (source_channel_id, target_channel_id, relation_type, created_at)
+                        VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+                        ON CONFLICT (source_channel_id, target_channel_id) 
+                        DO UPDATE SET relation_type = EXCLUDED.relation_type;
+                    """, (source_id, target_id, relation_type))
+                except Exception as cg_err:
+                    logging.debug(f"channel_graph legacy insert notice: {cg_err}")
+        except Exception as err:
+            logging.warning(f"Error inserting relationship {source_id} -> {target_id}: {err}")
 
     def upsert_discovery_source(self, source_type: str, source_name: str, keyword: str, is_high_quality: bool):
         self.check_connection()
@@ -1209,6 +1269,8 @@ class LeadValidator:
         self.reconciliation_mgr = None
         self.scheduler = None
         self.watermark_mgr = None
+        self.edge_mgr = None
+        self.provenance_mgr = None
 
     def is_all_sessions_rate_limited(self) -> bool:
         """Check if ALL Telegram sessions are currently rate-limited."""
@@ -1861,6 +1923,23 @@ class LeadValidator:
         else:
             return 'Tier_D'
 
+    async def validate_channel(self, identifier: str, link: Optional[str] = None):
+        """Convenience alias for validating a channel by username or link."""
+        target_link = link or (identifier if identifier.startswith("http") else f"https://t.me/{identifier}")
+        return await self.process_link(target_link)
+
+    async def validate_lead(self, link: str, crawl_job_id: Optional[str] = None, max_posts_budget: int = 0, crawl_watermark: int = 0):
+        """Validates a lead link with optional budget and watermark."""
+        if crawl_job_id or max_posts_budget > 0 or crawl_watermark > 0:
+            payload = json.dumps({
+                "link": link,
+                "job_id": crawl_job_id,
+                "max_posts_budget": max_posts_budget,
+                "watermark": crawl_watermark
+            })
+            return await self.process_link(payload)
+        return await self.process_link(link)
+
     async def process_link(self, link: str):
         """
         Resolves, scores, parses contacts, runs keyword frequencies, and updates CRM DB.
@@ -2032,17 +2111,23 @@ class LeadValidator:
                     if not has_forex:
                         failed_rules.append("non_forex")
 
-                    failed_count = len(failed_rules)
-                    if failed_count >= 2:
-                        failed_reason = f"failed_multiple_filters:{','.join(failed_rules)}"
-                        logging.info(f"HTTP filter: Channel @{identifier} rejected (SOFT): failed rules {failed_rules} (failed_count={failed_count} >= 2).")
-                        self.db_helper.add_to_blacklist(actual_link, failed_reason)
+                    # Check absolute non-forex spam / gaming blacklist on HTTP text
+                    absolute_blacklist = [
+                        "دعم قنوات", "تبادل نشر", "زيادة متابعين", "زيادة أعضاء", "زيادة اعضاء",
+                        "تبادل قنوات", "تبادل اشتراكات", "ترويج قنوات", "اضافة اعضاء", "اعضاء مجانا",
+                        "fortnite", "pubg", "robux", "nitro", "giftcard", "gift card", "steam key",
+                        "valorant", "free fire", "شحن العاب", "حسابات نتفليكس", "اشتراكات نتفلكس",
+                        "حسابات مجانية", "iptv", "crunchyroll"
+                    ]
+                    if any(count_word(combined_text, bl) > 0 for bl in absolute_blacklist):
+                        logging.info(f"HTTP filter: Channel @{identifier} rejected: matched absolute non-forex blacklist. Blacklisting...")
+                        self.db_helper.add_to_blacklist(actual_link, 'absolute_blacklist_spam')
                         self.db_helper.upsert_lead(
                             channel_username=identifier,
                             member_count=http_info.get("member_count", 0),
                             description=http_info.get("description", ""),
-                            language='English/Other' if 'non_arabic' in failed_rules else 'Arabic',
-                            arabic_ratio=0 if 'non_arabic' in failed_rules else 100,
+                            language='English/Other',
+                            arabic_ratio=0,
                             website='', email='', whatsapp='', contact_username='',
                             is_group=False, marketplace_score=0, vip=False, premium=False,
                             subscription=False, monthly_plans=False, yearly_plans=False,
@@ -2050,17 +2135,22 @@ class LeadValidator:
                             usdt_payments=False, binance_payments=False, lead_score=0,
                             tier='Tier_D', ai_confidence=100, last_activity=None,
                             discovery_source=discovery_source, discovery_method=discovery_method,
-                            arabic_score=0 if 'non_arabic' in failed_rules else 15, region_score=0, status='rejected',
+                            arabic_score=0, region_score=0, status='rejected',
                             forex_intent_score=0, forex_category='unknown', high_risk_fraud=False
                         )
                         return
+
+                    failed_count = len(failed_rules)
+                    if failed_count >= 2:
+                        # English-branded Arabic Forex channels or empty descriptions are inconclusive.
+                        # Never hard reject or blacklist without inspecting channel content!
+                        logging.info(f"HTTP filter: Channel @{identifier} metadata inconclusive (failed: {failed_rules}). Proceeding to content sampling.")
+                    elif failed_count > 0:
+                        logging.info(f"HTTP filter: Channel @{identifier} passed with soft failures: {failed_rules} (failed_count={failed_count} < 2). Proceeding.")
                     else:
-                        if failed_count > 0:
-                            logging.info(f"HTTP filter: Channel @{identifier} passed with soft failures: {failed_rules} (failed_count={failed_count} < 2). Proceeding.")
-                        else:
-                            logging.info(f"HTTP filter: Channel @{identifier} passed all HTTP pre-filter checks. Proceeding.")
+                        logging.info(f"HTTP filter: Channel @{identifier} passed all HTTP pre-filter checks. Proceeding.")
                     
-                    logging.info(f"HTTP filter: Channel @{identifier} passed HTTP pre-filter checks. Proceeding to Telegram API validation.")
+                    logging.info(f"HTTP filter: Channel @{identifier} completed HTTP pre-filter checks. Proceeding to validation.")
                     
             # ALWAYS attempt HTTP-only validation first for public channels to preserve Telethon session quotas
             if http_info and http_info.get("is_channel"):
@@ -2123,58 +2213,76 @@ class LeadValidator:
             username = getattr(entity, 'username', None) or identifier
 
             # ── Early-Rejection Filtering for Broadcast Channels ──
+            metadata_inconclusive = False
             if is_channel:
-                # Member count is context only, never a hard rejection filter
-                early_failed_rules = []
+                combined_meta_text = f"{title} {description}".lower()
 
-                # Soft check A: Arabic Language Check
+                # 1. Absolute Blacklist: Definitive non-forex spam / gaming / fraud
+                absolute_blacklist = [
+                    "دعم قنوات", "تبادل نشر", "زيادة متابعين", "زيادة أعضاء", "زيادة اعضاء",
+                    "تبادل قنوات", "تبادل اشتراكات", "ترويج قنوات", "اضافة اعضاء", "اعضاء مجانا",
+                    "fortnite", "pubg", "robux", "nitro", "giftcard", "gift card", "steam key",
+                    "valorant", "free fire", "شحن العاب", "حسابات نتفليكس", "اشتراكات نتفلكس",
+                    "حسابات مجانية", "iptv", "crunchyroll"
+                ]
+                if any(count_word(combined_meta_text, bl) > 0 for bl in absolute_blacklist):
+                    logging.info(f"Channel @{username} rejected (Early): matched absolute non-forex blacklist. Blacklisting...")
+                    self.db_helper.add_to_blacklist(actual_link, 'absolute_blacklist_spam')
+                    self.db_helper.upsert_lead(
+                        channel_username=username, member_count=member_count, description=description,
+                        language='English/Other', arabic_ratio=0, website='', email='', whatsapp='',
+                        contact_username='', is_group=False, marketplace_score=0, vip=False, premium=False,
+                        subscription=False, monthly_plans=False, yearly_plans=False, account_management=False,
+                        copy_trading=False, funded_accounts=False, usdt_payments=False, binance_payments=False,
+                        lead_score=0, tier='Tier_D', ai_confidence=100, last_activity=None,
+                        discovery_source=discovery_source, discovery_method=discovery_method,
+                        arabic_score=0, region_score=0, status='rejected', forex_intent_score=0,
+                        forex_category='unknown', high_risk_fraud=False
+                    )
+                    return
+
+                # 2. Soft Metadata Pre-Check (Inconclusive metadata -> sample content, NEVER hard reject)
                 arabic_regex = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]')
                 has_arabic = bool(arabic_regex.search(title) or arabic_regex.search(description))
-                if not has_arabic:
-                    early_failed_rules.append("non_arabic")
 
-                # Soft check B: Core Forex Keywords Check
                 core_forex_kws = [
                     "forex", "signals", "xauusd", "gold", "ذهب", "دهب", "توصيات", 
                     "تداول", "عملات", "تحليل", "فوركس", "smc", "ict", "fvg",
-                    "nasdaq", "ناسداك", "us30", "داو جونز"
+                    "nasdaq", "ناسداك", "us30", "داو جونز", "trading", "trader",
+                    "fx", "pips", "scalp", "scalping", "crypto", "btc", "binance"
                 ]
-                combined_meta_text = f"{title} {description}".lower()
                 has_core_kw = any(kw in combined_meta_text for kw in core_forex_kws)
-                if not has_core_kw:
-                    early_failed_rules.append("no_forex_intent")
 
-                # If both soft rules failed early, we can reject immediately (failed_count = 2)
-                if len(early_failed_rules) == 2:
-                    failed_reason = f"failed_multiple_filters:{','.join(early_failed_rules)}"
-                    logging.info(f"Channel @{username} rejected (SOFT - Early): failed rules {early_failed_rules} (failed_count=2).")
-                    self.db_helper.add_to_blacklist(actual_link, failed_reason)
-                    self.db_helper.upsert_lead(
-                        channel_username=username,
-                        member_count=member_count,
-                        description=description,
-                        language='English/Other',
-                        arabic_ratio=0,
-                        website='', email='', whatsapp='', contact_username='',
-                        is_group=False, marketplace_score=0, vip=False, premium=False,
-                        subscription=False, monthly_plans=False, yearly_plans=False,
-                        account_management=False, copy_trading=False, funded_accounts=False,
-                        usdt_payments=False, binance_payments=False, lead_score=0,
-                        tier='Tier_D', ai_confidence=100, last_activity=None,
-                        discovery_source=discovery_source, discovery_method=discovery_method,
-                        arabic_score=0, region_score=0, status='rejected',
-                        forex_intent_score=0, forex_category='unknown', high_risk_fraud=False
-                    )
-                    return
+                # English names, empty About, or trading brand names are inconclusive:
+                # Proceed to inspect sample content to give fair discovery recall.
+                if not has_arabic or not has_core_kw:
+                    metadata_inconclusive = True
+                    logging.info(f"Channel @{username} metadata inconclusive (arabic={has_arabic}, kw={has_core_kw}). Sampling content before final verdict.")
                 else:
-                    if early_failed_rules:
-                        logging.info(f"Channel @{username} passed early Telethon soft check with rules failed: {early_failed_rules}. Proceeding to fetch messages.")
-                    else:
-                        logging.info(f"Channel @{username} passed all early Telethon soft checks. Proceeding to fetch messages.")
+                    logging.info(f"Channel @{username} passed early metadata checks. Proceeding to fetch messages.")
 
-            # Fetch messages: use max_posts_budget and crawl_watermark (min_id)
-            msg_limit = max_posts_budget if max_posts_budget > 0 else 100
+            # Fetch messages: use lean sample budget (30) if metadata inconclusive to save API budget, else normal budget
+            if metadata_inconclusive and max_posts_budget <= 0:
+                msg_limit = 30
+            else:
+                msg_limit = max_posts_budget if max_posts_budget > 0 else 100
             messages = await self.fetch_messages_safe(entity, limit=msg_limit, min_id=crawl_watermark)
+
+            # If empty channel (0 posts) and metadata inconclusive, reject without blacklisting
+            if (not messages or len(messages) == 0) and crawl_watermark == 0 and metadata_inconclusive:
+                logging.info(f"Channel @{username} has 0 messages and inconclusive metadata. Marking rejected without blacklist.")
+                self.db_helper.upsert_lead(
+                    channel_username=username, member_count=member_count, description=description,
+                    language='English/Other', arabic_ratio=0, website='', email='', whatsapp='',
+                    contact_username='', is_group=False, marketplace_score=0, vip=False, premium=False,
+                    subscription=False, monthly_plans=False, yearly_plans=False, account_management=False,
+                    copy_trading=False, funded_accounts=False, usdt_payments=False, binance_payments=False,
+                    lead_score=0, tier='Tier_D', ai_confidence=100, last_activity=None,
+                    discovery_source=discovery_source, discovery_method=discovery_method,
+                    arabic_score=0, region_score=0, status='rejected', forex_intent_score=0,
+                    forex_category='unknown', high_risk_fraud=False
+                )
+                return
 
             # If incremental crawl with watermark and no new messages, channel is up to date
             if crawl_watermark > 0 and (not messages or len(messages) == 0):
@@ -2534,24 +2642,91 @@ class LeadValidator:
             # Detects ad-exchange posts, high-value copywriting patterns, and
             # immediately routes discovered target channels to queue:critical.
             if source_id:
+                if not hasattr(self, 'edge_mgr') or self.edge_mgr is None:
+                    db_c = getattr(self.db_helper, 'conn', None) if self.db_helper else None
+                    self.edge_mgr = GraphEdgeManager(db_conn=db_c, redis_conn=self.redis_conn)
+                if not hasattr(self, 'provenance_mgr') or self.provenance_mgr is None:
+                    db_c = getattr(self.db_helper, 'conn', None) if self.db_helper else None
+                    self.provenance_mgr = ProvenanceManager(redis_conn=self.redis_conn, db_conn=db_c)
+
                 source_is_tier_a = self.db_helper.is_verified_tier_a(username)
                 high_value_kws = ["vip", "premium", "اشتراك", "ادارة", "نسخ", "funded"]
 
                 for msg in messages:
-                    if not msg.text:
+                    # ── 1. Forward Origin Extraction (All Messages, Including Media Without Text) ──
+                    fwd = ForwardAnalyzer.extract_forward_origin(msg)
+                    if fwd and source_id:
+                        fwd_user = fwd.get("from_username")
+                        if not fwd_user and fwd.get("from_name"):
+                            fwd_name = str(fwd["from_name"]).strip()
+                            if fwd_name and not (fwd_name.lower().endswith("bot") or fwd_name.lower().endswith("_bot")):
+                                clean_fwd = normalize_telegram_link(fwd_name)
+                                link_type, parsed_user = parse_telegram_link(clean_fwd)
+                                fwd_user = parsed_user
+
+                        fwd_ident = fwd_user or fwd.get("channel_id")
+                        if fwd_ident and str(fwd_ident).lower() != username.lower():
+                            evidence_dict = fwd.get("evidence", {})
+                            evidence_str = json.dumps(evidence_dict) if isinstance(evidence_dict, dict) else f"Forwarded message ID {getattr(msg, 'id', '')}"
+
+                            # Insert stub lead and record edge in channel_edges + channel_graph
+                            target_id = self.db_helper.insert_stub_lead(str(fwd_ident))
+                            if target_id:
+                                self.db_helper.insert_relationship(
+                                    source_id=source_id,
+                                    target_id=target_id,
+                                    relation_type=EdgeRelation.FORWARDED_FROM,
+                                    confidence=95,
+                                    evidence=evidence_str,
+                                    metadata=evidence_dict if isinstance(evidence_dict, dict) else {}
+                                )
+                                logging.info(f"Graph forward edge added: @{username} -> {fwd_ident} ({EdgeRelation.FORWARDED_FROM})")
+
+                            # If forward has public username, route to candidate queue
+                            if fwd_user:
+                                fwd_link = f"https://t.me/{fwd_user}"
+                                is_new = True
+                                if self.provenance_mgr:
+                                    try:
+                                        is_new, prov_cnt, prov_srcs = self.provenance_mgr.record_candidate_discovery(
+                                            username_or_link=fwd_link,
+                                            source_type="forward",
+                                            referrer_channel_id=source_id,
+                                            metadata=evidence_dict if isinstance(evidence_dict, dict) else {}
+                                        )
+                                    except Exception as prov_err:
+                                        logging.debug(f"Forward provenance notice: {prov_err}")
+
+                                if not self.redis_conn.sismember("seen_channels", fwd_link):
+                                    self.redis_conn.sadd("seen_channels", fwd_link)
+                                    fwd_queue = "queue:critical" if source_is_tier_a else "queue:high"
+                                    fwd_payload = json.dumps({
+                                        "link": fwd_link,
+                                        "source": f"@{username}",
+                                        "method": "forward_origin",
+                                        "keyword": "",
+                                        "priority_weight": 25 if source_is_tier_a else 20,
+                                        "discovery_source": "forward_origin",
+                                        "origin_evidence": evidence_dict if isinstance(evidence_dict, dict) else {}
+                                    })
+                                    self.redis_conn.rpush(fwd_queue, fwd_payload)
+                                    logging.info(f"[FORWARD DISCOVERY] Enqueued forward origin {fwd_link} from @{username} into {fwd_queue}")
+
+                    raw_text = getattr(msg, 'text', '') or getattr(msg, 'message', '') or ''
+                    if not raw_text:
                         continue
 
-                    msg_text_lower = msg.text.lower()
+                    msg_text_lower = raw_text.lower()
 
                     # ── Classify message signal level ─────────────────────────
                     is_high_priority       = any(kw in msg_text_lower for kw in high_value_kws)
-                    is_ad_exchange         = any(kw in msg.text for kw in ad_exchange_kws)
-                    is_ad_copywriting      = any(kw in msg.text for kw in forex_ad_patterns)
+                    is_ad_exchange         = any(kw in raw_text for kw in ad_exchange_kws)
+                    is_ad_copywriting      = any(kw in raw_text for kw in forex_ad_patterns)
                     lists_ad_exchange_phrases = ["لمدة محدودة", "العرض ساري", "باقي أيام وينتهي", "الاشتراك السنوي", "انضموا قبل الحذف", "القناة الخاصة", "الجروب الخاص", "جروب الـ VIP", "دخول مجاني", "أقوى قناة توصيات", "تعويض الخسارة"]
-                    is_lists_ad_exchange   = any(kw in msg.text for kw in lists_ad_exchange_phrases)
+                    is_lists_ad_exchange   = any(kw in raw_text for kw in lists_ad_exchange_phrases)
 
-                    links_found   = TELEGRAM_LINK_REGEX.findall(msg.text)
-                    mentions_found = USERNAME_REGEX.findall(msg.text)
+                    links_found   = TELEGRAM_LINK_REGEX.findall(raw_text)
+                    mentions_found = USERNAME_REGEX.findall(raw_text)
                     discovered_in_msg = {}
 
                     for link_found in links_found:
@@ -2575,6 +2750,17 @@ class LeadValidator:
                         is_seen = self.redis_conn.sismember("seen_channels", normalized)
                         if not is_seen:
                             self.redis_conn.sadd("seen_channels", normalized)
+
+                            # Record provenance for links and mentions
+                            if hasattr(self, 'provenance_mgr') and self.provenance_mgr:
+                                try:
+                                    self.provenance_mgr.record_candidate_discovery(
+                                        username_or_link=normalized,
+                                        source_type="ad_exchange" if rel_type == 'advertisement' else "mention",
+                                        referrer_channel_id=source_id
+                                    )
+                                except Exception:
+                                    pass
 
                             # ── Routing decision (priority order) ────────────────
                             if is_lists_ad_exchange and (links_found or mentions_found):
@@ -2655,7 +2841,13 @@ class LeadValidator:
 
                         target_id = self.db_helper.insert_stub_lead(target_username)
                         if target_id:
-                            self.db_helper.insert_relationship(source_id, target_id, rel_type)
+                            self.db_helper.insert_relationship(
+                                source_id=source_id,
+                                target_id=target_id,
+                                relation_type=rel_type,
+                                confidence=85 if rel_type == 'advertisement' else 75,
+                                evidence=normalized
+                            )
                             logging.info(f"Graph edge added recursively: @{username} -> @{target_username} ({rel_type})")
             
             # Local Rules Regex checks
@@ -2979,14 +3171,18 @@ class LeadValidator:
                         confidence=sc.get('confidence', 100)
                     )
 
-                # 3. Queue high-value channels for similar channel recommendations discovery
-                if status_val == 'new' and scoring_dims.tier in ('Tier_A', 'Tier_B'):
+                # 3. Queue validated channels for similar channel recommendations discovery
+                # Fully inclusive for channels from ~400 members to 2M+ members
+                if status_val == 'new' and is_channel and is_forex and scoring_dims.tier in ('Tier_A', 'Tier_B', 'Tier_C'):
                     try:
                         self.redis_conn.rpush("recommendations:queue", json.dumps({
                             "username": username,
-                            "channel_id": channel_db_id,
-                            "tier": scoring_dims.tier
+                            "channel_id": str(channel_db_id),
+                            "tier": scoring_dims.tier,
+                            "member_count": member_count,
+                            "lead_score": scoring_dims.final_score
                         }))
+                        logging.info(f"[RECOMMENDATIONS] Queued @{username} (tier={scoring_dims.tier}, members={member_count}) to recommendations:queue")
                     except Exception as err:
                         logging.warning(f"Failed to queue recommendation candidate: {err}")
 
@@ -4527,11 +4723,13 @@ class LeadValidator:
                     except Exception:
                         pass
 
-            # Initialize v7 PriorityScheduler & WatermarkManager
+            # Initialize v7 PriorityScheduler, WatermarkManager, EdgeManager & ProvenanceManager
             self.scheduler = PriorityScheduler(self.redis_conn, self.db_helper.conn)
             self.watermark_mgr = WatermarkManager(self.redis_conn, self.db_helper.conn)
+            self.edge_mgr = GraphEdgeManager(self.db_helper.conn, self.redis_conn)
+            self.provenance_mgr = ProvenanceManager(self.redis_conn, self.db_helper.conn)
 
-            logging.info("Outreach & Scheduler engine modules initialized.")
+            logging.info("Outreach, Scheduler & Graph engine modules initialized.")
         except Exception as oe_err:
             logging.error(f"Engine initialization error (non-fatal): {oe_err}")
 

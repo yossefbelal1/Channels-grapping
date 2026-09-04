@@ -101,7 +101,32 @@ class ForwardAnalyzer:
                 origin["channel_id"] = str(saved_peer)
                 origin["peer_id"] = str(saved_peer)
 
-        # 6. Structured Explainable Edge Evidence (PART L)
+        # 6. Extract from_username (Telethon forward object, fwd attributes, or from_name)
+        fwd_obj = getattr(message, 'forward', None)
+        if fwd_obj:
+            chat_obj = getattr(fwd_obj, 'chat', None)
+            if chat_obj and getattr(chat_obj, 'username', None):
+                origin["from_username"] = chat_obj.username
+            sender_obj = getattr(fwd_obj, 'sender', None)
+            if not origin["from_username"] and sender_obj and getattr(sender_obj, 'username', None):
+                origin["from_username"] = sender_obj.username
+
+        if not origin["from_username"]:
+            direct_user = getattr(fwd, 'from_username', None) if not isinstance(fwd, dict) else fwd.get('from_username')
+            if direct_user:
+                origin["from_username"] = str(direct_user).lstrip('@')
+
+        if not origin["from_username"] and origin.get("from_name"):
+            import re
+            name = str(origin["from_name"]).strip()
+            if name.startswith("@") and len(name) > 1:
+                origin["from_username"] = name[1:]
+            elif "t.me/" in name:
+                m = re.search(r't\.me/([a-zA-Z0-9_]{5,32})', name)
+                if m:
+                    origin["from_username"] = m.group(1)
+
+        # 7. Structured Explainable Edge Evidence (PART L)
         observed_time = origin["date"]
         if observed_time is None:
             observed_time = datetime.now(timezone.utc).isoformat()
@@ -114,6 +139,7 @@ class ForwardAnalyzer:
             "original_channel_id": origin["channel_id"],
             "original_message_id": origin["channel_post_id"],
             "origin_name": origin["from_name"],
+            "origin_username": origin["from_username"],
             "observed_at": observed_time
         }
 
