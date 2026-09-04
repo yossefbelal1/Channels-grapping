@@ -69,14 +69,16 @@ class WatermarkManager:
     def update_watermark(
         self,
         channel_id: str,
-        new_message_id: int,
-        channel_username: Optional[str] = None
-    ) -> bool:
+        new_message_id: Optional[int] = None,
+        channel_username: Optional[str] = None,
+        new_watermark: Optional[int] = None
+    ) -> int:
         """
         Updates the watermark for a channel, ensuring monotonicity (never regresses).
         """
-        if new_message_id <= 0:
-            return False
+        target_id = new_watermark if new_watermark is not None else (new_message_id or 0)
+        if target_id <= 0:
+            return 0
 
         # 1. Update PostgreSQL with GREATEST constraint
         if self.db:
@@ -90,7 +92,7 @@ class WatermarkManager:
                                 last_successful_crawl_at = NOW(),
                                 consecutive_crawl_failures = 0
                             WHERE id::text = %s OR channel_username = %s;
-                        """, (new_message_id, str(channel_id), channel_username))
+                        """, (target_id, str(channel_id), channel_username))
                     else:
                         cur.execute("""
                             UPDATE leads
@@ -99,7 +101,7 @@ class WatermarkManager:
                                 last_successful_crawl_at = NOW(),
                                 consecutive_crawl_failures = 0
                             WHERE id::text = %s;
-                        """, (new_message_id, str(channel_id)))
+                        """, (target_id, str(channel_id)))
                 self.db.commit()
             except Exception as err:
                 logger.warning(f"Failed to update watermark in DB for channel {channel_id}: {err}")
@@ -112,10 +114,10 @@ class WatermarkManager:
         if self.redis:
             try:
                 key = self._redis_key(channel_id)
-                pipe = self.redis.pipeline()
-                pipe.setex(key, 86400, new_message_id)
-                pipe.execute()
+                self.redis.setex(key, 86400, target_id)
+                if channel_username and channel_username != str(channel_id):
+                    self.redis.setex(self._redis_key(channel_username), 86400, target_id)
             except Exception as err:
                 logger.debug(f"Failed to update Redis watermark cache: {err}")
 
-        return True
+        return target_id

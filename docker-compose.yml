@@ -115,6 +115,19 @@ services:
     env_file:
       - .env
 
+  worker_scheduler:
+    build: .
+    container_name: worker_scheduler
+    restart: unless-stopped
+    command: python scheduler_worker.py
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+
   dashboard:
     build: .
     container_name: leadhunter_dashboard

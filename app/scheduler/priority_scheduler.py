@@ -106,8 +106,8 @@ class PriorityScheduler:
         # 1. Calculate next crawl schedule & depth budget
         schedule_info = ActivityClassifier.calculate_next_crawl(
             final_score=int(data.get("lead_score") or 0),
-            forex_score=int(data.get("forex_score") or 0),
-            arabic_score=int(data.get("arabic_ratio") or 0),
+            forex_score=int(data.get("forex_score") or data.get("forex_intent_score") or 0),
+            arabic_score=int(data.get("arabic_score") or data.get("arabic_ratio") or 0),
             activity_score=int(data.get("activity_score") or 0),
             freshness_score=int(data.get("freshness_score") or 0),
             growth_score=int(data.get("growth_score") or 0),

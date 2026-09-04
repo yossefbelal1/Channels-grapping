@@ -38,6 +38,8 @@ from app.outreach.backpressure import BackpressureManager
 from app.scoring.dimensions import ScoringDimensions, calculate_all_dimensions
 from app.scoring.engine import LeadScoringEngine
 from app.scheduler.activity_classifier import ActivityClassifier, ActivityClass
+from app.scheduler.priority_scheduler import PriorityScheduler
+from app.scheduler.watermark_manager import WatermarkManager
 from app.graph.edge_manager import GraphEdgeManager, EdgeRelation
 from app.discovery.provenance import ProvenanceManager
 from app.discovery.taxonomy import classify_text_taxonomy
@@ -1205,11 +1207,13 @@ class LeadValidator:
         self.circuit_breaker = None
         self.backpressure_mgr = None
         self.reconciliation_mgr = None
+        self.scheduler = None
+        self.watermark_mgr = None
 
     def is_all_sessions_rate_limited(self) -> bool:
         """Check if ALL Telegram sessions are currently rate-limited."""
         import time
-        if not self.redis_conn or not self.tg_manager or not hasattr(self.tg_manager, 'accounts'):
+        if not self.redis_conn or not self.tg_manager or not isinstance(getattr(self.tg_manager, 'accounts', None), list) or not self.tg_manager.accounts:
             return False
         for acc in self.tg_manager.accounts:
             name = acc.get("session_name")
@@ -1731,12 +1735,15 @@ class LeadValidator:
             logging.warning(f"Failed to join or resolve private entity '{hash_code}': {err}")
             return None
 
-    async def fetch_messages_safe(self, entity, limit=50):
+    async def fetch_messages_safe(self, entity, limit=50, min_id=0):
         """
-        Fetches the last 50 messages of a channel through Centralized Request Manager.
+        Fetches messages of a channel through Centralized Request Manager.
+        Supports incremental scanning using min_id watermark.
         """
         async def fetch(cl):
-            logging.info(f"Fetching last {limit} messages for channel: {entity.id}")
+            logging.info(f"Fetching up to {limit} messages for channel: {entity.id} (min_id={min_id})")
+            if min_id and min_id > 0:
+                return await cl.get_messages(entity, limit=limit, min_id=min_id)
             return await cl.get_messages(entity, limit=limit)
         return await self.tg_manager.execute_request(self.session_name, fetch, shutdown_event=self.shutdown_event)
 
@@ -1760,6 +1767,10 @@ class LeadValidator:
         Weighted Smart Lead Scoring Engine V4 (Business Signal Boost & High Arabic Forex Priority).
         """
         score = 0
+        try:
+            in_degree = int(in_degree or 0)
+        except Exception:
+            in_degree = 0
         
         # 1. Keyword Frequency Score (up to 15 points)
         freq_sum = sum(kw_freqs.values())
@@ -1860,6 +1871,10 @@ class LeadValidator:
         discovery_method = "unknown"
         keyword = ""
         http_info = None
+        crawl_job_id = None
+        crawl_watermark = 0
+        scan_depth_tier = "standard"
+        max_posts_budget = 100
         try:
             # Unpack JSON payload if applicable
             if isinstance(link, str) and link.startswith("{") and link.endswith("}"):
@@ -1869,6 +1884,10 @@ class LeadValidator:
                     discovery_source = data.get("source", "unknown")
                     discovery_method = data.get("method", "unknown")
                     keyword = data.get("keyword", "")
+                    crawl_job_id = data.get("job_id")
+                    crawl_watermark = int(data.get("watermark") or 0)
+                    scan_depth_tier = data.get("scan_depth_tier", "standard")
+                    max_posts_budget = int(data.get("max_posts_budget") or 100)
                 except Exception:
                     pass
             
@@ -1878,6 +1897,10 @@ class LeadValidator:
                 logging.info(f"Link {actual_link} failed parsing (invalid format or junk/email domain/bot). Skipping.")
                 self.db_helper.add_to_blacklist(actual_link, 'invalid_link_format')
                 return
+
+            # Lookup existing watermark if not passed in payload
+            if crawl_watermark == 0 and hasattr(self, 'watermark_mgr') and self.watermark_mgr:
+                crawl_watermark = self.watermark_mgr.get_watermark(identifier, identifier)
 
             username = identifier
             is_gp = (link_type == 'private')
@@ -1927,7 +1950,7 @@ class LeadValidator:
                     return
                     
             if link_type == 'public' and identifier:
-                if self.check_rescan_cooldown(identifier):
+                if not crawl_job_id and discovery_source != "priority_scheduler" and self.check_rescan_cooldown(identifier):
                     # Cooldown hit, skip network API requests to protect account
                     return
                 
@@ -1976,12 +1999,14 @@ class LeadValidator:
 
                     # Soft check B: Arabic Language Check
                     arabic_regex = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]')
-                    has_arabic = bool(arabic_regex.search(http_info["title"]) or arabic_regex.search(http_info["description"]))
+                    h_title = http_info.get("title", "") or ""
+                    h_desc = http_info.get("description", "") or ""
+                    has_arabic = bool(arabic_regex.search(h_title) or arabic_regex.search(h_desc))
                     if not has_arabic:
                         failed_rules.append("non_arabic")
 
                     # Soft check C: Forex Intent Check
-                    combined_text = (http_info["title"] + " " + http_info["description"]).lower()
+                    combined_text = (h_title + " " + h_desc).lower()
                     forex_keywords = [
                         'forex', 'signals', 'xauusd', 'gold', 'ذهب', 'توصيات', 'تداول', 'عملات', 'فوركس',
                         'smc', 'ict', 'منزل التحليل', 'الصفقة', 'الربح', 'الخسارة', 'تحدي', 'تمويل'
@@ -1997,8 +2022,8 @@ class LeadValidator:
                         self.db_helper.add_to_blacklist(actual_link, failed_reason)
                         self.db_helper.upsert_lead(
                             channel_username=identifier,
-                            member_count=http_info["member_count"],
-                            description=http_info["description"],
+                            member_count=http_info.get("member_count", 0),
+                            description=http_info.get("description", ""),
                             language='English/Other' if 'non_arabic' in failed_rules else 'Arabic',
                             arabic_ratio=0 if 'non_arabic' in failed_rules else 100,
                             website='', email='', whatsapp='', contact_username='',
@@ -2130,9 +2155,42 @@ class LeadValidator:
                     else:
                         logging.info(f"Channel @{username} passed all early Telethon soft checks. Proceeding to fetch messages.")
 
-            # Fetch messages: 100 messages for both channels & groups to scrape maximum contact information
-            msg_limit = 100
-            messages = await self.fetch_messages_safe(entity, limit=msg_limit)
+            # Fetch messages: use max_posts_budget and crawl_watermark (min_id)
+            msg_limit = max_posts_budget if max_posts_budget > 0 else 100
+            messages = await self.fetch_messages_safe(entity, limit=msg_limit, min_id=crawl_watermark)
+
+            # If incremental crawl with watermark and no new messages, channel is up to date
+            if crawl_watermark > 0 and (not messages or len(messages) == 0):
+                logging.info(f"Incremental crawl for @{username}: 0 new messages since watermark {crawl_watermark}. Channel is up to date.")
+                if crawl_job_id and hasattr(self, 'scheduler') and self.scheduler:
+                    self.scheduler.record_crawl_result(
+                        job_id=crawl_job_id,
+                        channel_id=str(identifier),
+                        success=True,
+                        new_watermark=crawl_watermark,
+                        posts_scanned=0
+                    )
+                self.db_helper.check_connection()
+                try:
+                    with self.db_helper.conn.cursor() as cur:
+                        cur.execute("""
+                            UPDATE leads
+                            SET last_crawl_at = NOW(),
+                                consecutive_crawl_failures = 0
+                            WHERE channel_username = %s
+                        """, (identifier,))
+                    self.db_helper.conn.commit()
+                except Exception:
+                    pass
+                return
+
+            # Compute highest message ID
+            highest_msg_id = crawl_watermark
+            if messages:
+                for m in messages:
+                    m_id = getattr(m, 'id', 0)
+                    if isinstance(m_id, int) and m_id > highest_msg_id:
+                        highest_msg_id = m_id
             
             # Fetch pinned message if any exists
             pinned_text = ""
@@ -2888,7 +2946,26 @@ class LeadValidator:
                     except Exception as err:
                         logging.warning(f"Failed to queue recommendation candidate: {err}")
 
-            
+            # ── Advance watermark & record crawl result with PriorityScheduler ──
+            new_wm = max(crawl_watermark, highest_msg_id)
+            if new_wm > 0 and hasattr(self, 'watermark_mgr') and self.watermark_mgr:
+                try:
+                    self.watermark_mgr.update_watermark(str(channel_db_id or identifier), new_wm, username)
+                except Exception as wm_err:
+                    logging.debug(f"Watermark update notice: {wm_err}")
+
+            if crawl_job_id and hasattr(self, 'scheduler') and self.scheduler:
+                try:
+                    self.scheduler.record_crawl_result(
+                        job_id=crawl_job_id,
+                        channel_id=str(channel_db_id or identifier),
+                        success=True,
+                        new_watermark=new_wm,
+                        posts_scanned=len(messages) if messages else 0
+                    )
+                except Exception as sc_err:
+                    logging.debug(f"Scheduler record crawl result notice: {sc_err}")
+
             # ── Auto Outreach Enqueue for Newly Discovered Qualified Lead ──────────
             contact_user_str = contacts.get('contact_username')
             if status_val == 'new' and contact_user_str:
@@ -2959,6 +3036,16 @@ class LeadValidator:
                     
         except Exception as e:
             logging.error(f"Error processing link {link}: {e}", exc_info=True)
+            if crawl_job_id and hasattr(self, 'scheduler') and self.scheduler:
+                try:
+                    self.scheduler.record_crawl_result(
+                        job_id=crawl_job_id,
+                        channel_id=str(identifier) if identifier else "unknown",
+                        success=False,
+                        error_message=str(e)[:250]
+                    )
+                except Exception:
+                    pass
             try:
                 # Extract username to mark as rejected in DB to prevent clogging
                 link_type, identifier = parse_telegram_link(actual_link)
@@ -2994,87 +3081,41 @@ class LeadValidator:
 
     async def rescan_scheduler_loop(self):
         """
-        Runs periodically every 1 hour, finds leads past their cooldown, and queues them with appropriate priority.
-        (Phase 5: marketplace groups receive higher scan frequency and direct validation queues).
+        Runs periodically, checks channels due for crawl using PriorityScheduler,
+        and enqueues crawl jobs with dynamic prioritization and watermarks.
         """
-        logging.info("Rescan Scheduler loop initialized.")
+        logging.info("Rescan Scheduler loop initialized (v7 PriorityScheduler driven).")
         while not self.shutdown_event.is_set():
             try:
 
 
-                # Query leads past their scan cooldown
-                self.db_helper.check_connection()
-                query = """
-                SELECT channel_username, is_group, marketplace_score, lead_score,
-                       CASE 
-                           WHEN is_group = TRUE THEN COALESCE(marketplace_score, 0)
-                           ELSE COALESCE(lead_score, 0)
-                       END as score
-                FROM leads
-                WHERE status != 'rejected' AND (last_scan IS NULL OR 
-                       (CASE 
-                           WHEN is_group = TRUE THEN
-                               CASE 
-                                   WHEN COALESCE(marketplace_score, 0) > 50 THEN last_scan < NOW() - INTERVAL '6 hours'
-                                   WHEN COALESCE(marketplace_score, 0) > 20 THEN last_scan < NOW() - INTERVAL '12 hours'
-                                   ELSE last_scan < NOW() - INTERVAL '24 hours'
-                               END
-                           ELSE
-                               CASE
-                                    WHEN lead_score IS NULL THEN last_scan < NOW() - INTERVAL '1 hour'
-                                    WHEN lead_score > 80 THEN last_scan < NOW() - INTERVAL '1 day'
-                                   WHEN COALESCE(lead_score, 0) > 60 THEN last_scan < NOW() - INTERVAL '3 days'
-                                   WHEN COALESCE(lead_score, 0) > 40 THEN last_scan < NOW() - INTERVAL '7 days'
-                                   ELSE last_scan < NOW() - INTERVAL '30 days'
-                               END
-                        END))
-                LIMIT 50;
-                """
-                with self.db_helper.conn.cursor() as cur:
-                    cur.execute(query)
-                    leads_to_scan = cur.fetchall()
-                
-                if leads_to_scan:
-                    logging.info(f"Rescan Scheduler found {len(leads_to_scan)} leads past cooldown. Queueing...")
-                    for lead in leads_to_scan:
-                        username = lead['channel_username']
-                        is_gp = lead['is_group']
-                        score = lead['score']
-                        
-                        # Target link
-                        target_link = f"https://t.me/{username}"
-                        
-                        # Decide priority queue
-                        queue_name = "queue:normal"
-                        if score > 80:
-                            queue_name = "queue:critical"
-                        elif score > 60:
-                            queue_name = "queue:high"
-                        elif score > 40:
-                            queue_name = "queue:normal"
-                        else:
-                            queue_name = "queue:low"
-                            
-                        # Queue
-                        if is_gp:
-                            # Direct queue to validation (critical or high) to bypass 12-hour joiner delay
-                            queue_target = "queue:critical" if score > 50 else "queue:high"
-                            payload = json.dumps({
-                                "link": target_link,
-                                "source": "rescan_scheduler",
-                                "method": "marketplace_group",
-                                "keyword": ""
-                            })
-                            self.redis_conn.rpush(queue_target, payload)
-                            logging.info(f"Rescan scheduler directly queued group {target_link} to {queue_target}")
-                        else:
-                            payload = json.dumps({
-                                "link": target_link,
-                                "source": "rescan_scheduler",
-                                "method": "channel_mention",
-                                "keyword": ""
-                            })
-                            self.redis_conn.rpush(queue_name, payload)
+                # Check backpressure if manager initialized
+                if hasattr(self, 'backpressure_mgr') and self.backpressure_mgr:
+                    if self.backpressure_mgr.should_pause_discovery():
+                        logging.warning("System backpressure CRITICAL. Pausing rescan scheduler cycle.")
+                        await asyncio.sleep(60)
+                        continue
+
+                # Query and schedule due channels via PriorityScheduler
+                if hasattr(self, 'scheduler') and self.scheduler:
+                    self.db_helper.check_connection()
+                    due_channels = self.scheduler.get_channels_due_for_crawl(batch_size=30)
+                    if due_channels:
+                        logging.info(f"PriorityScheduler found {len(due_channels)} channels due for crawl. Dispatching...")
+                        for ch in due_channels:
+                            channel_id = str(ch.get("id"))
+                            username = ch.get("channel_username")
+                            if not username:
+                                continue
+                            wm = int(ch.get("last_scanned_message_id") or 0)
+                            job_id = self.scheduler.schedule_channel_crawl(
+                                channel_id=channel_id,
+                                channel_username=username,
+                                channel_data=ch,
+                                job_type="incremental" if wm > 0 else "deep_scan"
+                            )
+                            if job_id:
+                                logging.debug(f"Scheduled crawl job {job_id} for @{username} (watermark={wm})")
                 
             except Exception as e:
                 logging.error(f"Error in rescan scheduler loop: {e}", exc_info=True)
@@ -4416,24 +4457,30 @@ class LeadValidator:
             self.reconciliation_mgr = ReconciliationManager(
                 self.redis_conn, self.db_helper.conn
             )
-            # Run outreach schema migration
-            try:
-                migration_path = os.path.join(os.path.dirname(__file__), 'migrate_outreach_engine.sql')
-                if os.path.exists(migration_path):
-                    with open(migration_path, 'r') as f:
-                        migration_sql = f.read()
-                    self.db_helper.conn.cursor().execute(migration_sql)
-                    self.db_helper.conn.commit()
-                    logging.info("Outreach engine schema migration applied successfully.")
-            except Exception as mig_err:
-                logging.warning(f"Outreach migration warning (may already be applied): {mig_err}")
+            # Run schema migrations safely
+            for mig_file in ['migrate_outreach_engine.sql', 'migrate_v6_channel_intelligence.sql', 'migrate_v7_production_hardening.sql']:
                 try:
-                    self.db_helper.conn.rollback()
-                except Exception:
-                    pass
-            logging.info("Outreach engine modules initialized.")
+                    migration_path = os.path.join(os.path.dirname(__file__), mig_file)
+                    if os.path.exists(migration_path):
+                        with open(migration_path, 'r', encoding='utf-8') as f:
+                            migration_sql = f.read()
+                        self.db_helper.conn.cursor().execute(migration_sql)
+                        self.db_helper.conn.commit()
+                        logging.info(f"Schema migration {mig_file} applied/verified successfully.")
+                except Exception as mig_err:
+                    logging.warning(f"Migration check for {mig_file} (may already be applied): {mig_err}")
+                    try:
+                        self.db_helper.conn.rollback()
+                    except Exception:
+                        pass
+
+            # Initialize v7 PriorityScheduler & WatermarkManager
+            self.scheduler = PriorityScheduler(self.redis_conn, self.db_helper.conn)
+            self.watermark_mgr = WatermarkManager(self.redis_conn, self.db_helper.conn)
+
+            logging.info("Outreach & Scheduler engine modules initialized.")
         except Exception as oe_err:
-            logging.error(f"Outreach engine initialization error (non-fatal): {oe_err}")
+            logging.error(f"Engine initialization error (non-fatal): {oe_err}")
 
         # Start the periodic rescan scheduler
         asyncio.create_task(self.rescan_scheduler_loop())
