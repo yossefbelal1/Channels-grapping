@@ -3317,9 +3317,16 @@ class LeadValidator:
                             lead_db_row = cur_enqueue.fetchone()
                             if lead_db_row:
                                 cur_enqueue.execute("""
-                                    INSERT INTO campaign_logs (id, campaign_id, lead_id, status, sent_at)
-                                    SELECT gen_random_uuid(), %s, %s, 'pending', NULL
-                                    WHERE NOT EXISTS (
+                                    INSERT INTO campaign_logs (id, campaign_id, lead_id, status, sent_at,
+                                                               priority, priority_score, priority_reason, commercial_fit_score)
+                                    SELECT gen_random_uuid(), %s, l.id, 'pending', NULL,
+                                           COALESCE(l.outreach_priority, 'P3'),
+                                           COALESCE(l.outreach_priority_score, 25),
+                                           l.outreach_priority_reason,
+                                           COALESCE(l.commercial_fit_score, 0)
+                                    FROM leads l
+                                    WHERE l.id = %s
+                                      AND NOT EXISTS (
                                         SELECT 1 FROM campaign_logs cl2
                                         JOIN leads l2 ON cl2.lead_id = l2.id
                                         WHERE LOWER(l2.contact_username) = LOWER(%s)
@@ -4094,9 +4101,16 @@ class LeadValidator:
                                         if lead_row:
                                             with conn.cursor() as cur2:
                                                 cur2.execute("""
-                                                    INSERT INTO campaign_logs (id, campaign_id, lead_id, status, sent_at)
-                                                    SELECT gen_random_uuid(), %s, %s, 'pending', NULL
-                                                    WHERE NOT EXISTS (
+                                                    INSERT INTO campaign_logs (id, campaign_id, lead_id, status, sent_at,
+                                                                               priority, priority_score, priority_reason, commercial_fit_score)
+                                                    SELECT gen_random_uuid(), %s, l.id, 'pending', NULL,
+                                                           COALESCE(l.outreach_priority, 'P3'),
+                                                           COALESCE(l.outreach_priority_score, 25),
+                                                           l.outreach_priority_reason,
+                                                           COALESCE(l.commercial_fit_score, 0)
+                                                    FROM leads l
+                                                    WHERE l.id = %s
+                                                      AND NOT EXISTS (
                                                         SELECT 1 FROM campaign_logs
                                                         WHERE campaign_id = %s AND lead_id = %s
                                                     )
@@ -4137,9 +4151,16 @@ class LeadValidator:
                                         if lead_row:
                                             with conn.cursor() as cur2:
                                                 cur2.execute("""
-                                                    INSERT INTO campaign_logs (id, campaign_id, lead_id, status, sent_at)
-                                                    SELECT gen_random_uuid(), %s, %s, 'pending', NULL
-                                                    WHERE NOT EXISTS (
+                                                    INSERT INTO campaign_logs (id, campaign_id, lead_id, status, sent_at,
+                                                                               priority, priority_score, priority_reason, commercial_fit_score)
+                                                    SELECT gen_random_uuid(), %s, l.id, 'pending', NULL,
+                                                           COALESCE(l.outreach_priority, 'P3'),
+                                                           COALESCE(l.outreach_priority_score, 25),
+                                                           l.outreach_priority_reason,
+                                                           COALESCE(l.commercial_fit_score, 0)
+                                                    FROM leads l
+                                                    WHERE l.id = %s
+                                                      AND NOT EXISTS (
                                                         SELECT 1 FROM campaign_logs
                                                         WHERE campaign_id = %s AND lead_id = %s
                                                     )

@@ -103,11 +103,15 @@ class OutreachPriorityEngine:
         has_clear_business_model = len(comm_eval["detected_models"]) >= 1
         has_high_commercial_activity = comm_fit_pts >= 18
         has_contact = contact_pts >= 3
+        # Forex relevance gate: Channels must have minimum forex relevance to qualify for P0/P1.
+        # This prevents crypto-only, sports, gaming, or general finance channels from
+        # receiving high outreach priority just because they have VIP/subscription models.
+        has_forex_relevance = forex_pts >= 3  # forex_relevance_score >= 20 on 0-100 scale
 
-        if total_score >= 70 and has_clear_business_model and has_contact:
+        if total_score >= 70 and has_clear_business_model and has_contact and has_forex_relevance:
             tier = OutreachPriority.P0
             tier_label = "P0 (Immediate Commercial Priority)"
-        elif total_score >= 55 and (has_clear_business_model or has_high_commercial_activity):
+        elif total_score >= 55 and (has_clear_business_model or has_high_commercial_activity) and has_forex_relevance:
             tier = OutreachPriority.P1
             tier_label = "P1 (Very High Commercial Fit)"
         elif total_score >= 38 and (has_clear_business_model or comm_fit_pts >= 10 or forex_pts >= 8):
