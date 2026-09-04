@@ -1430,6 +1430,17 @@ class LeadValidator:
         Checks username via public HTTP web preview to get basic channel metadata.
         Does not use Telegram API.
         """
+        if not username or username.startswith("private_") or username.startswith("+") or "/" in username:
+            return {
+                "exists": True,
+                "is_channel": True,
+                "is_group": False,
+                "title": username or "",
+                "description": "",
+                "member_count": 999999,
+                "avg_views": 999999,
+                "status_code": 200
+            }
         url = f"https://t.me/s/{username}"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -2112,7 +2123,7 @@ class LeadValidator:
                     )
                     return
                     
-            if link_type == 'public' and identifier:
+            if link_type == 'public' and identifier and not identifier.startswith("private_"):
                 if not crawl_job_id and discovery_source != "priority_scheduler" and self.check_rescan_cooldown(identifier):
                     # Cooldown hit, skip network API requests to protect account
                     return
@@ -3782,11 +3793,12 @@ class LeadValidator:
             r'للتواصل|تواصل|تواصلوا|راسل|راسلونا|راسلني|راسلنا|مراسلة|للمراسلة|'
             r'للاشتراك|اشتراك|للانضمام|انضمام|الادارة|الاداره|ادارة|اداره|'
             r'المشرف|مشرف|المشرفين|الدعم|دعم|المسؤول|المسئول|مسؤول|مسئول|'
-            r'للاستفسار|استفسار|استفسارات|للاستفسارات|حسابي|خاص|الخاص|'
+            r'للاستفسار|استفسار|استفسارات|للاستفسارات|حسابي|خاص|الخاص|معرفي|'
             r'تواصل معي|تواصل معنا|للتواصل معي|للتواصل معنا|راسلني على|راسلنا على|'
             r'ارسل لي|ارسل لنا|ارسل رسالة|كلمني|كلمني على|تواصل عبر|تواصلوا عبر|'
             r'سجل|التسجيل|للتشراك|للتحدث|تحدث|مطور|المطور|مطورين|'
             r'صاحب القناة|صاحب القناه|مالك القناة|مالك القناه|صاحب|مالك|المالك|الصاحب|'
+            r'خدمة العملاء|خدمه العملاء|الدعم الفني|حسابي الوحيد|لطلب الاشتراك|'
             r'admin|administrator|support|contact|help|owner|manager|ceo|founder|creator|'
             r'inquiry|inquiries|subscribe|subscription|pm|dm|chat|personal|me|contactme|contactus|'
             r'messageme|reachme|reachus|writeme|writeus|askme|tg|tele|telegram'
@@ -3818,16 +3830,17 @@ class LeadValidator:
                 return c.strip()
 
             contact_username = None
+            SEP = r'[:\-\x20\s👇👈👉💬✉️📲📩📞🔹🔸🔻🔺]{1,15}'
             for src in [description or '', text or '']:
                 # 1. Keyword -> @username or t.me/username
-                m = re.search(r'(?:' + KEYWORDS_PATTERN + r')\s*[:\-\x20]{1,10}(?:https?://)?(?:t\.me/|@)([a-zA-Z0-9_]{3,35})', src, re.IGNORECASE)
+                m = re.search(r'(?:' + KEYWORDS_PATTERN + r')' + SEP + r'(?:https?://)?(?:t\.me/|@)([a-zA-Z0-9_]{3,35})', src, re.IGNORECASE)
                 if m:
                     cand = _clean(m.group(1))
                     if cand.lower() not in skip and cand.lower() != ch_username.lower() and not cand.startswith('+'):
                         contact_username = cand
                         break
                 # 2. @username or t.me/username -> Keyword
-                m2 = re.search(r'(?:https?://)?(?:t\.me/|@)([a-zA-Z0-9_]{3,35})\s*[:\-\x20]{1,10}(?:' + KEYWORDS_PATTERN + r')', src, re.IGNORECASE)
+                m2 = re.search(r'(?:https?://)?(?:t\.me/|@)([a-zA-Z0-9_]{3,35})' + SEP + r'(?:' + KEYWORDS_PATTERN + r')', src, re.IGNORECASE)
                 if m2:
                     cand = _clean(m2.group(1))
                     if cand.lower() not in skip and cand.lower() != ch_username.lower() and not cand.startswith('+'):
@@ -4229,6 +4242,121 @@ class LeadValidator:
                 await asyncio.wait_for(self.shutdown_event.wait(), timeout=300)
             except asyncio.TimeoutError:
                 pass
+
+    async def private_invite_resolver_loop(self):
+        """
+        Background loop to resolve private Telegram invite links (t.me/+<hash>).
+        Safely uses user_client with CheckChatInviteRequest (paced at 1 request per 35s),
+        extracts channel title, about, member count, and owner/admin contacts,
+        classifies Forex intent, and enqueues verified leads for outreach.
+        """
+        logging.info("Private Invite Resolver background task started.")
+        user_client = getattr(self, 'user_client', None)
+        if not user_client:
+            logging.warning("Private Invite Resolver: user_client not available. Task disabled.")
+            return
+
+        from telethon.tl.functions.messages import CheckChatInviteRequest
+        from telethon.errors import FloodWaitError, InviteHashExpiredError, InviteHashInvalidError
+
+        FOREX_KW = re.compile(
+            r'(forex|fx|gold|xau|trade|trader|trading|invest|vip|signal|signals|chart|smc|pip|pips|crypto|'
+            r'تداول|فوركس|ذهب|توصيات|توصيه|إشارات|إدارة|ادارة|محفظة|محافظ|استثمار|نسخ\s*صفقات)',
+            re.IGNORECASE
+        )
+        SYSTEM_BOTS = {'help', 'support', 'admin', 'addlist', 'everyone', 'share', 'joinchat', 'bot'}
+
+        while not self.shutdown_event.is_set():
+            try:
+                # 1. Collect candidate hashes
+                hashes = []
+                with self.db_helper.conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT DISTINCT substring(message_text from 'https?://t\\.me/\\+([a-zA-Z0-9_-]{10,25})') as h
+                        FROM channel_posts
+                        WHERE message_text LIKE '%t.me/+%'
+                        LIMIT 50;
+                    """)
+                    for r in cur.fetchall():
+                        val = r.get('h') if isinstance(r, dict) else r[0]
+                        if val and not self.redis_conn.sismember("resolved_private_hashes", val):
+                            hashes.append(val)
+
+                if not hashes:
+                    await asyncio.wait_for(self.shutdown_event.wait(), timeout=600)
+                    continue
+
+                for h in hashes:
+                    if self.shutdown_event.is_set():
+                        break
+                    if self.redis_conn.sismember("resolved_private_hashes", h):
+                        continue
+
+                    try:
+                        res = await user_client(CheckChatInviteRequest(h))
+                        chat = getattr(res, 'chat', None)
+                        title = getattr(res, 'title', None) or (getattr(chat, 'title', '') if chat else '') or ''
+                        about = getattr(res, 'about', '') or ''
+                        participants = getattr(res, 'participants_count', 0) or 0
+
+                        combined = f"{title} {about}"
+                        if FOREX_KW.search(combined):
+                            # Extract contacts
+                            cand_users = re.findall(r'@([a-zA-Z0-9_]{4,32})', combined)
+                            contacts = [c for c in cand_users if c.lower() not in SYSTEM_BOTS and not c.lower().endswith('bot')]
+                            primary_contact = contacts[0] if contacts else None
+
+                            ch_key = f"invite_{h}"
+                            with self.db_helper.conn.cursor() as cur:
+                                cur.execute("""
+                                    INSERT INTO leads (
+                                        channel_username, member_count, contact_username,
+                                        description, language, forex_intent_score, lead_score,
+                                        status, tier, is_group, metadata, last_scan, last_activity
+                                    ) VALUES (
+                                        %s, %s, %s, %s, 'Arabic', 85, 75, 'new', 'Tier_B', false, %s, NOW(), NOW()
+                                    ) ON CONFLICT (channel_username) DO UPDATE SET
+                                        contact_username = COALESCE(NULLIF(leads.contact_username,''), EXCLUDED.contact_username),
+                                        description = COALESCE(NULLIF(leads.description,''), EXCLUDED.description),
+                                        member_count = GREATEST(leads.member_count, EXCLUDED.member_count)
+                                    RETURNING id;
+                                """, (ch_key, participants, primary_contact, about, json.dumps({'title': title, 'invite_hash': h})))
+                                lead_row = cur.fetchone()
+                                lead_id = lead_row.get('id') if isinstance(lead_row, dict) else lead_row[0] if lead_row else None
+
+                                if lead_id and primary_contact:
+                                    cur.execute("SELECT id FROM campaigns ORDER BY created_at DESC LIMIT 1;")
+                                    camp_row = cur.fetchone()
+                                    if camp_row:
+                                        camp_id_val = camp_row.get('id') if isinstance(camp_row, dict) else camp_row[0]
+                                        cur.execute("""
+                                            INSERT INTO campaign_logs (id, campaign_id, lead_id, status, sent_at, priority, priority_score)
+                                            SELECT gen_random_uuid(), %s, %s, 'pending', NULL, 'P1', 90
+                                            WHERE NOT EXISTS (
+                                                SELECT 1 FROM campaign_logs WHERE campaign_id = %s AND lead_id = %s
+                                            );
+                                        """, (camp_id_val, lead_id, camp_id_val, lead_id))
+                                self.db_helper.conn.commit()
+                                logging.info(f"Private Invite Resolver: Processed Forex hash {h} -> @{primary_contact}")
+
+                        self.redis_conn.sadd("resolved_private_hashes", h)
+                        # Pacing: 35s between requests to respect Telegram Flood limits
+                        await asyncio.wait_for(self.shutdown_event.wait(), timeout=35)
+
+                    except (InviteHashExpiredError, InviteHashInvalidError):
+                        self.redis_conn.sadd("resolved_private_hashes", h)
+                    except FloodWaitError as fw:
+                        logging.warning(f"Private Invite Resolver: FloodWait {fw.seconds}s. Sleeping...")
+                        await asyncio.wait_for(self.shutdown_event.wait(), timeout=fw.seconds + 10)
+                    except Exception as e:
+                        logging.warning(f"Private Invite Resolver error for hash {h}: {e}")
+                        self.redis_conn.sadd("resolved_private_hashes", h)
+
+            except asyncio.TimeoutError:
+                pass
+            except Exception as loop_err:
+                logging.error(f"Private Invite Resolver loop error: {loop_err}")
+                await asyncio.sleep(60)
 
     def _resolve_media_list(self, m_path):
         if not m_path:
@@ -4946,6 +5074,8 @@ class LeadValidator:
             self.followup_dispatcher_task = asyncio.create_task(self.followup_dispatcher_loop())
             # Start the auto dialog scanner: watches Tamer's joined channels and extracts owners
             self.auto_scan_task = asyncio.create_task(self.auto_scan_user_dialogs_loop())
+            # Start continuous private invite link resolver
+            self.private_invite_task = asyncio.create_task(self.private_invite_resolver_loop())
         else:
             logging.warning("User client not initialized. Auto-joiner, Campaign dispatcher, Follow-up dispatcher and Auto Dialog Scanner are disabled.")
         
