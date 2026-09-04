@@ -3244,6 +3244,29 @@ class LeadValidator:
             )
 
             if channel_db_id:
+                # Sync updated priority into any existing pending campaign logs for this lead
+                try:
+                    with self.db_helper.conn.cursor() as cur_sync:
+                        cur_sync.execute("""
+                            UPDATE campaign_logs
+                            SET priority = %s,
+                                priority_score = %s,
+                                priority_reason = %s,
+                                commercial_fit_score = %s,
+                                likely_services = %s
+                            WHERE lead_id = %s AND status = 'pending'
+                        """, (
+                            outreach_eval["priority"],
+                            outreach_eval["priority_score"],
+                            outreach_eval["reason"],
+                            outreach_eval["commercial_fit_score"],
+                            outreach_eval["likely_services"],
+                            channel_db_id
+                        ))
+                    self.db_helper.conn.commit()
+                except Exception as sync_err:
+                    logging.debug(f"Campaign log priority sync note for @{username}: {sync_err}")
+
                 # 1. Record snapshot for historical growth tracking with score metrics
                 self.db_helper.insert_snapshot(
                     channel_id=channel_db_id,
@@ -4234,19 +4257,43 @@ class LeadValidator:
                 self.db_helper.check_connection()
                 conn = self.db_helper.conn
                 
+                # Periodic background sync (every 300s) to keep campaign_logs in sync with leads table
+                now_ts = time.time()
+                if not hasattr(self, '_last_priority_sync_ts') or (now_ts - getattr(self, '_last_priority_sync_ts', 0)) > 300:
+                    self._last_priority_sync_ts = now_ts
+                    try:
+                        with conn.cursor() as cur_sync:
+                            cur_sync.execute("""
+                                UPDATE campaign_logs cl
+                                SET priority = l.outreach_priority,
+                                    priority_score = l.outreach_priority_score,
+                                    priority_reason = l.outreach_priority_reason,
+                                    commercial_fit_score = l.commercial_fit_score,
+                                    likely_services = l.likely_services,
+                                    intent_evidence = l.commercial_evidence
+                                FROM leads l
+                                WHERE cl.lead_id = l.id
+                                  AND cl.status = 'pending'
+                                  AND l.outreach_priority IS NOT NULL
+                                  AND (cl.priority != l.outreach_priority OR cl.priority_score != l.outreach_priority_score);
+                            """)
+                            conn.commit()
+                    except Exception as sync_err:
+                        logging.debug(f"Campaign dispatcher background sync note: {sync_err}")
+
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
                     cur.execute("""
                         SELECT cl.id as log_id, cl.campaign_id, cl.lead_id, c.message_text, c.media_path,
                                l.contact_username, l.channel_username,
-                               COALESCE(cl.priority, l.outreach_priority, 'P3') as priority,
-                               COALESCE(cl.priority_score, l.outreach_priority_score, 25) as priority_score
+                               COALESCE(l.outreach_priority, cl.priority, 'P3') as priority,
+                               COALESCE(l.outreach_priority_score, cl.priority_score, 25) as priority_score
                         FROM campaign_logs cl
                         JOIN campaigns c ON cl.campaign_id = c.id
                         JOIN leads l ON cl.lead_id = l.id
                         WHERE cl.status = 'pending'
                            OR (cl.status = 'processing' AND cl.sent_at IS NULL AND cl.last_attempt_at < NOW() - INTERVAL '15 minutes')
                         ORDER BY 
-                            CASE COALESCE(cl.priority, l.outreach_priority, 'P3')
+                            CASE COALESCE(l.outreach_priority, cl.priority, 'P3')
                                 WHEN 'P0' THEN 0
                                 WHEN 'P1' THEN 1
                                 WHEN 'P2' THEN 2
@@ -4254,7 +4301,7 @@ class LeadValidator:
                                 WHEN 'P4' THEN 4
                                 ELSE 5
                             END ASC,
-                            COALESCE(cl.priority_score, l.outreach_priority_score, 25) DESC,
+                            COALESCE(l.outreach_priority_score, cl.priority_score, 25) DESC,
                             COALESCE(l.commercial_last_seen, l.intent_detected_at) DESC NULLS LAST,
                             cl.attempt_count ASC,
                             c.created_at ASC

@@ -473,17 +473,21 @@ def test_sql_ordering_real_database_integration():
         cur.execute("INSERT INTO leads VALUES (?, ?, ?, ?, ?, 'reason', ?, NULL)", (lid, cname, uadmin, prio, score, lseen))
         cur.execute("INSERT INTO campaign_logs VALUES (?, 'camp-1', ?, 'pending', ?, ?, 0, NULL, NULL)", (f"log-{lid}", lid, prio, score))
 
+    # Add a lead with STALE priority in campaign_logs ('P3', 25), but UPDATED in leads table ('P0', 95)
+    cur.execute("INSERT INTO leads VALUES ('lead-stale-p0', 'vip_stale_updated', 'admin9', 'P0', 95, 'reason', '2026-09-04 05:00:00', NULL)")
+    cur.execute("INSERT INTO campaign_logs VALUES ('log-stale', 'camp-1', 'lead-stale-p0', 'pending', 'P3', 25, 0, NULL, NULL)")
+
     # Actual Claiming Query (matching campaign_worker.py / validator.py)
     cur.execute("""
         SELECT cl.id as log_id, l.channel_username,
-               COALESCE(cl.priority, l.outreach_priority, 'P3') as priority,
-               COALESCE(cl.priority_score, l.outreach_priority_score, 25) as priority_score
+               COALESCE(l.outreach_priority, cl.priority, 'P3') as priority,
+               COALESCE(l.outreach_priority_score, cl.priority_score, 25) as priority_score
         FROM campaign_logs cl
         JOIN campaigns c ON cl.campaign_id = c.id
         JOIN leads l ON cl.lead_id = l.id
         WHERE cl.status = 'pending'
         ORDER BY 
-            CASE COALESCE(cl.priority, l.outreach_priority, 'P3')
+            CASE COALESCE(l.outreach_priority, cl.priority, 'P3')
                 WHEN 'P0' THEN 0
                 WHEN 'P1' THEN 1
                 WHEN 'P2' THEN 2
@@ -491,7 +495,7 @@ def test_sql_ordering_real_database_integration():
                 WHEN 'P4' THEN 4
                 ELSE 5
             END ASC,
-            COALESCE(cl.priority_score, l.outreach_priority_score, 25) DESC,
+            COALESCE(l.outreach_priority_score, cl.priority_score, 25) DESC,
             COALESCE(l.commercial_last_seen, l.intent_detected_at) DESC,
             cl.attempt_count ASC,
             c.created_at ASC
@@ -500,8 +504,10 @@ def test_sql_ordering_real_database_integration():
     results = cur.fetchall()
     extracted_order = [(r[1], r[2], r[3]) for r in results]
 
-    # Verify exact claimed sequence
+    # Verify exact claimed sequence:
+    # Stale lead with P3 in log but P0/95 in leads MUST be claimed first!
     expected_order = [
+        ("vip_stale_updated", "P0", 95),
         ("vip_1", "P0", 92),
         ("vip_2", "P0", 78),
         ("prop_1", "P1", 72),
@@ -556,7 +562,7 @@ def test_previously_contacted_replied_skipped_cooldown_not_selected():
         JOIN leads l ON cl.lead_id = l.id
         WHERE cl.status = 'pending'
         ORDER BY 
-            CASE COALESCE(cl.priority, l.outreach_priority, 'P3')
+            CASE COALESCE(l.outreach_priority, cl.priority, 'P3')
                 WHEN 'P0' THEN 0
                 WHEN 'P1' THEN 1
                 WHEN 'P2' THEN 2

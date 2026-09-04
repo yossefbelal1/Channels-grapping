@@ -93,16 +93,17 @@ class CampaignRepository:
                        COUNT(CASE WHEN cl.status = 'failed' THEN 1 END) as failed_count,
                        COUNT(CASE WHEN cl.status = 'skipped' THEN 1 END) as skipped_count,
                        COUNT(CASE WHEN cl.status = 'pending' THEN 1 END) as pending_count,
-                       COUNT(CASE WHEN cl.status = 'pending' AND COALESCE(cl.priority, 'P3') = 'P0' THEN 1 END) as p0_pending_count,
-                       COUNT(CASE WHEN cl.status = 'pending' AND COALESCE(cl.priority, 'P3') = 'P1' THEN 1 END) as p1_pending_count,
-                       COUNT(CASE WHEN cl.status = 'pending' AND COALESCE(cl.priority, 'P3') = 'P2' THEN 1 END) as p2_pending_count,
-                       COUNT(CASE WHEN cl.status = 'pending' AND COALESCE(cl.priority, 'P3') = 'P3' THEN 1 END) as p3_pending_count,
-                       COUNT(CASE WHEN cl.status = 'pending' AND COALESCE(cl.priority, 'P3') = 'P4' THEN 1 END) as p4_pending_count,
+                       COUNT(CASE WHEN cl.status = 'pending' AND COALESCE(l.outreach_priority, cl.priority, 'P3') = 'P0' THEN 1 END) as p0_pending_count,
+                       COUNT(CASE WHEN cl.status = 'pending' AND COALESCE(l.outreach_priority, cl.priority, 'P3') = 'P1' THEN 1 END) as p1_pending_count,
+                       COUNT(CASE WHEN cl.status = 'pending' AND COALESCE(l.outreach_priority, cl.priority, 'P3') = 'P2' THEN 1 END) as p2_pending_count,
+                       COUNT(CASE WHEN cl.status = 'pending' AND COALESCE(l.outreach_priority, cl.priority, 'P3') = 'P3' THEN 1 END) as p3_pending_count,
+                       COUNT(CASE WHEN cl.status = 'pending' AND COALESCE(l.outreach_priority, cl.priority, 'P3') = 'P4' THEN 1 END) as p4_pending_count,
                        COUNT(CASE WHEN cl.followup_status = 'sent' THEN 1 END) as followup_sent_count,
                        COUNT(CASE WHEN cl.user_replied = TRUE THEN 1 END) as replied_count,
                        COUNT(CASE WHEN cl.status = 'sent' AND (cl.followup_status IS NULL OR cl.followup_status = 'pending') AND cl.user_replied = FALSE AND cl.sent_at < NOW() - (COALESCE(c.followup_delay_days, 4) || ' days')::INTERVAL THEN 1 END) as followup_ready_count
                 FROM campaigns c
                 LEFT JOIN campaign_logs cl ON c.id = cl.campaign_id
+                LEFT JOIN leads l ON cl.lead_id = l.id
                 GROUP BY c.id, c.created_at, c.message_text, c.media_path, c.status, c.followup_enabled, c.followup_message_text, c.followup_delay_days
                 ORDER BY c.created_at DESC
             """)
@@ -110,13 +111,17 @@ class CampaignRepository:
 
             cur.execute("""
                 SELECT cl.campaign_id, cl.status, cl.error_message, cl.sent_at,
-                       cl.priority, cl.priority_score, cl.priority_reason, cl.likely_services, cl.intent_evidence,
+                       COALESCE(l.outreach_priority, cl.priority, 'P3') as priority,
+                       COALESCE(l.outreach_priority_score, cl.priority_score, 25) as priority_score,
+                       COALESCE(l.outreach_priority_reason, cl.priority_reason) as priority_reason,
+                       COALESCE(l.likely_services, cl.likely_services) as likely_services,
+                       COALESCE(l.commercial_evidence, cl.intent_evidence) as intent_evidence,
                        l.channel_username, l.contact_username, c.message_text
                 FROM campaign_logs cl
                 JOIN campaigns c ON cl.campaign_id = c.id
                 JOIN leads l ON cl.lead_id = l.id
                 ORDER BY 
-                    CASE COALESCE(cl.priority, 'P3')
+                    CASE COALESCE(l.outreach_priority, cl.priority, 'P3')
                         WHEN 'P0' THEN 0
                         WHEN 'P1' THEN 1
                         WHEN 'P2' THEN 2
@@ -124,7 +129,7 @@ class CampaignRepository:
                         WHEN 'P4' THEN 4
                         ELSE 5
                     END ASC,
-                    COALESCE(cl.priority_score, 25) DESC,
+                    COALESCE(l.outreach_priority_score, cl.priority_score, 25) DESC,
                     cl.sent_at DESC NULLS FIRST, c.created_at DESC
                 LIMIT 50
             """)

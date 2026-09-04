@@ -17,7 +17,7 @@ import logging
 import random
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import redis
 import psycopg2
@@ -137,15 +137,15 @@ async def main():
             cur.execute("""
                 SELECT cl.id as log_id, cl.campaign_id, cl.lead_id, c.message_text, c.media_path,
                        l.contact_username, l.channel_username, l.is_group,
-                       COALESCE(cl.priority, l.outreach_priority, 'P3') as priority,
-                       COALESCE(cl.priority_score, l.outreach_priority_score, 25) as priority_score
+                       COALESCE(l.outreach_priority, cl.priority, 'P3') as priority,
+                       COALESCE(l.outreach_priority_score, cl.priority_score, 25) as priority_score
                 FROM campaign_logs cl
                 JOIN campaigns c ON cl.campaign_id = c.id
                 JOIN leads l ON cl.lead_id = l.id
                 WHERE cl.status = 'pending'
                    OR (cl.status = 'processing' AND cl.sent_at IS NULL AND cl.last_attempt_at < NOW() - INTERVAL '15 minutes')
                 ORDER BY 
-                    CASE COALESCE(cl.priority, l.outreach_priority, 'P3')
+                    CASE COALESCE(l.outreach_priority, cl.priority, 'P3')
                         WHEN 'P0' THEN 0
                         WHEN 'P1' THEN 1
                         WHEN 'P2' THEN 2
@@ -153,7 +153,7 @@ async def main():
                         WHEN 'P4' THEN 4
                         ELSE 5
                     END ASC,
-                    COALESCE(cl.priority_score, l.outreach_priority_score, 25) DESC,
+                    COALESCE(l.outreach_priority_score, cl.priority_score, 25) DESC,
                     COALESCE(l.commercial_last_seen, l.intent_detected_at) DESC NULLS LAST,
                     cl.attempt_count ASC,
                     c.created_at ASC
@@ -190,14 +190,54 @@ async def main():
                 conn.close()
                 continue
 
-            # ── 3. Validate Contact Username ──────────────────────────────────
-            target_username = contact_username
+            # ── 3. Validate Contact Username & Filter Bots/System Keywords ───
+            target_username = contact_username.strip().lstrip('@') if contact_username else None
             if not target_username:
                 logging.warning(f"No direct contact username found for lead ID: {lead_id}. Skipping channel @{channel_username}.")
                 cur.execute(
-                    "UPDATE campaign_logs SET status = 'failed', error_message = %s, sent_at = %s WHERE id = %s",
-                    ("No owner or admin contact username resolved for this channel", datetime.now(), log_id)
+                    "UPDATE campaign_logs SET status = 'skipped', error_message = %s, sent_at = %s WHERE id = %s",
+                    ("No contact username resolved for this channel", datetime.now(), log_id)
                 )
+                conn.commit()
+                cur.close()
+                conn.close()
+                continue
+
+            target_lower = target_username.lower()
+            if target_lower.endswith('bot') or target_lower.endswith('_bot') or target_lower in ('addlist', 'everyone', 'share', 'joinchat', 'setlanguage', 'proxy', 'socks', 'c', 's', 'm', 'i', '4030'):
+                logging.info(f"Campaign Dispatcher: @{target_username} is a bot or system keyword. Skipping log ID {log_id}.")
+                cur.execute(
+                    "UPDATE campaign_logs SET status = 'skipped', error_message = 'Invalid contact: bot or system keyword', sent_at = %s WHERE id = %s",
+                    (datetime.now(), log_id)
+                )
+                conn.commit()
+                cur.close()
+                conn.close()
+                continue
+
+            # ── 4. Cross-Channel Contact Deduplication ─────────────────────────
+            cur.execute("""
+                SELECT COUNT(*) as count
+                FROM campaign_logs cl2
+                JOIN leads l2 ON cl2.lead_id = l2.id
+                WHERE LOWER(l2.contact_username) = LOWER(%s)
+                  AND cl2.status = 'sent'
+            """, (target_username,))
+            already_sent_res = cur.fetchone()
+            already_sent_count = already_sent_res['count'] if already_sent_res else 0
+
+            if already_sent_count > 0:
+                logging.info(f"Campaign Dispatcher: Contact @{target_username} was ALREADY messaged previously. Skipping duplicate log ID {log_id}.")
+                cur.execute(
+                    "UPDATE campaign_logs SET status = 'skipped', error_message = %s, sent_at = %s WHERE id = %s",
+                    ("Skipped: Contact username already messaged via another channel/campaign", datetime.now(), log_id)
+                )
+                cur.execute("""
+                    UPDATE campaign_logs cl_sub
+                    SET status = 'skipped', error_message = 'Skipped: Contact username already messaged', sent_at = %s
+                    FROM leads l_sub
+                    WHERE cl_sub.lead_id = l_sub.id AND LOWER(l_sub.contact_username) = LOWER(%s) AND cl_sub.status = 'pending'
+                """, (datetime.now(), target_username))
                 conn.commit()
                 cur.close()
                 conn.close()
@@ -235,9 +275,16 @@ async def main():
                     (datetime.now(), log_id)
                 )
                 cur.execute(
-                    "UPDATE leads SET status = 'contacted', last_activity = %s WHERE id = %s",
-                    (datetime.now(), lead_id)
+                    "UPDATE leads SET status = 'contacted', last_activity = %s, last_contact_at = %s, next_eligible_at = %s WHERE id = %s",
+                    (datetime.now(), datetime.now(), datetime.now() + timedelta(days=30), lead_id)
                 )
+                # Skip duplicate pending campaign logs for same contact
+                cur.execute("""
+                    UPDATE campaign_logs cl_sub
+                    SET status = 'skipped', error_message = 'Skipped: Contact username already messaged', sent_at = %s
+                    FROM leads l_sub
+                    WHERE cl_sub.lead_id = l_sub.id AND LOWER(l_sub.contact_username) = LOWER(%s) AND cl_sub.status = 'pending'
+                """, (datetime.now(), target_username))
             else:
                 logging.error(f"Outreach message delivery failed for @{target_username}: {error_message}")
                 cur.execute(
