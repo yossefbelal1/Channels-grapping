@@ -133,16 +133,30 @@ async def main():
             conn = get_db_connection()
             cur = conn.cursor()
 
-            # ── 1. Atomic Row Claiming with FOR UPDATE SKIP LOCKED ─────────────
+            # ── 1. Atomic Row Claiming with Priority-First FOR UPDATE SKIP LOCKED ──
             cur.execute("""
                 SELECT cl.id as log_id, cl.campaign_id, cl.lead_id, c.message_text, c.media_path,
-                       l.contact_username, l.channel_username, l.is_group
+                       l.contact_username, l.channel_username, l.is_group,
+                       COALESCE(cl.priority, l.outreach_priority, 'P3') as priority,
+                       COALESCE(cl.priority_score, l.outreach_priority_score, 25) as priority_score
                 FROM campaign_logs cl
                 JOIN campaigns c ON cl.campaign_id = c.id
                 JOIN leads l ON cl.lead_id = l.id
                 WHERE cl.status = 'pending'
-                   OR (cl.status = 'processing' AND cl.sent_at IS NULL)
-                ORDER BY c.created_at ASC, cl.sent_at ASC NULLS FIRST
+                   OR (cl.status = 'processing' AND cl.sent_at IS NULL AND cl.last_attempt_at < NOW() - INTERVAL '15 minutes')
+                ORDER BY 
+                    CASE COALESCE(cl.priority, l.outreach_priority, 'P3')
+                        WHEN 'P0' THEN 0
+                        WHEN 'P1' THEN 1
+                        WHEN 'P2' THEN 2
+                        WHEN 'P3' THEN 3
+                        WHEN 'P4' THEN 4
+                        ELSE 5
+                    END ASC,
+                    COALESCE(cl.priority_score, l.outreach_priority_score, 25) DESC,
+                    COALESCE(l.commercial_last_seen, l.intent_detected_at) DESC NULLS LAST,
+                    cl.attempt_count ASC,
+                    c.created_at ASC
                 LIMIT 1
                 FOR UPDATE OF cl SKIP LOCKED
             """)

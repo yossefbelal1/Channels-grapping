@@ -33,6 +33,9 @@ from app.outreach.message_validator import validate_message
 from app.outreach.metrics import OutreachMetrics
 from app.outreach.reconciliation import ReconciliationManager
 from app.outreach.backpressure import BackpressureManager
+from app.outreach.constants import OutreachPriority, ServiceNeedType
+from app.outreach.commercial_inference import CommercialInferenceEngine
+from app.outreach.priority_engine import OutreachPriorityEngine
 
 # Discovery, Graph, Scoring & Scheduling imports (v5)
 from app.scoring.dimensions import ScoringDimensions, calculate_all_dimensions
@@ -244,12 +247,14 @@ def extract_contacts(text: str, description: str, channel_username: str) -> dict
             c = c[1:]
         return c.strip()
     
+    contact_source = 'unknown'
     # A. Search description first (official channel biography) - Check both @ and t.me/ formats
     match_desc_fwd = re.search(r'(?:' + keywords_pattern + r')\s*[:\-\x20]{1,10}(?:https?://)?(?:t\.me/|@)([a-zA-Z0-9_]{3,35})', description or '', re.IGNORECASE)
     if match_desc_fwd:
         cand = _clean_cand(match_desc_fwd.group(1))
         if cand.lower() != channel_username.lower() and cand.lower() not in skip_usernames:
             contact_username = cand
+            contact_source = 'bio_official'
             
     if not contact_username:
         match_desc_bwd = re.search(r'(?:https?://)?(?:t\.me/|@)([a-zA-Z0-9_]{3,35})\s*[:\-\x20]{1,10}(?:' + keywords_pattern + r')', description or '', re.IGNORECASE)
@@ -257,6 +262,7 @@ def extract_contacts(text: str, description: str, channel_username: str) -> dict
             cand = _clean_cand(match_desc_bwd.group(1))
             if cand.lower() != channel_username.lower() and cand.lower() not in skip_usernames:
                 contact_username = cand
+                contact_source = 'bio_admin'
                 
     if not contact_username and description:
         # Fallback 1: any t.me link in description
@@ -265,6 +271,7 @@ def extract_contacts(text: str, description: str, channel_username: str) -> dict
             cand = _clean_cand(raw)
             if cand.lower() != channel_username.lower() and cand.lower() not in skip_usernames and not cand.startswith('+'):
                 contact_username = cand
+                contact_source = 'bio_general'
                 break
                 
     if not contact_username and description:
@@ -274,6 +281,7 @@ def extract_contacts(text: str, description: str, channel_username: str) -> dict
             cand = _clean_cand(raw)
             if cand.lower() != channel_username.lower() and cand.lower() not in skip_usernames:
                 contact_username = cand
+                contact_source = 'bio_general'
                 break
                     
     # B. If not found in description, search in the message logs text
@@ -283,6 +291,7 @@ def extract_contacts(text: str, description: str, channel_username: str) -> dict
             cand = _clean_cand(match_txt_fwd.group(1))
             if cand.lower() != channel_username.lower() and cand.lower() not in skip_usernames:
                 contact_username = cand
+                contact_source = 'intent_cta'
                 
     if not contact_username:
         match_txt_bwd = re.search(r'(?:https?://)?(?:t\.me/|@)([a-zA-Z0-9_]{3,35})\s*[:\-\x20]{1,10}(?:' + keywords_pattern + r')', text or '', re.IGNORECASE)
@@ -290,6 +299,7 @@ def extract_contacts(text: str, description: str, channel_username: str) -> dict
             cand = _clean_cand(match_txt_bwd.group(1))
             if cand.lower() != channel_username.lower() and cand.lower() not in skip_usernames:
                 contact_username = cand
+                contact_source = 'intent_cta'
 
     if not contact_username and text:
         # Fallback: any t.me link in text
@@ -298,6 +308,7 @@ def extract_contacts(text: str, description: str, channel_username: str) -> dict
             cand = _clean_cand(raw)
             if cand.lower() != channel_username.lower() and cand.lower() not in skip_usernames and not cand.startswith('+'):
                 contact_username = cand
+                contact_source = 'message_general'
                 break
 
     if not contact_username and text:
@@ -307,10 +318,12 @@ def extract_contacts(text: str, description: str, channel_username: str) -> dict
             cand = _clean_cand(raw)
             if cand.lower() != channel_username.lower() and cand.lower() not in skip_usernames:
                 contact_username = cand
+                contact_source = 'message_general'
                 break
                         
     if contact_username:
         contacts['contact_username'] = contact_username
+        contacts['source'] = contact_source
         
     return contacts
 
@@ -683,6 +696,32 @@ class DatabaseHelper:
                 FROM channel_graph
                 ON CONFLICT (source_channel_id, target_channel_id, relation_type) DO NOTHING;
                 """)
+
+                # Self-healing migration for Outreach Priority & Commercial Fit
+                cur.execute("""
+                ALTER TABLE leads ADD COLUMN IF NOT EXISTS outreach_priority VARCHAR(10) DEFAULT 'P3';
+                ALTER TABLE leads ADD COLUMN IF NOT EXISTS outreach_priority_score INT DEFAULT 25;
+                ALTER TABLE leads ADD COLUMN IF NOT EXISTS outreach_priority_reason TEXT;
+                ALTER TABLE leads ADD COLUMN IF NOT EXISTS outreach_priority_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                ALTER TABLE leads ADD COLUMN IF NOT EXISTS commercial_fit_score INT DEFAULT 0;
+                ALTER TABLE leads ADD COLUMN IF NOT EXISTS business_model_score INT DEFAULT 0;
+                ALTER TABLE leads ADD COLUMN IF NOT EXISTS operational_complexity_score INT DEFAULT 0;
+                ALTER TABLE leads ADD COLUMN IF NOT EXISTS commercial_intent_type VARCHAR(50) DEFAULT 'none';
+                ALTER TABLE leads ADD COLUMN IF NOT EXISTS commercial_intent_score INT DEFAULT 0;
+                ALTER TABLE leads ADD COLUMN IF NOT EXISTS commercial_intent_evidence JSONB DEFAULT '{}'::jsonb;
+                ALTER TABLE leads ADD COLUMN IF NOT EXISTS commercial_evidence JSONB DEFAULT '{}'::jsonb;
+                ALTER TABLE leads ADD COLUMN IF NOT EXISTS likely_services TEXT[] DEFAULT '{}';
+                ALTER TABLE leads ADD COLUMN IF NOT EXISTS intent_detected_at TIMESTAMP;
+                ALTER TABLE leads ADD COLUMN IF NOT EXISTS commercial_last_seen TIMESTAMP;
+
+                ALTER TABLE campaign_logs ADD COLUMN IF NOT EXISTS priority VARCHAR(10) DEFAULT 'P3';
+                ALTER TABLE campaign_logs ADD COLUMN IF NOT EXISTS priority_score INT DEFAULT 25;
+                ALTER TABLE campaign_logs ADD COLUMN IF NOT EXISTS priority_reason TEXT;
+                ALTER TABLE campaign_logs ADD COLUMN IF NOT EXISTS intent_type VARCHAR(50) DEFAULT 'none';
+                ALTER TABLE campaign_logs ADD COLUMN IF NOT EXISTS intent_evidence JSONB DEFAULT '{}'::jsonb;
+                ALTER TABLE campaign_logs ADD COLUMN IF NOT EXISTS commercial_fit_score INT DEFAULT 0;
+                ALTER TABLE campaign_logs ADD COLUMN IF NOT EXISTS likely_services TEXT[] DEFAULT '{}';
+                """)
             logging.info("Connected to PostgreSQL database successfully.")
         except Exception as e:
             logging.error(f"Failed to connect to PostgreSQL database: {e}")
@@ -1015,11 +1054,22 @@ class DatabaseHelper:
         avg_posts_per_day: float = 0.0,
         discovery_source: str = 'unknown',
         discovery_method: str = 'unknown',
-        status: str = 'new'
+        status: str = 'new',
+        outreach_priority: str = 'P3',
+        outreach_priority_score: int = 25,
+        outreach_priority_reason: str = '',
+        commercial_fit_score: int = 0,
+        business_model_score: int = 0,
+        operational_complexity_score: int = 0,
+        likely_services: Optional[list] = None,
+        commercial_evidence: Optional[dict] = None,
+        commercial_last_seen: Optional[datetime] = None
     ) -> Optional[str]:
-        """Upserts lead with all 13 multi-dimensional scores and activity metadata."""
+        """Upserts lead with all multi-dimensional scores, commercial fit, and outreach priority."""
         self.check_connection()
         contacts_dict = contacts_dict or {}
+        likely_services = likely_services or []
+        comm_evidence_json = json.dumps(commercial_evidence or {})
         query = """
         INSERT INTO leads (
             channel_username, member_count, description, language, arabic_ratio,
@@ -1028,7 +1078,10 @@ class DatabaseHelper:
             forex_score, trading_score, signal_score, gold_score, activity_score, growth_score,
             commercial_score, contact_score, legitimacy_score, discovery_score, freshness_score,
             confidence_score, new_channel_score, classification, scoring_evidence,
-            activity_class, posts_24h, posts_7d, posts_30d, avg_posts_per_day, next_crawl_at
+            activity_class, posts_24h, posts_7d, posts_30d, avg_posts_per_day, next_crawl_at,
+            outreach_priority, outreach_priority_score, outreach_priority_reason,
+            commercial_fit_score, business_model_score, operational_complexity_score,
+            likely_services, commercial_evidence, commercial_last_seen
         ) VALUES (
             %s, %s, %s, 'Arabic', %s,
             %s, %s, %s, %s, %s, %s,
@@ -1036,7 +1089,8 @@ class DatabaseHelper:
             %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s,
             %s, %s, %s, %s::jsonb,
-            %s, %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
         )
         ON CONFLICT (channel_username) DO UPDATE SET
             member_count = EXCLUDED.member_count,
@@ -1072,7 +1126,17 @@ class DatabaseHelper:
             posts_7d = EXCLUDED.posts_7d,
             posts_30d = EXCLUDED.posts_30d,
             avg_posts_per_day = EXCLUDED.avg_posts_per_day,
-            next_crawl_at = EXCLUDED.next_crawl_at
+            next_crawl_at = EXCLUDED.next_crawl_at,
+            outreach_priority = EXCLUDED.outreach_priority,
+            outreach_priority_score = EXCLUDED.outreach_priority_score,
+            outreach_priority_reason = EXCLUDED.outreach_priority_reason,
+            outreach_priority_updated_at = NOW(),
+            commercial_fit_score = EXCLUDED.commercial_fit_score,
+            business_model_score = EXCLUDED.business_model_score,
+            operational_complexity_score = EXCLUDED.operational_complexity_score,
+            likely_services = EXCLUDED.likely_services,
+            commercial_evidence = EXCLUDED.commercial_evidence,
+            commercial_last_seen = COALESCE(EXCLUDED.commercial_last_seen, leads.commercial_last_seen)
         RETURNING id;
         """
         evidence_json = json.dumps(scores.evidence or {})
@@ -1087,7 +1151,10 @@ class DatabaseHelper:
                     scores.activity_score, scores.growth_score, scores.commercial_score, scores.contact_score,
                     scores.legitimacy_score, scores.discovery_score, scores.freshness_score,
                     scores.confidence_score, scores.new_channel_score, scores.classification, evidence_json,
-                    activity_class, posts_24h, posts_7d, posts_30d, avg_posts_per_day, next_crawl_at
+                    activity_class, posts_24h, posts_7d, posts_30d, avg_posts_per_day, next_crawl_at,
+                    outreach_priority, outreach_priority_score, outreach_priority_reason,
+                    commercial_fit_score, business_model_score, operational_complexity_score,
+                    likely_services, comm_evidence_json, commercial_last_seen
                 ))
                 res = cur.fetchone()
                 self.conn.commit()
@@ -3129,7 +3196,27 @@ class LeadValidator:
                 status_val = 'rejected'
                 logging.info(f"Channel @{username} below qualification threshold (FinalScore={scoring_dims.final_score}, Class={scoring_dims.classification}). Marking rejected.")
 
-            # Save to database using v5/v6 schema (all scoring dimensions + activity class)
+            # Evaluate Commercial Fit & Outreach Priority (P0..P4)
+            outreach_eval = OutreachPriorityEngine.evaluate_priority(
+                title=title or '',
+                description=description or '',
+                recent_messages=messages,
+                contacts_dict=contacts,
+                forex_relevance_score=scoring_dims.forex_score,
+                member_count=member_count,
+                posts_24h=msgs_72h,
+                posts_7d=msgs_7d
+            )
+            comm_last_seen = None
+            if outreach_eval.get("freshest_commercial_date"):
+                try:
+                    comm_last_seen = datetime.fromisoformat(outreach_eval["freshest_commercial_date"])
+                except Exception:
+                    comm_last_seen = datetime.now()
+            elif outreach_eval.get("commercial_fit_score", 0) > 0:
+                comm_last_seen = datetime.now()
+
+            # Save to database using v5/v6/v8 schema (all scoring dimensions + activity class + outreach priority)
             channel_db_id = self.db_helper.upsert_lead_v5(
                 channel_username=username,
                 member_count=member_count,
@@ -3144,7 +3231,16 @@ class LeadValidator:
                 avg_posts_per_day=round(len(messages) / 30.0, 2),
                 discovery_source=discovery_source,
                 discovery_method=discovery_method,
-                status=status_val
+                status=status_val,
+                outreach_priority=outreach_eval["priority"],
+                outreach_priority_score=outreach_eval["priority_score"],
+                outreach_priority_reason=outreach_eval["reason"],
+                commercial_fit_score=outreach_eval["commercial_fit_score"],
+                business_model_score=outreach_eval["business_model_score"],
+                operational_complexity_score=outreach_eval["operational_complexity_score"],
+                likely_services=outreach_eval["likely_services"],
+                commercial_evidence=outreach_eval["evidence"],
+                commercial_last_seen=comm_last_seen
             )
 
             if channel_db_id:
@@ -4120,12 +4216,27 @@ class LeadValidator:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
                     cur.execute("""
                         SELECT cl.id as log_id, cl.campaign_id, cl.lead_id, c.message_text, c.media_path,
-                               l.contact_username, l.channel_username
+                               l.contact_username, l.channel_username,
+                               COALESCE(cl.priority, l.outreach_priority, 'P3') as priority,
+                               COALESCE(cl.priority_score, l.outreach_priority_score, 25) as priority_score
                         FROM campaign_logs cl
                         JOIN campaigns c ON cl.campaign_id = c.id
                         JOIN leads l ON cl.lead_id = l.id
                         WHERE cl.status = 'pending'
-                        ORDER BY c.created_at ASC, cl.sent_at ASC NULLS FIRST
+                           OR (cl.status = 'processing' AND cl.sent_at IS NULL AND cl.last_attempt_at < NOW() - INTERVAL '15 minutes')
+                        ORDER BY 
+                            CASE COALESCE(cl.priority, l.outreach_priority, 'P3')
+                                WHEN 'P0' THEN 0
+                                WHEN 'P1' THEN 1
+                                WHEN 'P2' THEN 2
+                                WHEN 'P3' THEN 3
+                                WHEN 'P4' THEN 4
+                                ELSE 5
+                            END ASC,
+                            COALESCE(cl.priority_score, l.outreach_priority_score, 25) DESC,
+                            COALESCE(l.commercial_last_seen, l.intent_detected_at) DESC NULLS LAST,
+                            cl.attempt_count ASC,
+                            c.created_at ASC
                         LIMIT 1
                         FOR UPDATE OF cl SKIP LOCKED
                     """)
@@ -4707,7 +4818,7 @@ class LeadValidator:
                 self.redis_conn, self.db_helper.conn
             )
             # Run schema migrations safely
-            for mig_file in ['migrate_outreach_engine.sql', 'migrate_v6_channel_intelligence.sql', 'migrate_v7_production_hardening.sql']:
+            for mig_file in ['migrate_outreach_engine.sql', 'migrate_v6_channel_intelligence.sql', 'migrate_v7_production_hardening.sql', 'migrate_v8_outreach_intelligence.sql']:
                 try:
                     migration_path = os.path.join(os.path.dirname(__file__), mig_file)
                     if os.path.exists(migration_path):

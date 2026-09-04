@@ -24,6 +24,7 @@ from app.outreach.emergency import is_outreach_enabled, emergency_stop, emergenc
 from app.outreach.account_health import AccountHealthManager
 from app.outreach.circuit_breaker import CircuitBreaker
 from app.outreach.backpressure import BackpressureManager
+from app.repositories.campaign_repository import CampaignRepository
 
 # Configure logging
 logging.basicConfig(
@@ -130,25 +131,11 @@ def start_campaign(req: CampaignRequest):
     try:
         # Sanitize media path against traversal
         safe_media_path = sanitize_media_path(req.media_path)
-        campaign_id = str(uuid.uuid4())
-        inserted_logs = 0
-
-        with get_db_cursor(commit_on_success=True) as cur:
-            # 1. Insert Campaign
-            cur.execute(
-                "INSERT INTO campaigns (id, message_text, media_path, status, created_at) VALUES (%s, %s, %s, %s, %s)",
-                (campaign_id, req.message_text, safe_media_path, "active", datetime.now())
-            )
-            
-            # 2. Batch-insert Pending Logs
-            for lead_id in req.selected_lead_ids:
-                log_id = str(uuid.uuid4())
-                cur.execute(
-                    "INSERT INTO campaign_logs (id, campaign_id, lead_id, status) VALUES (%s, %s, %s, %s)",
-                    (log_id, campaign_id, lead_id, "pending")
-                )
-                inserted_logs += 1
-        
+        campaign_id, inserted_logs = CampaignRepository.create_campaign(
+            message_text=req.message_text,
+            media_path=safe_media_path,
+            selected_lead_ids=req.selected_lead_ids
+        )
         logging.info(f"Outreach Campaign started: ID {campaign_id} with {inserted_logs} recipient leads.")
         return {
             "success": True,
@@ -162,57 +149,13 @@ def start_campaign(req: CampaignRequest):
 @app.get("/api/campaigns", dependencies=[Depends(verify_dashboard_auth)])
 def get_campaigns():
     try:
-        with get_db_cursor(commit_on_success=True) as cur:
-            # 0. Auto-enqueue any unqueued eligible leads into active campaign
-            cur.execute("SELECT id FROM campaigns WHERE status = 'active' ORDER BY created_at DESC LIMIT 1")
-            active_camp = cur.fetchone()
-            if active_camp:
-                active_campaign_id = active_camp['id']
-                cur.execute("""
-                    INSERT INTO campaign_logs (id, campaign_id, lead_id, status)
-                    SELECT gen_random_uuid(), %s, l.id, 'pending'
-                    FROM leads l
-                    WHERE l.contact_username IS NOT NULL
-                      AND l.contact_username != ''
-                      AND LOWER(l.contact_username) NOT LIKE '%%bot'
-                      AND LOWER(l.contact_username) NOT LIKE '%%_bot'
-                      AND LOWER(l.contact_username) NOT IN ('addlist', 'everyone', 'share', 'joinchat', 'setlanguage', 'proxy', 'socks', 'c', 's', 'm', 'i', '4030')
-                      AND (l.description IS NULL OR (l.description NOT LIKE 'Blacklisted entity%%' AND l.description NOT LIKE 'Entity does not exist%%'))
-                      AND l.id NOT IN (SELECT lead_id FROM campaign_logs WHERE campaign_id = %s)
-                    ON CONFLICT (id) DO NOTHING
-                """, (active_campaign_id, active_campaign_id))
+        # 0. Auto-enqueue any unqueued eligible leads into active campaign with priority
+        active_camp = CampaignRepository.get_active_campaign()
+        if active_camp:
+            CampaignRepository.auto_enqueue_eligible_leads(active_camp['id'])
 
-            # 1. Fetch campaigns along with aggregated status counts (including follow-up counts)
-            cur.execute("""
-                SELECT c.id, c.created_at, c.message_text, c.media_path, c.status,
-                       c.followup_enabled, c.followup_message_text, c.followup_delay_days,
-                       COUNT(cl.id) as total_recipients,
-                       COUNT(CASE WHEN cl.status = 'sent' THEN 1 END) as sent_count,
-                       COUNT(CASE WHEN cl.status = 'failed' THEN 1 END) as failed_count,
-                       COUNT(CASE WHEN cl.status = 'skipped' THEN 1 END) as skipped_count,
-                       COUNT(CASE WHEN cl.status = 'pending' THEN 1 END) as pending_count,
-                       COUNT(CASE WHEN cl.followup_status = 'sent' THEN 1 END) as followup_sent_count,
-                       COUNT(CASE WHEN cl.user_replied = TRUE THEN 1 END) as replied_count,
-                       COUNT(CASE WHEN cl.status = 'sent' AND (cl.followup_status IS NULL OR cl.followup_status = 'pending') AND cl.user_replied = FALSE AND cl.sent_at < NOW() - (COALESCE(c.followup_delay_days, 4) || ' days')::INTERVAL THEN 1 END) as followup_ready_count
-                FROM campaigns c
-                LEFT JOIN campaign_logs cl ON c.id = cl.campaign_id
-                GROUP BY c.id, c.created_at, c.message_text, c.media_path, c.status, c.followup_enabled, c.followup_message_text, c.followup_delay_days
-                ORDER BY c.created_at DESC
-            """)
-            campaigns = cur.fetchall()
-            
-            # 2. Fetch latest 50 logs with target channel info
-            cur.execute("""
-                SELECT cl.campaign_id, cl.status, cl.error_message, cl.sent_at,
-                       l.channel_username, l.contact_username, c.message_text
-                FROM campaign_logs cl
-                JOIN campaigns c ON cl.campaign_id = c.id
-                JOIN leads l ON cl.lead_id = l.id
-                ORDER BY cl.sent_at DESC NULLS FIRST, c.created_at DESC
-                LIMIT 50
-            """)
-            logs = cur.fetchall()
-            
+        # 1. Fetch campaigns with priority tiers and 50 granular priority-ordered logs
+        campaigns, logs = CampaignRepository.get_campaign_summaries()
         return {
             "success": True,
             "campaigns": campaigns,
@@ -220,6 +163,21 @@ def get_campaigns():
         }
     except Exception as e:
         logging.error(f"Error fetching campaigns: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/campaigns/{campaign_id}/rerank", dependencies=[Depends(verify_dashboard_auth)])
+def rerank_campaign(campaign_id: str):
+    try:
+        res = CampaignRepository.rerank_campaign_recipients(campaign_id)
+        logging.info(f"Campaign {campaign_id} reranked: {res}")
+        return {
+            "success": True,
+            "campaign_id": campaign_id,
+            "reranked_count": res.get("updated", 0),
+            "tier_counts": res.get("tier_counts", {})
+        }
+    except Exception as e:
+        logging.error(f"Error reranking campaign {campaign_id}: {e}")
         return {"success": False, "error": str(e)}
 
 @app.get("/api/leads", dependencies=[Depends(verify_dashboard_auth)])
@@ -2598,6 +2556,18 @@ def serve_dashboard():
                                 const followupBadge = c.followup_enabled ? `<span class="text-cyan-400 font-bold">${c.followup_sent_count || 0}</span> <span class="text-slate-500 text-[10px]">(${c.followup_ready_count || 0} ready)</span>` : `<span class="text-slate-600">Off</span>`;
                                 const repliedBadge = `<span class="text-teal-400 font-bold">${c.replied_count || 0}</span>`;
                                 
+                                const p0Count = c.p0_pending_count || 0;
+                                const p1Count = c.p1_pending_count || 0;
+                                const p2Count = c.p2_pending_count || 0;
+                                const p3Count = c.p3_pending_count || 0;
+                                const priorityPills = `<div class="flex items-center justify-center gap-1 mt-1 text-[9px]">
+                                    <span class="px-1 py-0.5 rounded bg-rose-500/20 text-rose-300 font-bold" title="P0 Immediate">P0:${p0Count}</span>
+                                    <span class="px-1 py-0.5 rounded bg-amber-500/20 text-amber-300 font-bold" title="P1 Very High">P1:${p1Count}</span>
+                                    <span class="px-1 py-0.5 rounded bg-blue-500/20 text-blue-300" title="P2 High">P2:${p2Count}</span>
+                                    <span class="px-1 py-0.5 rounded bg-slate-700 text-slate-300" title="P3 Normal">P3:${p3Count}</span>
+                                </div>`;
+                                const rerankBtn = `<button onclick="rerankCampaign('${c.id}')" class="mt-1 block mx-auto text-[10px] text-indigo-400 hover:text-indigo-300 underline font-medium">Re-rank</button>`;
+
                                 campaignsBody.insertAdjacentHTML('beforeend', `
                                     <tr class="hover:bg-slate-900/20 transition duration-150">
                                         <td class="px-5 py-4 font-mono font-semibold text-indigo-400 text-xs">${c.id.substring(0, 8)}...</td>
@@ -2609,7 +2579,7 @@ def serve_dashboard():
                                         <td class="px-4 py-4 text-center">${repliedBadge}</td>
                                         <td class="px-4 py-4 text-center font-bold text-rose-400">${c.failed_count}</td>
                                         <td class="px-4 py-4 text-center font-bold text-purple-400">${c.skipped_count || 0}</td>
-                                        <td class="px-4 py-4 text-center font-bold text-amber-400">${c.pending_count}</td>
+                                        <td class="px-4 py-4 text-center font-bold text-amber-400">${c.pending_count} ${priorityPills} ${rerankBtn}</td>
                                         <td class="px-4 py-4 text-center ${statusClass}">${c.status.toUpperCase()}</td>
                                     </tr>
                                 `);
@@ -2630,6 +2600,13 @@ def serve_dashboard():
                                     sentStr = sentDate.toLocaleTimeString(undefined, {hour: '2-digit', minute: '2-digit', second: '2-digit'});
                                 }
 
+                                const prio = l.priority || 'P3';
+                                const score = l.priority_score !== undefined ? l.priority_score : 25;
+                                let prioBadge = `<span class="inline-block px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-700 text-slate-300">${prio} (${score})</span>`;
+                                if (prio === 'P0') prioBadge = `<span class="inline-block px-1.5 py-0.5 rounded text-[10px] font-bold bg-rose-500/30 text-rose-300 border border-rose-500/40">${prio} (${score})</span>`;
+                                else if (prio === 'P1') prioBadge = `<span class="inline-block px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">${prio} (${score})</span>`;
+                                else if (prio === 'P2') prioBadge = `<span class="inline-block px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-500/20 text-blue-300 border border-blue-500/30">${prio} (${score})</span>`;
+
                                 let statusBadge = `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">Pending</span>`;
                                 if (l.status === 'sent') {
                                     statusBadge = `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Sent</span>`;
@@ -2646,7 +2623,10 @@ def serve_dashboard():
                                 logsBody.insertAdjacentHTML('beforeend', `
                                     <tr class="hover:bg-slate-900/20 transition duration-150">
                                         <td class="px-6 py-4 font-semibold text-slate-300">
-                                            <a href="https://t.me/${l.channel_username}" target="_blank" class="hover:underline">@${l.channel_username}</a>
+                                            <div class="flex items-center gap-2">
+                                                ${prioBadge}
+                                                <a href="https://t.me/${l.channel_username}" target="_blank" class="hover:underline">@${l.channel_username}</a>
+                                            </div>
                                         </td>
                                         <td class="px-6 py-4 font-medium text-slate-400">
                                             ${l.contact_username ? `<a href="https://t.me/${l.contact_username}" target="_blank" class="text-indigo-400 hover:underline">@${l.contact_username}</a>` : '<span class="text-slate-600">No Outward Contact</span>'}
@@ -2666,6 +2646,21 @@ def serve_dashboard():
                         logsBody.innerHTML = `<tr><td colspan="6" class="px-6 py-8 text-center text-rose-500">API connection error</td></tr>`;
                     });
             }
+
+            window.rerankCampaign = function(campaignId) {
+                if (!confirm('Re-rank pending recipients based on commercial fit and service need inference?')) return;
+                fetch('/api/campaigns/' + campaignId + '/rerank', { method: 'POST' })
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.success) {
+                            alert('Successfully re-ranked ' + d.reranked_count + ' recipients!');
+                            fetchCampaigns();
+                        } else {
+                            alert('Re-ranking error: ' + d.error);
+                        }
+                    })
+                    .catch(e => alert('Network error: ' + e));
+            };
 
             // Initial Load
             fetchLeads();
