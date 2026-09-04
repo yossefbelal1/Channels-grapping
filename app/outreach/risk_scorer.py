@@ -61,8 +61,10 @@ def calculate_risk_score(
         try:
             db_cursor.execute("SELECT health_score FROM account_health WHERE session_name = %s", (session_name,))
             row = db_cursor.fetchone()
-            if row and 'health_score' in row:
-                health = float(row['health_score'])
+            if row:
+                val = row['health_score'] if isinstance(row, dict) else row[0]
+                if val is not None:
+                    health = float(val)
         except Exception as e:
             logger.error(f"DB error getting health: {e}")
             
@@ -72,16 +74,15 @@ def calculate_risk_score(
         elif health < 70:
             risk += 15
             
-    # 2. Recent FloodWait events
+    # 2. Recent FloodWait events (timestamp column in flood_wait_log)
     try:
         one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
         db_cursor.execute("""
-            SELECT COUNT(*) as fw_count 
-            FROM flood_wait_log 
-            WHERE session_name = %s AND created_at >= %s
+            SELECT COUNT(*) FROM flood_wait_log 
+            WHERE session_name = %s AND "timestamp" >= %s
         """, (session_name, one_hour_ago))
         row = db_cursor.fetchone()
-        fw_count = int(row['fw_count']) if row else 0
+        fw_count = (row[0] if isinstance(row, (list, tuple)) else (row.get('count', 0) if isinstance(row, dict) else 0)) if row else 0
         if fw_count >= 3:
             risk += 30
         elif fw_count >= 1:
@@ -97,12 +98,15 @@ def calculate_risk_score(
             WHERE session_name = %s
         """, (session_name,))
         row = db_cursor.fetchone()
-        if row and row.get('total_sends') and row['total_sends'] > 0:
-            rate = float(row['total_failures']) / float(row['total_sends'])
-            if rate >= 0.3:
-                risk += 25
-            elif rate >= 0.1:
-                risk += 10
+        if row:
+            t_failures = row['total_failures'] if isinstance(row, dict) else row[0]
+            t_sends = row['total_sends'] if isinstance(row, dict) else row[1]
+            if t_sends and t_sends > 0:
+                rate = float(t_failures or 0) / float(t_sends)
+                if rate >= 0.3:
+                    risk += 25
+                elif rate >= 0.1:
+                    risk += 10
     except Exception as e:
         logger.error(f"DB error getting failure rate: {e}")
         
@@ -110,26 +114,28 @@ def calculate_risk_score(
     try:
         db_cursor.execute("SELECT lead_score FROM leads WHERE id = %s", (lead_id,))
         row = db_cursor.fetchone()
-        if row and row.get('lead_score') is not None:
-            l_score = float(row['lead_score'])
-            if l_score < 25:
-                risk += 20
-            elif l_score < 50:
-                risk += 10
-            elif l_score < 75:
-                risk += 5
+        if row:
+            l_val = row['lead_score'] if isinstance(row, dict) else row[0]
+            if l_val is not None:
+                l_score = float(l_val)
+                if l_score < 25:
+                    risk += 20
+                elif l_score < 50:
+                    risk += 10
+                elif l_score < 75:
+                    risk += 5
     except Exception as e:
         logger.error(f"DB error getting lead score: {e}")
         
     # 5. Previous failures to this lead's contact
     try:
         db_cursor.execute("""
-            SELECT COUNT(*) as fail_count 
+            SELECT COUNT(*) 
             FROM campaign_logs 
             WHERE lead_id = %s AND status = 'failed'
         """, (lead_id,))
         row = db_cursor.fetchone()
-        fail_count = int(row['fail_count']) if row else 0
+        fail_count = (row[0] if isinstance(row, (list, tuple)) else (row.get('count', 0) if isinstance(row, dict) else 0)) if row else 0
         if fail_count >= 3:
             risk += 20
         elif fail_count >= 1:

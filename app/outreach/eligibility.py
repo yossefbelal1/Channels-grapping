@@ -4,7 +4,11 @@ from typing import Tuple
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_KEYWORDS = {'addlist', 'everyone', 'share', 'joinchat', 'setlanguage', 'proxy', 'socks', 'c', 's', 'm', 'i', '4030'}
+SYSTEM_KEYWORDS = {
+    'addlist', 'everyone', 'share', 'joinchat', 'setlanguage', 'proxy', 'socks',
+    'c', 's', 'm', 'i', '4030', 'http', 'https', 't', 'me', 'join', 'channel',
+    'group', 'admin', 'contact', 'support', 'null', 'none', 'undefined'
+}
 
 def check_eligibility(
     redis_conn,
@@ -48,17 +52,35 @@ def check_eligibility(
         return "BLOCKED", "Redis failure"
         
     try:
-        # 2. Not in blacklist
-        db_cursor.execute("SELECT 1 FROM blacklist WHERE username = %s OR lead_id = %s", (contact_username, lead_id))
+        # 2. Not in blacklist (entity_username_or_link column in blacklist table)
+        cu_clean = contact_username.lstrip('@')
+        db_cursor.execute("""
+            SELECT 1 FROM blacklist 
+            WHERE entity_username_or_link = %s 
+               OR entity_username_or_link = %s
+               OR entity_username_or_link = %s
+        """, (contact_username, cu_clean, f"@{cu_clean}"))
         if db_cursor.fetchone():
             return "BLOCKED", "Contact is blacklisted"
             
         # 3. Lead status is not 'rejected'
-        db_cursor.execute("SELECT status, next_eligible_at, risk_level FROM leads WHERE id = %s", (lead_id,))
+        db_cursor.execute("SELECT status, next_eligible_at, risk_score FROM leads WHERE id = %s", (lead_id,))
         lead_row = db_cursor.fetchone()
+        status = None
+        next_eligible = None
+        lead_risk_score = None
         if lead_row:
-            if lead_row.get('status') == 'rejected':
-                return "BLOCKED", "Lead is rejected"
+            if isinstance(lead_row, dict):
+                status = lead_row.get('status')
+                next_eligible = lead_row.get('next_eligible_at')
+                lead_risk_score = lead_row.get('risk_score')
+            elif isinstance(lead_row, (list, tuple)):
+                status = lead_row[0] if len(lead_row) > 0 else None
+                next_eligible = lead_row[1] if len(lead_row) > 1 else None
+                lead_risk_score = lead_row[2] if len(lead_row) > 2 else None
+
+        if status == 'rejected':
+            return "BLOCKED", "Lead is rejected"
                 
         # 4. Not already contacted in this campaign
         db_cursor.execute("""
@@ -70,32 +92,39 @@ def check_eligibility(
             
         # 5. Contact username not already messaged via another lead
         db_cursor.execute("""
-            SELECT 1 FROM campaign_logs 
-            WHERE contact_username = %s AND status = 'sent'
-        """, (contact_username,))
+            SELECT 1 FROM campaign_logs cl
+            JOIN leads l ON cl.lead_id = l.id
+            WHERE (l.contact_username = %s OR l.contact_username = %s) AND cl.status = 'sent'
+        """, (contact_username, cu_clean))
         if db_cursor.fetchone():
             return "CONTACTED", "Username already messaged via another lead"
             
         # 6. Per-lead cooldown check
-        if lead_row and lead_row.get('next_eligible_at'):
-            next_eligible = lead_row['next_eligible_at']
+        if next_eligible:
             if next_eligible.tzinfo is None:
                 next_eligible = next_eligible.replace(tzinfo=timezone.utc)
             if next_eligible > datetime.now(timezone.utc):
                 return "COOLDOWN", "Lead is in cooldown"
                 
-        # 7. No permanent failure history for this contact (3+ permanent failures)
+        # 7. No permanent failure history for this contact (3+ failures)
         db_cursor.execute("""
-            SELECT COUNT(*) as fail_count FROM campaign_logs 
-            WHERE contact_username = %s AND status = 'failed' AND is_permanent = TRUE
-        """, (contact_username,))
+            SELECT COUNT(*) FROM campaign_logs cl
+            JOIN leads l ON cl.lead_id = l.id
+            WHERE (l.contact_username = %s OR l.contact_username = %s) AND cl.status = 'failed'
+        """, (contact_username, cu_clean))
         fail_row = db_cursor.fetchone()
-        if fail_row and fail_row.get('fail_count', 0) >= 3:
+        fail_count = 0
+        if fail_row:
+            if isinstance(fail_row, dict):
+                fail_count = fail_row.get('count', 0)
+            elif isinstance(fail_row, (list, tuple)):
+                fail_count = fail_row[0] if len(fail_row) > 0 else 0
+        if fail_count >= 3:
             return "FAILED", "Permanent failure history threshold reached"
             
         # 8. Risk score check
-        if lead_row and lead_row.get('risk_level') in ('HIGH', 'CRITICAL'):
-            return "RISKY", f"Risk level is {lead_row.get('risk_level')}"
+        if lead_risk_score and int(lead_risk_score) > 75:
+            return "RISKY", f"Risk score is {lead_risk_score}"
             
     except Exception as e:
         logger.error(f"DB error checking eligibility: {e}")

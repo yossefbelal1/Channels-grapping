@@ -243,6 +243,23 @@ async def main():
                 conn.close()
                 continue
 
+            from app.outreach.dry_run import is_dry_run, log_dry_run_decision
+            if is_dry_run():
+                log_dry_run_decision(
+                    str(lead_id), str(campaign_id), target_username,
+                    preferred_session, priority, 'ELIGIBLE',
+                    message_text[:100] if message_text else ''
+                )
+                logging.info(f"[DRY-RUN] Outreach message simulated for @{target_username} (associated with @{channel_username}, priority {priority}, score {priority_score}). Skipping live Telegram dispatch.")
+                cur.execute(
+                    "UPDATE campaign_logs SET status = 'skipped', error_message = 'DRY_RUN: Message not sent', sent_at = %s WHERE id = %s",
+                    (datetime.now(), log_id)
+                )
+                conn.commit()
+                cur.close()
+                conn.close()
+                continue
+
             logging.info(f"Attempting outreach message delivery to @{target_username} (associated with channel @{channel_username})...")
 
             success = False

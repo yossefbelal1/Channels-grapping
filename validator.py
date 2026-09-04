@@ -3734,6 +3734,20 @@ class LeadValidator:
         api_hash = user_config["api_hash"]
         session_path = get_session_path(session_name)
         
+        # Check if TelegramManager already has an active connected client for this session
+        if hasattr(self, 'tg_manager') and self.tg_manager and session_name in getattr(self.tg_manager, 'clients', {}):
+            existing_client = self.tg_manager.clients[session_name]
+            if existing_client and existing_client.is_connected():
+                logging.info(f"User Client: Reusing existing connected client from TelegramManager for '{session_name}'.")
+                self.user_client = existing_client
+                try:
+                    me = await self.user_client.get_me()
+                    logging.info(f"User Client: Ready and authorized as @{me.username or me.first_name}")
+                    return True
+                except Exception as me_err:
+                    logging.warning(f"User Client: get_me failed on reused client: {me_err}")
+                    return True
+
         logging.info(f"Initializing Telethon client for user session '{session_name}'...")
         self.user_client = TelegramClient(session_path, api_id, api_hash)
         
@@ -4340,7 +4354,7 @@ class LeadValidator:
                         self.outreach_metrics.record_attempt('user_session', str(campaign_id))
                     
                     elig_status, elig_reason = check_eligibility(
-                        self.redis_conn, conn.cursor(), str(lead_id), str(campaign_id),
+                        self.redis_conn, cur, str(lead_id), str(campaign_id),
                         contact_username or ''
                     )
                     if elig_status != 'ELIGIBLE':
@@ -4357,7 +4371,7 @@ class LeadValidator:
                     
                     # ── Outreach Engine: Risk Scoring ──────────────────────
                     risk_score, risk_level = calculate_risk_score(
-                        self.redis_conn, conn.cursor(), str(lead_id), 'user_session', str(campaign_id)
+                        self.redis_conn, cur, str(lead_id), 'user_session', str(campaign_id)
                     )
                     if risk_level in ('HIGH', 'CRITICAL'):
                         logging.warning(f"Campaign Dispatcher: Lead {lead_id} risk too high: {risk_level} (score={risk_score}). Skipping.")
