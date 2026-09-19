@@ -7,17 +7,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
 
-from fastapi import FastAPI, Query, HTTPException, Security, Depends, Request
+from fastapi import FastAPI, Query, HTTPException, Security, Depends, Request, Response
 from fastapi.security.api_key import APIKeyHeader
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import uvicorn
 from dotenv import load_dotenv
 import redis
+import hmac
+import hashlib
 
 from app.core.db import get_db_connection, get_db_cursor
+from app.core.redis_client import get_redis_client
 from app.core import config
 from app.outreach.metrics import OutreachMetrics
 from app.outreach.emergency import is_outreach_enabled, emergency_stop, emergency_resume, disable_account, enable_account
@@ -43,14 +46,22 @@ app = FastAPI(title="LeadHunter CRM Dashboard")
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
+def _get_session_token(key: str) -> str:
+    """Generates a deterministic HMAC session token for the configured master key."""
+    return hmac.new(key.encode("utf-8"), b"leadhunter_session_token_v1", hashlib.sha256).hexdigest()
+
+
 def verify_dashboard_auth(
+    request: Request = None,
     header_key: Optional[Union[str, Request]] = Security(API_KEY_HEADER),
 ):
     """
-    Authenticates mutating and sensitive API requests strictly via the 'X-API-Key' HTTP header.
+    Authenticates mutating and sensitive API requests strictly via:
+    1. 'X-API-Key' HTTP header (for automated scripts, integrations, and CLI clients).
+    2. 'dashboard_session' HttpOnly cookie (for authenticated browser UI sessions).
     Configured via DASHBOARD_API_KEY.
     Query parameters (e.g. ?api_key=...) are strictly rejected.
-    In production environments, missing or invalid key is strictly rejected.
+    In production environments, missing or invalid credentials are strictly rejected.
     """
     required_key = os.getenv("DASHBOARD_API_KEY", "").strip()
     is_production = os.getenv("ENVIRONMENT", "").lower() == "production"
@@ -65,17 +76,79 @@ def verify_dashboard_auth(
         return True  # Local development fallback when no key is set and not production
 
     actual_key = None
+    req_obj = request
+
     if isinstance(header_key, str):
         actual_key = header_key
     elif hasattr(header_key, "headers"):
+        req_obj = header_key
         actual_key = header_key.headers.get("X-API-Key") or header_key.headers.get("x-api-key")
 
-    if not actual_key or actual_key.strip() != required_key:
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized: Invalid or missing API key. Provide via 'X-API-Key' HTTP header only."
-        )
-    return True
+    if actual_key and actual_key.strip() == required_key:
+        return True
+
+    # Check for session cookie if request object is available
+    if req_obj and hasattr(req_obj, "cookies"):
+        session_cookie = req_obj.cookies.get("dashboard_session")
+        if session_cookie and session_cookie == _get_session_token(required_key):
+            return True
+
+    raise HTTPException(
+        status_code=401,
+        detail="Unauthorized: Invalid or missing API key. Provide via 'X-API-Key' HTTP header or session login."
+    )
+
+
+class LoginRequest(BaseModel):
+    api_key: str
+
+
+@app.post("/api/auth/login")
+async def dashboard_login(payload: LoginRequest, response: Response):
+    """Authenticates browser user and sets a secure HttpOnly session cookie."""
+    required_key = os.getenv("DASHBOARD_API_KEY", "").strip()
+    is_production = os.getenv("ENVIRONMENT", "").lower() == "production"
+
+    if is_production and not required_key:
+        raise HTTPException(status_code=500, detail="DASHBOARD_API_KEY must be configured in production.")
+
+    if required_key and payload.api_key.strip() != required_key:
+        raise HTTPException(status_code=401, detail="Invalid API Key.")
+
+    token = _get_session_token(required_key) if required_key else "dev_session"
+    response.set_cookie(
+        key="dashboard_session",
+        value=token,
+        httponly=True,
+        samesite="lax",
+        secure=(is_production),
+        max_age=86400 * 7
+    )
+    return {"success": True, "message": "Authenticated successfully"}
+
+
+@app.post("/api/auth/logout")
+async def dashboard_logout(response: Response):
+    """Clears the session cookie."""
+    response.delete_cookie(key="dashboard_session", httponly=True, samesite="lax")
+    return {"success": True, "message": "Logged out successfully"}
+
+
+@app.get("/api/auth/status")
+async def dashboard_auth_status(request: Request):
+    """Returns current browser authentication status."""
+    required_key = os.getenv("DASHBOARD_API_KEY", "").strip()
+    is_production = os.getenv("ENVIRONMENT", "").lower() == "production"
+
+    if not required_key and not is_production:
+        return {"authenticated": True, "required": False}
+
+    cookie = request.cookies.get("dashboard_session")
+    if cookie and required_key and cookie == _get_session_token(required_key):
+        return {"authenticated": True, "required": True}
+
+    return {"authenticated": False, "required": True}
+
 
 
 def sanitize_media_path(media_input: Optional[str]) -> Optional[str]:
@@ -690,8 +763,89 @@ def get_graph_network():
         return {"success": False, "error": str(e)}
 
 
+LOGIN_PAGE_HTML = """
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-slate-950">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LeadHunter CRM - Secure Sign In</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>body { font-family: 'Outfit', sans-serif; }</style>
+</head>
+<body class="h-full flex items-center justify-center p-4 bg-gradient-to-br from-slate-950 via-slate-900 to-indigo-950">
+    <div class="w-full max-w-md bg-slate-900/90 border border-slate-800/80 backdrop-blur-xl rounded-2xl p-8 shadow-2xl shadow-indigo-950/50">
+        <div class="flex items-center gap-3 mb-6">
+            <div class="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center text-white font-bold text-lg shadow-lg shadow-indigo-500/30">LH</div>
+            <div>
+                <h1 class="text-xl font-bold text-white tracking-tight">LeadHunter Engine</h1>
+                <p class="text-xs text-slate-400">Restricted Production Dashboard</p>
+            </div>
+        </div>
+        <div id="login-error" class="hidden mb-4 p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-400 text-sm flex items-center gap-2">
+            <span>⚠️</span><span id="login-error-text"></span>
+        </div>
+        <form id="login-form" onsubmit="handleLogin(event)" class="space-y-5">
+            <div>
+                <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">Master API Key</label>
+                <input type="password" id="api-key-input" required autofocus placeholder="Enter DASHBOARD_API_KEY..." class="w-full px-4 py-3 bg-slate-950/80 border border-slate-700/70 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all text-sm" />
+            </div>
+            <button type="submit" id="submit-btn" class="w-full py-3 px-4 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded-xl transition-all shadow-lg shadow-indigo-600/25 flex items-center justify-center gap-2 cursor-pointer">
+                <span>Sign In to Portal</span>
+            </button>
+        </form>
+    </div>
+    <script>
+        async function handleLogin(e) {
+            e.preventDefault();
+            const btn = document.getElementById('submit-btn');
+            const errDiv = document.getElementById('login-error');
+            const errText = document.getElementById('login-error-text');
+            const key = document.getElementById('api-key-input').value;
+            errDiv.classList.add('hidden');
+            btn.disabled = true;
+            btn.innerHTML = '<span>Verifying...</span>';
+            try {
+                const res = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_key: key })
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    window.location.reload();
+                } else {
+                    errText.innerText = data.detail || data.message || 'Invalid API Key.';
+                    errDiv.classList.remove('hidden');
+                    btn.disabled = false;
+                    btn.innerHTML = '<span>Sign In to Portal</span>';
+                }
+            } catch (err) {
+                errText.innerText = 'Network error: ' + err.message;
+                errDiv.classList.remove('hidden');
+                btn.disabled = false;
+                btn.innerHTML = '<span>Sign In to Portal</span>';
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+
 @app.get("/", response_class=HTMLResponse)
-def serve_dashboard():
+def serve_dashboard(request: Request):
+    required_key = os.getenv("DASHBOARD_API_KEY", "").strip()
+    is_production = os.getenv("ENVIRONMENT", "").lower() == "production"
+
+    if is_production and required_key:
+        cookie = request.cookies.get("dashboard_session")
+        if not cookie or cookie != _get_session_token(required_key):
+            return HTMLResponse(content=LOGIN_PAGE_HTML, status_code=200)
+
     html_content = """
     <!DOCTYPE html>
     <html lang="en" class="h-full bg-slate-950">
@@ -767,6 +921,10 @@ def serve_dashboard():
                     <span class="h-2 w-2 rounded-full bg-emerald-400 mr-2 animate-pulse"></span>
                     Validator Workers Online
                 </span>
+                <button onclick="handleLogout()" title="Sign Out of Portal" class="px-3 py-1 text-xs font-semibold text-slate-400 hover:text-rose-400 border border-slate-800 hover:border-rose-500/30 rounded-full transition flex items-center gap-1.5 bg-slate-900/60 cursor-pointer">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
+                    <span>Sign Out</span>
+                </button>
             </div>
         </header>
 
@@ -1624,10 +1782,60 @@ def serve_dashboard():
             const statBlacklist = document.getElementById('stat-blacklist');
             const statPosts = document.getElementById('stat-posts');
 
-            // Event Listeners
+            // Toast Notification Engine
+            function showToast(message, type = 'success') {
+                let container = document.getElementById('toast-container');
+                if (!container) {
+                    container = document.createElement('div');
+                    container.id = 'toast-container';
+                    container.className = 'fixed bottom-5 right-5 z-50 flex flex-col gap-2 pointer-events-none';
+                    document.body.appendChild(container);
+                }
+                const toast = document.createElement('div');
+                const isSuccess = type === 'success';
+                toast.className = `pointer-events-auto px-4 py-3 rounded-xl shadow-2xl flex items-center gap-3 transition-all duration-300 transform translate-y-4 opacity-0 border ${
+                    isSuccess 
+                        ? 'bg-slate-900/95 border-emerald-500/40 text-emerald-300 shadow-emerald-950/40' 
+                        : 'bg-slate-900/95 border-rose-500/40 text-rose-300 shadow-rose-950/40'
+                }`;
+                toast.innerHTML = `
+                    <span class="text-base">${isSuccess ? '✓' : '⚠️'}</span>
+                    <span class="text-sm font-medium text-slate-200">${message}</span>
+                `;
+                container.appendChild(toast);
+                requestAnimationFrame(() => {
+                    toast.classList.remove('translate-y-4', 'opacity-0');
+                });
+                setTimeout(() => {
+                    toast.classList.add('opacity-0', 'translate-y-2');
+                    setTimeout(() => toast.remove(), 300);
+                }, 4000);
+            }
+
+            async function handleLogout() {
+                try {
+                    await fetch('/api/auth/logout', { method: 'POST' });
+                } catch (e) {}
+                window.location.reload();
+            }
+
+            // Debounce helper
+            function debounce(func, wait) {
+                let timeout;
+                return function(...args) {
+                    clearTimeout(timeout);
+                    timeout = setTimeout(() => func.apply(this, args), wait);
+                };
+            }
+
+            // Active AbortController for race condition protection
+            let leadsAbortController = null;
+
+            // Event Listeners with Debounce
+            const debouncedFetchLeads = debounce(fetchLeads, 250);
             minScoreInput.addEventListener('input', (e) => {
                 scoreVal.innerText = e.target.value;
-                fetchLeads();
+                debouncedFetchLeads();
             });
             hasVipCheckbox.addEventListener('change', fetchLeads);
             hasAcMgmtCheckbox.addEventListener('change', fetchLeads);
@@ -1637,6 +1845,12 @@ def serve_dashboard():
 
             // Fetch Data
             function fetchLeads() {
+                // Abort previous in-flight query to prevent race conditions
+                if (leadsAbortController) {
+                    leadsAbortController.abort();
+                }
+                leadsAbortController = new AbortController();
+
                 const minScore = minScoreInput.value;
                 const hasVip = hasVipCheckbox.checked;
                 const hasAcMgmt = hasAcMgmtCheckbox.checked;
@@ -1653,17 +1867,23 @@ def serve_dashboard():
 
                 leadsBody.innerHTML = `
                     <tr>
-                        <td colspan="13" class="px-6 py-8 text-center text-slate-500">Querying databases...</td>
+                        <td colspan="13" class="px-6 py-6">
+                            <div class="flex flex-col gap-3 animate-pulse">
+                                <div class="h-4 bg-slate-800/80 rounded w-full"></div>
+                                <div class="h-4 bg-slate-800/60 rounded w-5/6"></div>
+                                <div class="h-4 bg-slate-800/40 rounded w-4/6"></div>
+                            </div>
+                        </td>
                     </tr>
                 `;
 
-                fetch(url)
+                fetch(url, { signal: leadsAbortController.signal })
                     .then(res => res.json())
                     .then(data => {
                         if (!data.success) {
                             leadsBody.innerHTML = `
                                 <tr>
-                                    <td colspan="13" class="px-6 py-8 text-center text-rose-500 font-medium">Error: ${data.error}</td>
+                                    <td colspan="13" class="px-6 py-8 text-center text-rose-400 font-medium">Error: ${data.error}</td>
                                 </tr>
                             `;
                             return;
@@ -1677,7 +1897,13 @@ def serve_dashboard():
                         if (data.leads.length === 0) {
                             leadsBody.innerHTML = `
                                 <tr>
-                                    <td colspan="13" class="px-6 py-8 text-center text-slate-500">No leads found matching current filters.</td>
+                                    <td colspan="13" class="px-6 py-12 text-center text-slate-400">
+                                        <div class="flex flex-col items-center justify-center gap-2">
+                                            <span class="text-3xl mb-1">🔍</span>
+                                            <p class="font-medium text-slate-300">No leads match current filters</p>
+                                            <p class="text-xs text-slate-500">Try adjusting minimum score or unchecking specific tags.</p>
+                                        </div>
+                                    </td>
                                 </tr>
                             `;
                             return;
@@ -1767,6 +1993,16 @@ def serve_dashboard():
                         // Reset Select All
                         document.getElementById('select-all-leads').checked = false;
                         updateSelectedCount();
+                    })
+                    .catch(err => {
+                        if (err.name === 'AbortError') return;
+                        leadsBody.innerHTML = `
+                            <tr>
+                                <td colspan="13" class="px-6 py-8 text-center text-rose-400 font-medium">
+                                    Failed to load leads: ${err.message || 'Network error'}. Please refresh or try again.
+                                </td>
+                            </tr>
+                        `;
                     });
             }
 
@@ -1792,15 +2028,11 @@ def serve_dashboard():
                 const selectedIds = Array.from(checkboxes).filter(cb => cb.checked).map(cb => cb.value);
 
                 if (!messageText) {
-                    alert("Please type a sales outreach message first!");
+                    showToast("Please type a sales outreach message first!", "error");
                     return;
                 }
                 if (selectedIds.length === 0) {
-                    alert("Please select at least one channel from the table below!");
-                    return;
-                }
-
-                if (!confirm(`Are you sure you want to start this outreach campaign to ${selectedIds.length} channel owners?`)) {
+                    showToast("Please select at least one channel from the table below!", "error");
                     return;
                 }
 
@@ -1809,6 +2041,14 @@ def serve_dashboard():
                     media_path: mediaPath || null,
                     selected_lead_ids: selectedIds
                 };
+
+                const launchBtn = document.querySelector("button[onclick='startCampaign()']");
+                if (launchBtn && launchBtn.disabled) return;
+                if (launchBtn) {
+                    launchBtn.disabled = true;
+                    launchBtn.dataset.origHtml = launchBtn.innerHTML;
+                    launchBtn.innerHTML = `<span>⏳ Dispatching Campaign...</span>`;
+                }
 
                 fetch('/api/campaigns/start', {
                     method: 'POST',
@@ -1820,18 +2060,24 @@ def serve_dashboard():
                 .then(res => res.json())
                 .then(data => {
                     if (data.success) {
-                        alert(`Campaign dispatched successfully! Queued ${data.queued_leads_count} message dispatches.`);
+                        showToast(`Campaign dispatched successfully! Queued ${data.queued_leads_count} message dispatches.`, 'success');
                         document.getElementById('campaign-message').value = "";
                         document.getElementById('campaign-media').value = "";
                         // Refresh grid to reflect status changes when worker processes them
                         fetchLeads();
                     } else {
-                        alert(`Error starting campaign: ${data.error}`);
+                        showToast(`Error starting campaign: ${data.error}`, 'error');
                     }
                 })
                 .catch(err => {
                     console.error("Campaign start error:", err);
-                    alert("Failed to communicate with API server.");
+                    showToast("Failed to communicate with API server.", 'error');
+                })
+                .finally(() => {
+                    if (launchBtn) {
+                        launchBtn.disabled = false;
+                        launchBtn.innerHTML = launchBtn.dataset.origHtml || `<span>🚀 Launch Immediate DM Outreach Campaign</span>`;
+                    }
                 });
             }
 
@@ -2648,18 +2894,18 @@ def serve_dashboard():
             }
 
             window.rerankCampaign = function(campaignId) {
-                if (!confirm('Re-rank pending recipients based on commercial fit and service need inference?')) return;
+                showToast('Re-ranking pending recipients...', 'info');
                 fetch('/api/campaigns/' + campaignId + '/rerank', { method: 'POST' })
                     .then(r => r.json())
                     .then(d => {
                         if (d.success) {
-                            alert('Successfully re-ranked ' + d.reranked_count + ' recipients!');
+                            showToast('Successfully re-ranked ' + d.reranked_count + ' recipients!', 'success');
                             fetchCampaigns();
                         } else {
-                            alert('Re-ranking error: ' + d.error);
+                            showToast('Re-ranking error: ' + d.error, 'error');
                         }
                     })
-                    .catch(e => alert('Network error: ' + e));
+                    .catch(e => showToast('Network error: ' + e, 'error'));
             };
 
             // Initial Load
@@ -2768,12 +3014,7 @@ async def get_prometheus_metrics():
     """Prometheus-compatible plain text metrics endpoint."""
     lines = []
     try:
-        redis_conn = redis.Redis(
-            host=os.getenv('REDIS_HOST', 'localhost'),
-            port=int(os.getenv('REDIS_PORT', 6379)),
-            db=int(os.getenv('REDIS_DB', 0)),
-            decode_responses=True
-        )
+        redis_conn = get_redis_client()
         
         # 1. Queue Depths
         for q in ['queue:critical', 'queue:high', 'queue:normal', 'queue:low', 'queue:dead_letter', 'outreach:high', 'outreach:normal', 'outreach:low', 'recommendations:queue']:
@@ -2784,8 +3025,8 @@ async def get_prometheus_metrics():
         seen_count = redis_conn.scard('seen_channels') or 0
         lines.append(f'lead_seen_channels_total {seen_count}')
 
-        # 3. Account pool health metrics
-        for acc_key in redis_conn.keys("health:*:score"):
+        # 3. Account pool health metrics (using non-blocking scan_iter)
+        for acc_key in redis_conn.scan_iter(match="health:*:score", count=100):
             acc_name = acc_key.split(":")[1] if isinstance(acc_key, str) else acc_key.decode().split(":")[1]
             score_val = redis_conn.get(acc_key) or 100
             lines.append(f'lead_account_health_score{{account="{acc_name}"}} {score_val}')
@@ -2793,40 +3034,35 @@ async def get_prometheus_metrics():
         lines.append(f'# redis_metrics_error: {re_err}')
 
     try:
-        conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        # Total leads
-        cur.execute("SELECT COUNT(*) as total FROM leads")
-        total_leads = cur.fetchone()['total']
-        lines.append(f'lead_channels_total {total_leads}')
-        
-        # Leads by Tier
-        cur.execute("SELECT tier, COUNT(*) as count FROM leads GROUP BY tier")
-        for row in cur.fetchall():
-            tier_name = row['tier'] or 'unclassified'
-            lines.append(f'lead_channels_by_tier{{tier="{tier_name}"}} {row["count"]}')
-        
-        # Total Graph Edges
-        cur.execute("SELECT COUNT(*) as total FROM channel_edges")
-        total_edges = cur.fetchone()['total']
-        lines.append(f'lead_graph_edges_total {total_edges}')
-        
-        # Total Snapshots
-        cur.execute("SELECT COUNT(*) as total FROM channel_snapshots")
-        total_snaps = cur.fetchone()['total']
-        lines.append(f'lead_snapshots_total {total_snaps}')
+        with get_db_cursor(commit_on_success=False) as cur:
+            # Total leads
+            cur.execute("SELECT COUNT(*) as total FROM leads")
+            total_leads = cur.fetchone()['total']
+            lines.append(f'lead_channels_total {total_leads}')
+            
+            # Leads by Tier
+            cur.execute("SELECT tier, COUNT(*) as count FROM leads GROUP BY tier")
+            for row in cur.fetchall():
+                tier_name = row['tier'] or 'unclassified'
+                lines.append(f'lead_channels_by_tier{{tier="{tier_name}"}} {row["count"]}')
+            
+            # Total Graph Edges
+            cur.execute("SELECT COUNT(*) as total FROM channel_edges")
+            total_edges = cur.fetchone()['total']
+            lines.append(f'lead_graph_edges_total {total_edges}')
+            
+            # Total Snapshots
+            cur.execute("SELECT COUNT(*) as total FROM channel_snapshots")
+            total_snaps = cur.fetchone()['total']
+            lines.append(f'lead_snapshots_total {total_snaps}')
 
-        # Crawl Jobs
-        cur.execute("SELECT status, COUNT(*) as count FROM crawl_jobs GROUP BY status")
-        for row in cur.fetchall():
-            lines.append(f'lead_crawl_jobs_total{{status="{row["status"]}"}} {row["count"]}')
-        
-        conn.close()
+            # Crawl Jobs
+            cur.execute("SELECT status, COUNT(*) as count FROM crawl_jobs GROUP BY status")
+            for row in cur.fetchall():
+                lines.append(f'lead_crawl_jobs_total{{status="{row["status"]}"}} {row["count"]}')
     except Exception as db_err:
         lines.append(f'# db_metrics_error: {db_err}')
 
-    from fastapi.responses import PlainTextResponse
     return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
 
@@ -2838,11 +3074,10 @@ async def get_system_health():
     Inspects PostgreSQL, Redis, Queue depths, DLQ, and Account pool status.
     """
     import time
-    from fastapi.responses import JSONResponse
 
     health_data = {
         "status": "healthy",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.utcnow().isoformat() + "Z",
         "components": {
             "database": {"status": "unknown"},
             "redis": {"status": "unknown"},
@@ -2852,14 +3087,12 @@ async def get_system_health():
     }
     is_healthy = True
 
-    # 1. Database Check
+    # 1. Database Check (uses pooled connection)
     t0 = time.time()
     try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
+        with get_db_cursor(commit_on_success=False) as cur:
             cur.execute("SELECT 1;")
             cur.fetchone()
-        conn.close()
         db_latency_ms = round((time.time() - t0) * 1000, 2)
         health_data["components"]["database"] = {
             "status": "healthy",
@@ -2872,16 +3105,10 @@ async def get_system_health():
             "error": str(db_e)
         }
 
-    # 2. Redis & Queue Check
+    # 2. Redis & Queue Check (uses singleton client and non-blocking scan_iter)
     t0 = time.time()
     try:
-        redis_conn = redis.Redis(
-            host=os.getenv('REDIS_HOST', 'localhost'),
-            port=int(os.getenv('REDIS_PORT', 6379)),
-            db=int(os.getenv('REDIS_DB', 0)),
-            decode_responses=True,
-            socket_timeout=2.0
-        )
+        redis_conn = get_redis_client()
         redis_conn.ping()
         redis_latency_ms = round((time.time() - t0) * 1000, 2)
         
@@ -2896,9 +3123,9 @@ async def get_system_health():
         }
         health_data["components"]["queues"] = queues_checked
 
-        # Check Account Pool
+        # Check Account Pool via non-blocking scan_iter
         account_statuses = {}
-        for state_key in redis_conn.keys("account:pool:*:state"):
+        for state_key in redis_conn.scan_iter(match="account:pool:*:state", count=100):
             s_name = state_key.split(":")[2]
             state_val = redis_conn.get(state_key)
             account_statuses[s_name] = state_val

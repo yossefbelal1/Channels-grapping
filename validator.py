@@ -36,6 +36,7 @@ from app.outreach.backpressure import BackpressureManager
 from app.outreach.constants import OutreachPriority, ServiceNeedType
 from app.outreach.commercial_inference import CommercialInferenceEngine
 from app.outreach.priority_engine import OutreachPriorityEngine
+from app.outreach.auto_reply import AutoReplyEngine
 
 # Discovery, Graph, Scoring & Scheduling imports (v5)
 from app.scoring.dimensions import ScoringDimensions, calculate_all_dimensions
@@ -4932,239 +4933,21 @@ class LeadValidator:
                 await asyncio.sleep(15)
 
     def register_auto_reply_handler(self):
-        """
-        Registers real-time Telegram event listener on user_client.
-        When any lead replies to our outreach DM, this automatically:
-        1. Marks user_replied = TRUE in campaign_logs.
-        2. If auto_reply_enabled = TRUE and auto_reply_message_text is set:
-           Simulates natural human typing delay (6-15s) and dispatches the second message (with optional media).
-        3. Marks auto_reply_sent = TRUE so each lead only receives the auto-reply ONCE.
-        """
-        if not hasattr(self, 'user_client') or not self.user_client:
-            return
+        """Forwarder to modular AutoReplyEngine for backward compatibility."""
+        if hasattr(self, 'auto_reply_engine') and self.auto_reply_engine:
+            return self.auto_reply_engine.register_handler()
 
-        client = self.user_client
-
-        @client.on(events.NewMessage(incoming=True))
-        async def handle_incoming_user_message(event):
-            try:
-                # 1. Strictly private 1-on-1 chats only (no groups or channels)
-                if not event.is_private or getattr(event, 'out', False):
-                    return
-
-                sender_id = event.sender_id
-                if not sender_id:
-                    return
-
-                # Exclude self
-                try:
-                    me = await client.get_me()
-                    if me and sender_id == me.id:
-                        return
-                except Exception:
-                    pass
-
-                # Quick sender details
-                sender = await event.get_sender()
-                if not sender or getattr(sender, 'bot', False):
-                    return
-
-                raw_username = (getattr(sender, 'username', None) or '').strip().lstrip('@')
-
-                # Concurrency lock in Redis to avoid processing rapid multiple messages simultaneously
-                lock_key = f"autoreply_lock:{sender_id}"
-                if not self.redis_conn.set(lock_key, "1", nx=True, ex=30):
-                    return
-
-                # Check if already replied to avoid re-querying DB repeatedly for active chats
-                done_key = f"autoreply_done:{sender_id}"
-                if self.redis_conn.get(done_key):
-                    return
-
-                # Query DB to check if this sender is a campaign lead that was messaged
-                self.db_helper.check_connection()
-                conn = self.db_helper.conn
-                with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    cur.execute("""
-                        SELECT cl.id as log_id, cl.campaign_id, cl.lead_id, cl.auto_reply_sent, cl.user_replied,
-                               c.auto_reply_enabled, c.auto_reply_message_text, c.auto_reply_media_path,
-                               l.contact_username, l.channel_username
-                        FROM campaign_logs cl
-                        JOIN campaigns c ON cl.campaign_id = c.id
-                        JOIN leads l ON cl.lead_id = l.id
-                        WHERE cl.status = 'sent'
-                          AND (
-                              (cl.telegram_user_id IS NOT NULL AND cl.telegram_user_id = %s)
-                              OR (%s != '' AND LOWER(l.contact_username) = LOWER(%s))
-                          )
-                        ORDER BY cl.sent_at DESC
-                        LIMIT 1;
-                    """, (sender_id, raw_username, raw_username))
-                    matched_lead = cur.fetchone()
-
-                    if not matched_lead:
-                        # Not an outreach campaign lead, ignore
-                        return
-
-                    log_id = matched_lead['log_id']
-                    auto_reply_already_sent = matched_lead.get('auto_reply_sent', False)
-                    auto_reply_enabled = matched_lead.get('auto_reply_enabled', True)
-                    auto_reply_text = matched_lead.get('auto_reply_message_text')
-                    auto_reply_media = matched_lead.get('auto_reply_media_path')
-
-                    # 2. Mark user_replied = TRUE in campaign_logs
-                    cur.execute("""
-                        UPDATE campaign_logs 
-                        SET user_replied = TRUE, 
-                            telegram_user_id = COALESCE(telegram_user_id, %s) 
-                        WHERE id = %s;
-                    """, (sender_id, log_id))
-                    conn.commit()
-
-                    logging.info(f"Auto-Reply Detector: Detected incoming reply from lead @{raw_username} (ID: {sender_id}, log: {log_id})!")
-
-                    # If already sent before, cache and exit
-                    if auto_reply_already_sent:
-                        self.redis_conn.set(done_key, "1", ex=86400 * 30)
-                        return
-
-                    # If auto-reply is not configured or disabled, record reply only
-                    if not auto_reply_enabled or not auto_reply_text:
-                        logging.info("Auto-Reply Detector: Auto-reply disabled or 2nd message text not configured yet. user_replied recorded.")
-                        return
-
-                    # 3. Simulate natural human reading & typing delay (6 - 15 seconds)
-                    delay_sec = random.randint(6, 15)
-                    logging.info(f"Auto-Reply Dispatcher: Waiting {delay_sec}s human delay before replying to @{raw_username}...")
-                    await asyncio.sleep(delay_sec)
-
-                    # Send typing action
-                    try:
-                        async with client.action(event.chat_id, 'typing'):
-                            await asyncio.sleep(random.randint(2, 4))
-                    except Exception:
-                        pass
-
-                    # 4. Dispatch the second message (with media if present)
-                    media_files = self._resolve_media_list(auto_reply_media) if auto_reply_media else []
-                    if media_files:
-                        if len(media_files) == 1:
-                            await client.send_message(event.chat_id, auto_reply_text, file=media_files[0])
-                        else:
-                            await client.send_file(event.chat_id, media_files, caption=auto_reply_text)
-                    else:
-                        await client.send_message(event.chat_id, auto_reply_text)
-
-                    # 5. Mark auto_reply_sent = TRUE
-                    cur.execute("""
-                        UPDATE campaign_logs 
-                        SET auto_reply_sent = TRUE, 
-                            auto_reply_sent_at = NOW(), 
-                            auto_reply_error = NULL 
-                        WHERE id = %s;
-                    """, (log_id,))
-                    conn.commit()
-
-                    self.redis_conn.set(done_key, "1", ex=86400 * 30)
-                    logging.info(f"Auto-Reply Dispatcher: Successfully sent 2nd message to @{raw_username} (ID: {sender_id})!")
-
-            except errors.FloodWaitError as fw:
-                logging.warning(f"Auto-Reply FloodWait: {fw.seconds}s. Cooling down...")
-                await asyncio.sleep(fw.seconds)
-            except Exception as e:
-                logging.error(f"Auto-Reply handler error: {e}", exc_info=True)
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-
-        logging.info("Auto-Reply real-time event listener registered on User Client.")
+    def unregister_auto_reply_handler(self):
+        """Forwarder to modular AutoReplyEngine for unregistering."""
+        if hasattr(self, 'auto_reply_engine') and self.auto_reply_engine:
+            return self.auto_reply_engine.unregister_handlers()
 
     async def auto_reply_fallback_loop(self):
-        """
-        Safety fallback dispatcher (runs every 60 seconds):
-        Queries DB for any leads where user_replied = TRUE but auto_reply_sent = FALSE.
-        Ensures any lead who replied (even before configuration or during restarts)
-        receives the second message promptly.
-        """
-        logging.info("Auto-Reply fallback dispatcher task started.")
-        while not self.shutdown_event.is_set():
-            try:
-                await asyncio.sleep(60)
-                if not hasattr(self, 'user_client') or not self.user_client or not self.user_client.is_connected():
-                    continue
+        """Forwarder to modular AutoReplyEngine for backward compatibility."""
+        if hasattr(self, 'auto_reply_engine') and self.auto_reply_engine:
+            return await self.auto_reply_engine.fallback_loop()
 
-                self.db_helper.check_connection()
-                conn = self.db_helper.conn
-                with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    cur.execute("""
-                        SELECT id, auto_reply_enabled, auto_reply_message_text, auto_reply_media_path
-                        FROM campaigns WHERE status = 'active' LIMIT 1;
-                    """)
-                    camp = cur.fetchone()
-                    if not camp or not camp.get('auto_reply_enabled') or not camp.get('auto_reply_message_text'):
-                        continue
 
-                    auto_text = camp['auto_reply_message_text']
-                    auto_media = camp['auto_reply_media_path']
-
-                    # Find leads who replied but haven't received the second message
-                    cur.execute("""
-                        SELECT cl.id as log_id, cl.telegram_user_id, l.contact_username
-                        FROM campaign_logs cl
-                        JOIN leads l ON cl.lead_id = l.id
-                        WHERE cl.status = 'sent'
-                          AND cl.user_replied = TRUE
-                          AND cl.auto_reply_sent = FALSE
-                          AND cl.sent_at >= NOW() - INTERVAL '24 hours'
-                        ORDER BY cl.sent_at ASC
-                        LIMIT 5;
-                    """)
-                    unreplied_leads = cur.fetchall()
-
-                    for row in unreplied_leads:
-                        log_id = row['log_id']
-                        target = row['telegram_user_id'] or row['contact_username']
-                        if not target:
-                            continue
-
-                        lock_key = f"autoreply_lock:{target}"
-                        if not self.redis_conn.set(lock_key, "1", nx=True, ex=30):
-                            continue
-
-                        try:
-                            peer = await self.user_client.get_input_entity(target)
-                            logging.info(f"Auto-Reply Fallback: Sending 2nd message to {target} (log {log_id})...")
-                            media_files = self._resolve_media_list(auto_media) if auto_media else []
-                            if media_files:
-                                if len(media_files) == 1:
-                                    await self.user_client.send_message(peer, auto_text, file=media_files[0])
-                                else:
-                                    await self.user_client.send_file(peer, media_files, caption=auto_text)
-                            else:
-                                await self.user_client.send_message(peer, auto_text)
-
-                            cur.execute("""
-                                UPDATE campaign_logs
-                                SET auto_reply_sent = TRUE, auto_reply_sent_at = NOW(), auto_reply_error = NULL
-                                WHERE id = %s;
-                            """, (log_id,))
-                            conn.commit()
-                            self.redis_conn.set(f"autoreply_done:{target}", "1", ex=86400 * 30)
-                            logging.info(f"Auto-Reply Fallback: Successfully sent 2nd message to {target}!")
-                            await asyncio.sleep(random.randint(5, 10))
-
-                        except errors.FloodWaitError as fw:
-                            logging.warning(f"Auto-Reply Fallback FloodWait: {fw.seconds}s.")
-                            await asyncio.sleep(fw.seconds)
-                            break
-                        except Exception as send_err:
-                            logging.error(f"Auto-Reply Fallback error sending to {target}: {send_err}")
-                            cur.execute("UPDATE campaign_logs SET auto_reply_error = %s WHERE id = %s", (str(send_err), log_id))
-                            conn.commit()
-
-            except Exception as fb_err:
-                logging.debug(f"Auto-reply fallback note: {fb_err}")
 
     async def start(self):
         """
@@ -5277,7 +5060,7 @@ class LeadValidator:
         # Only start embedded loop if explicitly enabled for single-process development.
         if os.getenv("ENABLE_EMBEDDED_SCHEDULER", "false").lower() == "true":
             logging.info("Embedded rescan scheduler ENABLED by configuration.")
-            asyncio.create_task(self.rescan_scheduler_loop())
+            self.rescan_scheduler_task = asyncio.create_task(self.rescan_scheduler_loop())
         else:
             logging.info("Embedded rescan scheduler DISABLED. Dedicated worker_scheduler handles scheduling.")
         
@@ -5285,6 +5068,14 @@ class LeadValidator:
         has_user_client = await self.init_user_client()
         
         if has_user_client:
+            # Initialize modular AutoReplyEngine
+            self.auto_reply_engine = AutoReplyEngine(
+                user_client=self.user_client,
+                redis_conn=self.redis_conn,
+                db_helper=self.db_helper,
+                db_conn=self.db_helper.conn,
+                shutdown_event=self.shutdown_event
+            )
             # Start the user auto-joiner background loop
             self.user_joiner_task = asyncio.create_task(self.user_joiner_loop())
             # Start the outreach campaign dispatcher background loop (12 new leads/day)
@@ -5343,30 +5134,29 @@ class LeadValidator:
         except (KeyboardInterrupt, asyncio.CancelledError):
             logging.info("Validator interrupted.")
         finally:
-            if hasattr(self, 'user_joiner_task'):
-                self.user_joiner_task.cancel()
-                try:
-                    await self.user_joiner_task
-                except asyncio.CancelledError:
-                    pass
-            if hasattr(self, 'campaign_dispatcher_task'):
-                self.campaign_dispatcher_task.cancel()
-                try:
-                    await self.campaign_dispatcher_task
-                except asyncio.CancelledError:
-                    pass
-            if hasattr(self, 'followup_dispatcher_task'):
-                self.followup_dispatcher_task.cancel()
-                try:
-                    await self.followup_dispatcher_task
-                except asyncio.CancelledError:
-                    pass
-            if hasattr(self, 'auto_scan_task'):
-                self.auto_scan_task.cancel()
-                try:
-                    await self.auto_scan_task
-                except asyncio.CancelledError:
-                    pass
+            logging.info("Initiating graceful shutdown of background tasks and resources...")
+            tasks_to_cancel = [
+                getattr(self, 'user_joiner_task', None),
+                getattr(self, 'campaign_dispatcher_task', None),
+                getattr(self, 'followup_dispatcher_task', None),
+                getattr(self, 'auto_scan_task', None),
+                getattr(self, 'private_invite_task', None),
+                getattr(self, 'auto_reply_fallback_task', None),
+                getattr(self, 'rescan_scheduler_task', None),
+            ]
+            valid_tasks = [t for t in tasks_to_cancel if t and not t.done()]
+            for t in valid_tasks:
+                t.cancel()
+            if valid_tasks:
+                await asyncio.gather(*valid_tasks, return_exceptions=True)
+                logging.info(f"Gracefully cancelled and awaited {len(valid_tasks)} background task(s).")
+
+            # Unregister auto-reply handlers from Telethon
+            try:
+                self.unregister_auto_reply_handler()
+            except Exception as unreg_err:
+                logging.warning(f"Error unregistering auto reply handler: {unreg_err}")
+
             if hasattr(self, 'user_client') and self.user_client:
                 try:
                     await self.user_client.disconnect()
