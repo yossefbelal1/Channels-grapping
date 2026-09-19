@@ -42,6 +42,7 @@ telegram-saas-key.pem
 !migrate_v7_production_hardening.sql
 !migrate_v8_outreach_intelligence.sql
 !migrate_v9_cross_platform_discovery.sql
+!migrate_v9_auto_reply.sql
 !migrate_v10_campaign_logs_unique.sql
 db_backups/
 postgres_data/
@@ -64,3 +65,8 @@ Thumbs.db
 logs/
 .system_generated/
 scratch/
+scripts/diagnostics/
+deep_audit_results.txt
+report_data.txt
+full_verification_proof.json
+

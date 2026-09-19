@@ -14,7 +14,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
 from bs4 import BeautifulSoup
-from telethon import TelegramClient, errors
+from telethon import TelegramClient, errors, events
 from telethon.tl.types import Chat, Channel
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.functions.messages import CheckChatInviteRequest
@@ -3937,134 +3937,97 @@ class LeadValidator:
                 
                 logging.info(f"Auto Dialog Scanner: Detected {len(admin_channel_ids)} active admin channels/groups.")
 
-                TARGET_FOLDERS = {"My_Channels", "حملات", "No_Post", "Banned", "Only_Post"}
-                
                 from telethon.tl.functions.messages import UpdateDialogFilterRequest
                 import telethon.tl.functions.chatlists as chatlists_fn
                 from telethon.tl.types import DialogFilter, TextWithEntities, InputPeerSelf, InputChatlistDialogFilter
 
                 target_admin_peers = list(admin_peers_map.values()) if admin_peers_map else [InputPeerSelf()]
-                
-                def is_channel_or_chat_peer(peer):
-                    classname = peer.__class__.__name__
-                    return "Channel" in classname or "Chat" in classname
 
                 for f in all_filters:
                     t_str = ""
                     if hasattr(f, 'title') and f.title:
                         t_str = f.title.text if hasattr(f.title, 'text') else str(f.title)
                     
-                    if t_str in TARGET_FOLDERS:
-                        cleaned_peers = []
-                        changed = False
+                    # Strictly and exclusively manage 'My_Channels'.
+                    # NEVER touch 'حملات' (campaigns) or any other user-managed folder!
+                    if t_str == "My_Channels":
+                        old_ids = set(getattr(p, 'channel_id', None) or getattr(p, 'chat_id', None) or getattr(p, 'id', None) for p in getattr(f, 'include_peers', []))
+                        new_ids = set(getattr(p, 'channel_id', None) or getattr(p, 'chat_id', None) or getattr(p, 'id', None) for p in target_admin_peers)
                         
-                        if t_str == "My_Channels":
-                            # My_Channels should strictly and exclusively contain all active admin channels/groups
-                            # Also reset default category flags (groups/broadcasts) to avoid non-admin channels appearing
-                            old_ids = set(getattr(p, 'channel_id', None) or getattr(p, 'chat_id', None) or getattr(p, 'id', None) for p in getattr(f, 'include_peers', []))
-                            new_ids = set(getattr(p, 'channel_id', None) or getattr(p, 'chat_id', None) or getattr(p, 'id', None) for p in target_admin_peers)
-                            
-                            has_flag_issue = (getattr(f, 'groups', False) or getattr(f, 'broadcasts', False) or getattr(f, 'contacts', False) or getattr(f, 'non_contacts', False))
-                            
-                            if old_ids != new_ids or has_flag_issue:
-                                f.include_peers = target_admin_peers
-                                f.exclude_peers = []
-                                f.contacts = False
-                                f.non_contacts = False
-                                f.groups = False
-                                f.broadcasts = False
-                                f.bots = False
-                                changed = True
-                                logging.info(f"Auto Dialog Scanner: Syncing folder 'My_Channels' count from {len(old_ids)} to {len(new_ids)} active admin channels.")
-                        else:
-                            for peer in getattr(f, 'include_peers', []):
-                                if is_channel_or_chat_peer(peer):
-                                    p_id = getattr(peer, 'channel_id', None) or getattr(peer, 'chat_id', None) or getattr(peer, 'id', None)
-                                    if p_id in admin_channel_ids:
-                                        cleaned_peers.append(peer)
-                                    else:
-                                        changed = True
-                                        logging.info(f"Auto Dialog Scanner: Removing non-admin peer {peer.__class__.__name__}(id={p_id}) from folder '{t_str}'")
-                                else:
-                                    cleaned_peers.append(peer)
-                            if changed:
-                                f.include_peers = cleaned_peers if cleaned_peers else [InputPeerSelf()]
+                        has_flag_issue = (getattr(f, 'groups', False) or getattr(f, 'broadcasts', False) or getattr(f, 'contacts', False) or getattr(f, 'non_contacts', False))
                         
-                        if changed:
+                        if old_ids != new_ids or has_flag_issue:
+                            f.include_peers = target_admin_peers
+                            f.exclude_peers = []
+                            f.contacts = False
+                            f.non_contacts = False
+                            f.groups = False
+                            f.broadcasts = False
+                            f.bots = False
                             try:
                                 await self.user_client(UpdateDialogFilterRequest(id=f.id, filter=f))
-                                logging.info(f"Auto Dialog Scanner: Successfully updated folder '{t_str}' on Telegram server.")
+                                logging.info(f"Auto Dialog Scanner: Syncing folder 'My_Channels' count from {len(old_ids)} to {len(new_ids)} active admin channels.")
                             except Exception as update_err:
-                                logging.error(f"Auto Dialog Scanner: Failed to update folder '{t_str}': {update_err}")
+                                logging.error(f"Auto Dialog Scanner: Failed to update folder 'My_Channels': {update_err}")
 
                         # Automatically update Share Link for My_Channels
-                        if t_str == "My_Channels":
-                            try:
-                                folder_input = InputChatlistDialogFilter(filter_id=f.id)
-                                exp_res = await self.user_client(chatlists_fn.GetExportedInvitesRequest(chatlist=folder_input))
-                                invites = getattr(exp_res, 'invites', [])
-                                if invites:
-                                    for inv in invites:
-                                        url = getattr(inv, 'url', '')
-                                        slug = url.split('/')[-1] if '/' in url else url
-                                        await self.user_client(chatlists_fn.EditExportedInviteRequest(
-                                            chatlist=folder_input,
-                                            slug=slug,
-                                            title="My_Channels",
-                                            peers=target_admin_peers
-                                        ))
-                                        logging.info(f"Auto Dialog Scanner: Successfully updated Chatlist Share Link ({url}) with {len(target_admin_peers)} admin channels.")
-                                else:
-                                    export_res = await self.user_client(chatlists_fn.ExportChatlistInviteRequest(
+                        try:
+                            folder_input = InputChatlistDialogFilter(filter_id=f.id)
+                            exp_res = await self.user_client(chatlists_fn.GetExportedInvitesRequest(chatlist=folder_input))
+                            invites = getattr(exp_res, 'invites', [])
+                            if invites:
+                                for inv in invites:
+                                    url = getattr(inv, 'url', '')
+                                    slug = url.split('/')[-1] if '/' in url else url
+                                    await self.user_client(chatlists_fn.EditExportedInviteRequest(
                                         chatlist=folder_input,
+                                        slug=slug,
                                         title="My_Channels",
                                         peers=target_admin_peers
                                     ))
-                                    new_url = getattr(export_res, 'url', None) or getattr(getattr(export_res, 'invite', None), 'url', None)
-                                    logging.info(f"Auto Dialog Scanner: Created new Chatlist Share Link: {new_url}")
-                            except Exception as share_err:
-                                logging.warning(f"Auto Dialog Scanner: Share link sync note: {share_err}")
+                                    logging.info(f"Auto Dialog Scanner: Successfully updated Chatlist Share Link ({url}) with {len(target_admin_peers)} admin channels.")
+                            else:
+                                export_res = await self.user_client(chatlists_fn.ExportChatlistInviteRequest(
+                                    chatlist=folder_input,
+                                    title="My_Channels",
+                                    peers=target_admin_peers
+                                ))
+                                new_url = getattr(export_res, 'url', None) or getattr(getattr(export_res, 'invite', None), 'url', None)
+                                logging.info(f"Auto Dialog Scanner: Created new Chatlist Share Link: {new_url}")
+                        except Exception as share_err:
+                            logging.warning(f"Auto Dialog Scanner: Share link sync note: {share_err}")
 
-                from telethon.tl.types import InputPeerSelf
-                
                 existing_folder_titles = set()
                 for f in all_filters:
-                    if hasattr(f, 'title'):
-                        t_str = f.title.text if hasattr(f.title, 'text') else str(f.title)
-                        existing_folder_titles.add(t_str)
-                
-                for target_title in TARGET_FOLDERS:
-                    if target_title not in existing_folder_titles:
-                        # Determine include_peers
-                        if target_title == "My_Channels":
-                            inc_peers = list(admin_peers_map.values()) if admin_peers_map else [InputPeerSelf()]
-                        else:
-                            inc_peers = [InputPeerSelf()]
-                            
-                        try:
-                            existing_ids = [f.id for f in all_filters if hasattr(f, 'id')]
-                            new_f_id = max(existing_ids) + 1 if existing_ids else 2
-                            if new_f_id < 2:
-                                new_f_id = 2
-                            
-                            new_filter = DialogFilter(
-                                id=new_f_id,
-                                title=TextWithEntities(text=target_title, entities=[]),
-                                pinned_peers=[],
-                                include_peers=inc_peers,
-                                exclude_peers=[],
-                                contacts=False,
-                                non_contacts=False,
-                                groups=False,
-                                broadcasts=False,
-                                bots=False
-                            )
-                            await self.user_client(UpdateDialogFilterRequest(id=new_f_id, filter=new_filter))
-                            all_filters.append(new_filter)
-                            existing_folder_titles.add(target_title)
-                            logging.info(f"Auto Dialog Scanner: Automatically created missing folder '{target_title}' with Saved Messages placeholder.")
-                        except Exception as create_err:
-                            logging.error(f"Auto Dialog Scanner: Failed to create missing folder '{target_title}': {create_err}")
+                    if hasattr(f, 'title') and f.title:
+                        existing_folder_titles.add(f.title.text if hasattr(f.title, 'text') else str(f.title))
+
+                if "My_Channels" not in existing_folder_titles:
+                    inc_peers = list(admin_peers_map.values()) if admin_peers_map else [InputPeerSelf()]
+                    try:
+                        existing_ids = [f.id for f in all_filters if hasattr(f, 'id')]
+                        new_f_id = max(existing_ids) + 1 if existing_ids else 2
+                        if new_f_id < 2:
+                            new_f_id = 2
+                        
+                        new_filter = DialogFilter(
+                            id=new_f_id,
+                            title=TextWithEntities(text="My_Channels", entities=[]),
+                            pinned_peers=[],
+                            include_peers=inc_peers,
+                            exclude_peers=[],
+                            contacts=False,
+                            non_contacts=False,
+                            groups=False,
+                            broadcasts=False,
+                            bots=False
+                        )
+                        await self.user_client(UpdateDialogFilterRequest(id=new_f_id, filter=new_filter))
+                        all_filters.append(new_filter)
+                        existing_folder_titles.add("My_Channels")
+                        logging.info("Auto Dialog Scanner: Automatically created missing folder 'My_Channels'.")
+                    except Exception as create_err:
+                        logging.error(f"Auto Dialog Scanner: Failed to create missing folder 'My_Channels': {create_err}")
                 # ----------------------------------------------------
 
                 new_added = 0
@@ -4565,7 +4528,9 @@ class LeadValidator:
                     if sent_today > 0 and sent_today % burst_size == 0:
                         break_key = f"campaign_break_taken:{today_str}:{sent_today}"
                         if not self.redis_conn.get(break_key):
-                            break_duration = random.randint(600, 1200)
+                            break_min = int(os.getenv("CAMPAIGN_BREAK_MIN", 300))
+                            break_max = int(os.getenv("CAMPAIGN_BREAK_MAX", 600))
+                            break_duration = random.randint(break_min, break_max)
                             logging.info(f"Campaign Dispatcher: Short pause of {break_duration//60} minutes after sending {sent_today} messages...")
                             self.redis_conn.set(break_key, "1", ex=break_duration + 1800)
                             await asyncio.wait_for(self.shutdown_event.wait(), timeout=break_duration)
@@ -4638,6 +4603,16 @@ class LeadValidator:
                     success = False
                     error_message = None
                     
+                    # Anti-Fingerprinting Spintax for initial greeting
+                    greeting_variants = [
+                        "السلام عليكم",
+                        "السلام عليكم ورحمة الله",
+                        "السلام عليكم يا غالي",
+                        "مرحباً، السلام عليكم",
+                        "أهلاً بك، السلام عليكم"
+                    ]
+                    dispatch_text = random.choice(greeting_variants) if message_text and message_text.strip() == "السلام عليكم" else message_text
+
                     try:
                         peer = await user_client.get_entity(target_username)
                         media_files = self._resolve_media_list(media_path)
@@ -4645,15 +4620,15 @@ class LeadValidator:
                             try:
                                 if len(media_files) == 1:
                                     logging.info(f"Campaign Dispatcher: Sending message with single media: {media_files[0]}")
-                                    await user_client.send_message(peer, message_text, file=media_files[0])
+                                    await user_client.send_message(peer, dispatch_text, file=media_files[0])
                                 else:
                                     logging.info(f"Campaign Dispatcher: Sending message with album of {len(media_files)} images...")
-                                    await user_client.send_file(peer, media_files, caption=message_text)
+                                    await user_client.send_file(peer, media_files, caption=dispatch_text)
                             except Exception as media_err:
                                 logging.warning(f"Campaign Dispatcher: Media send failed for @{target_username} ({media_err}). Falling back to text-only pitch...")
-                                await user_client.send_message(peer, message_text)
+                                await user_client.send_message(peer, dispatch_text)
                         else:
-                            await user_client.send_message(peer, message_text)
+                            await user_client.send_message(peer, dispatch_text)
                         success = True
                     except errors.FloodWaitError as flood_err:
                         wait_seconds = flood_err.seconds + 60
@@ -4728,9 +4703,10 @@ class LeadValidator:
                         
                     if success:
                         logging.info(f"Campaign Dispatcher: Successfully sent message to @{target_username}!")
+                        p_user_id = getattr(peer, 'id', None)
                         cur.execute(
-                            "UPDATE campaign_logs SET status = 'sent', sent_at = %s WHERE id = %s",
-                            (datetime.now(), log_id)
+                            "UPDATE campaign_logs SET status = 'sent', sent_at = %s, telegram_user_id = COALESCE(%s, telegram_user_id) WHERE id = %s",
+                            (datetime.now(), p_user_id, log_id)
                         )
                         cur.execute(
                             "UPDATE leads SET status = 'contacted', last_activity = %s WHERE id = %s",
@@ -4955,6 +4931,241 @@ class LeadValidator:
                 logging.error(f"Follow-up Dispatcher error in loop: {loop_err}")
                 await asyncio.sleep(15)
 
+    def register_auto_reply_handler(self):
+        """
+        Registers real-time Telegram event listener on user_client.
+        When any lead replies to our outreach DM, this automatically:
+        1. Marks user_replied = TRUE in campaign_logs.
+        2. If auto_reply_enabled = TRUE and auto_reply_message_text is set:
+           Simulates natural human typing delay (6-15s) and dispatches the second message (with optional media).
+        3. Marks auto_reply_sent = TRUE so each lead only receives the auto-reply ONCE.
+        """
+        if not hasattr(self, 'user_client') or not self.user_client:
+            return
+
+        client = self.user_client
+
+        @client.on(events.NewMessage(incoming=True))
+        async def handle_incoming_user_message(event):
+            try:
+                # 1. Strictly private 1-on-1 chats only (no groups or channels)
+                if not event.is_private or getattr(event, 'out', False):
+                    return
+
+                sender_id = event.sender_id
+                if not sender_id:
+                    return
+
+                # Exclude self
+                try:
+                    me = await client.get_me()
+                    if me and sender_id == me.id:
+                        return
+                except Exception:
+                    pass
+
+                # Quick sender details
+                sender = await event.get_sender()
+                if not sender or getattr(sender, 'bot', False):
+                    return
+
+                raw_username = (getattr(sender, 'username', None) or '').strip().lstrip('@')
+
+                # Concurrency lock in Redis to avoid processing rapid multiple messages simultaneously
+                lock_key = f"autoreply_lock:{sender_id}"
+                if not self.redis_conn.set(lock_key, "1", nx=True, ex=30):
+                    return
+
+                # Check if already replied to avoid re-querying DB repeatedly for active chats
+                done_key = f"autoreply_done:{sender_id}"
+                if self.redis_conn.get(done_key):
+                    return
+
+                # Query DB to check if this sender is a campaign lead that was messaged
+                self.db_helper.check_connection()
+                conn = self.db_helper.conn
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("""
+                        SELECT cl.id as log_id, cl.campaign_id, cl.lead_id, cl.auto_reply_sent, cl.user_replied,
+                               c.auto_reply_enabled, c.auto_reply_message_text, c.auto_reply_media_path,
+                               l.contact_username, l.channel_username
+                        FROM campaign_logs cl
+                        JOIN campaigns c ON cl.campaign_id = c.id
+                        JOIN leads l ON cl.lead_id = l.id
+                        WHERE cl.status = 'sent'
+                          AND (
+                              (cl.telegram_user_id IS NOT NULL AND cl.telegram_user_id = %s)
+                              OR (%s != '' AND LOWER(l.contact_username) = LOWER(%s))
+                          )
+                        ORDER BY cl.sent_at DESC
+                        LIMIT 1;
+                    """, (sender_id, raw_username, raw_username))
+                    matched_lead = cur.fetchone()
+
+                    if not matched_lead:
+                        # Not an outreach campaign lead, ignore
+                        return
+
+                    log_id = matched_lead['log_id']
+                    auto_reply_already_sent = matched_lead.get('auto_reply_sent', False)
+                    auto_reply_enabled = matched_lead.get('auto_reply_enabled', True)
+                    auto_reply_text = matched_lead.get('auto_reply_message_text')
+                    auto_reply_media = matched_lead.get('auto_reply_media_path')
+
+                    # 2. Mark user_replied = TRUE in campaign_logs
+                    cur.execute("""
+                        UPDATE campaign_logs 
+                        SET user_replied = TRUE, 
+                            telegram_user_id = COALESCE(telegram_user_id, %s) 
+                        WHERE id = %s;
+                    """, (sender_id, log_id))
+                    conn.commit()
+
+                    logging.info(f"Auto-Reply Detector: Detected incoming reply from lead @{raw_username} (ID: {sender_id}, log: {log_id})!")
+
+                    # If already sent before, cache and exit
+                    if auto_reply_already_sent:
+                        self.redis_conn.set(done_key, "1", ex=86400 * 30)
+                        return
+
+                    # If auto-reply is not configured or disabled, record reply only
+                    if not auto_reply_enabled or not auto_reply_text:
+                        logging.info("Auto-Reply Detector: Auto-reply disabled or 2nd message text not configured yet. user_replied recorded.")
+                        return
+
+                    # 3. Simulate natural human reading & typing delay (6 - 15 seconds)
+                    delay_sec = random.randint(6, 15)
+                    logging.info(f"Auto-Reply Dispatcher: Waiting {delay_sec}s human delay before replying to @{raw_username}...")
+                    await asyncio.sleep(delay_sec)
+
+                    # Send typing action
+                    try:
+                        async with client.action(event.chat_id, 'typing'):
+                            await asyncio.sleep(random.randint(2, 4))
+                    except Exception:
+                        pass
+
+                    # 4. Dispatch the second message (with media if present)
+                    media_files = self._resolve_media_list(auto_reply_media) if auto_reply_media else []
+                    if media_files:
+                        if len(media_files) == 1:
+                            await client.send_message(event.chat_id, auto_reply_text, file=media_files[0])
+                        else:
+                            await client.send_file(event.chat_id, media_files, caption=auto_reply_text)
+                    else:
+                        await client.send_message(event.chat_id, auto_reply_text)
+
+                    # 5. Mark auto_reply_sent = TRUE
+                    cur.execute("""
+                        UPDATE campaign_logs 
+                        SET auto_reply_sent = TRUE, 
+                            auto_reply_sent_at = NOW(), 
+                            auto_reply_error = NULL 
+                        WHERE id = %s;
+                    """, (log_id,))
+                    conn.commit()
+
+                    self.redis_conn.set(done_key, "1", ex=86400 * 30)
+                    logging.info(f"Auto-Reply Dispatcher: Successfully sent 2nd message to @{raw_username} (ID: {sender_id})!")
+
+            except errors.FloodWaitError as fw:
+                logging.warning(f"Auto-Reply FloodWait: {fw.seconds}s. Cooling down...")
+                await asyncio.sleep(fw.seconds)
+            except Exception as e:
+                logging.error(f"Auto-Reply handler error: {e}", exc_info=True)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
+        logging.info("Auto-Reply real-time event listener registered on User Client.")
+
+    async def auto_reply_fallback_loop(self):
+        """
+        Safety fallback dispatcher (runs every 60 seconds):
+        Queries DB for any leads where user_replied = TRUE but auto_reply_sent = FALSE.
+        Ensures any lead who replied (even before configuration or during restarts)
+        receives the second message promptly.
+        """
+        logging.info("Auto-Reply fallback dispatcher task started.")
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(60)
+                if not hasattr(self, 'user_client') or not self.user_client or not self.user_client.is_connected():
+                    continue
+
+                self.db_helper.check_connection()
+                conn = self.db_helper.conn
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("""
+                        SELECT id, auto_reply_enabled, auto_reply_message_text, auto_reply_media_path
+                        FROM campaigns WHERE status = 'active' LIMIT 1;
+                    """)
+                    camp = cur.fetchone()
+                    if not camp or not camp.get('auto_reply_enabled') or not camp.get('auto_reply_message_text'):
+                        continue
+
+                    auto_text = camp['auto_reply_message_text']
+                    auto_media = camp['auto_reply_media_path']
+
+                    # Find leads who replied but haven't received the second message
+                    cur.execute("""
+                        SELECT cl.id as log_id, cl.telegram_user_id, l.contact_username
+                        FROM campaign_logs cl
+                        JOIN leads l ON cl.lead_id = l.id
+                        WHERE cl.status = 'sent'
+                          AND cl.user_replied = TRUE
+                          AND cl.auto_reply_sent = FALSE
+                          AND cl.sent_at >= NOW() - INTERVAL '24 hours'
+                        ORDER BY cl.sent_at ASC
+                        LIMIT 5;
+                    """)
+                    unreplied_leads = cur.fetchall()
+
+                    for row in unreplied_leads:
+                        log_id = row['log_id']
+                        target = row['telegram_user_id'] or row['contact_username']
+                        if not target:
+                            continue
+
+                        lock_key = f"autoreply_lock:{target}"
+                        if not self.redis_conn.set(lock_key, "1", nx=True, ex=30):
+                            continue
+
+                        try:
+                            peer = await self.user_client.get_input_entity(target)
+                            logging.info(f"Auto-Reply Fallback: Sending 2nd message to {target} (log {log_id})...")
+                            media_files = self._resolve_media_list(auto_media) if auto_media else []
+                            if media_files:
+                                if len(media_files) == 1:
+                                    await self.user_client.send_message(peer, auto_text, file=media_files[0])
+                                else:
+                                    await self.user_client.send_file(peer, media_files, caption=auto_text)
+                            else:
+                                await self.user_client.send_message(peer, auto_text)
+
+                            cur.execute("""
+                                UPDATE campaign_logs
+                                SET auto_reply_sent = TRUE, auto_reply_sent_at = NOW(), auto_reply_error = NULL
+                                WHERE id = %s;
+                            """, (log_id,))
+                            conn.commit()
+                            self.redis_conn.set(f"autoreply_done:{target}", "1", ex=86400 * 30)
+                            logging.info(f"Auto-Reply Fallback: Successfully sent 2nd message to {target}!")
+                            await asyncio.sleep(random.randint(5, 10))
+
+                        except errors.FloodWaitError as fw:
+                            logging.warning(f"Auto-Reply Fallback FloodWait: {fw.seconds}s.")
+                            await asyncio.sleep(fw.seconds)
+                            break
+                        except Exception as send_err:
+                            logging.error(f"Auto-Reply Fallback error sending to {target}: {send_err}")
+                            cur.execute("UPDATE campaign_logs SET auto_reply_error = %s WHERE id = %s", (str(send_err), log_id))
+                            conn.commit()
+
+            except Exception as fb_err:
+                logging.debug(f"Auto-reply fallback note: {fb_err}")
+
     async def start(self):
         """
         Initializes connections and runs the main validation queue loop.
@@ -5021,14 +5232,22 @@ class LeadValidator:
         try:
             self.outreach_metrics = OutreachMetrics(self.redis_conn, self.db_helper.conn)
             self.account_health_mgr = AccountHealthManager(self.redis_conn, self.db_helper.conn)
-            self.adaptive_throttle = AdaptiveThrottle(self.redis_conn, 'user_session')
+            throttle_min = int(os.getenv("CAMPAIGN_JITTER_MIN", 45))
+            throttle_max = int(os.getenv("CAMPAIGN_JITTER_MAX", 120))
+            throttle_default = int(os.getenv("CAMPAIGN_DEFAULT_DELAY", 60))
+            self.adaptive_throttle = AdaptiveThrottle(
+                self.redis_conn, 'user_session',
+                min_delay=throttle_min,
+                max_delay=throttle_max,
+                default_delay=throttle_default
+            )
             self.circuit_breaker = CircuitBreaker(self.redis_conn)
             self.backpressure_mgr = BackpressureManager(self.redis_conn)
             self.reconciliation_mgr = ReconciliationManager(
                 self.redis_conn, self.db_helper.conn
             )
             # Run schema migrations safely
-            for mig_file in ['migrate_channel_edges.sql', 'migrate_outreach_engine.sql', 'migrate_v6_channel_intelligence.sql', 'migrate_v7_production_hardening.sql', 'migrate_v8_outreach_intelligence.sql']:
+            for mig_file in ['migrate_channel_edges.sql', 'migrate_outreach_engine.sql', 'migrate_v6_channel_intelligence.sql', 'migrate_v7_production_hardening.sql', 'migrate_v8_outreach_intelligence.sql', 'migrate_v9_auto_reply.sql']:
                 try:
                     migration_path = os.path.join(os.path.dirname(__file__), mig_file)
                     if os.path.exists(migration_path):
@@ -5076,6 +5295,10 @@ class LeadValidator:
             self.auto_scan_task = asyncio.create_task(self.auto_scan_user_dialogs_loop())
             # Start continuous private invite link resolver
             self.private_invite_task = asyncio.create_task(self.private_invite_resolver_loop())
+            # Register real-time incoming auto-reply listener for replies
+            self.register_auto_reply_handler()
+            # Start fallback auto-reply checker
+            self.auto_reply_fallback_task = asyncio.create_task(self.auto_reply_fallback_loop())
         else:
             logging.warning("User client not initialized. Auto-joiner, Campaign dispatcher, Follow-up dispatcher and Auto Dialog Scanner are disabled.")
         
