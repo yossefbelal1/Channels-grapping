@@ -52,15 +52,17 @@ class WatermarkManager:
                             (str(channel_id),)
                         )
                     row = cur.fetchone()
-                    if row and row[0] is not None:
-                        val = int(row[0])
-                        # Populate Redis cache
-                        if self.redis:
-                            try:
-                                self.redis.setex(self._redis_key(channel_id), 86400, val)
-                            except Exception:
-                                pass
-                        return val
+                    if row:
+                        val_raw = row.get("last_scanned_message_id") if isinstance(row, dict) else row[0]
+                        if val_raw is not None:
+                            val = int(val_raw)
+                            # Populate Redis cache
+                            if self.redis:
+                                try:
+                                    self.redis.setex(self._redis_key(channel_id), 86400, val)
+                                except Exception:
+                                    pass
+                            return val
             except Exception as err:
                 logger.warning(f"Failed to query watermark from DB for channel {channel_id}: {err}")
 
