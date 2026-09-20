@@ -136,7 +136,9 @@ def parse_telegram_link(link: str):
         if username_lower not in junk_usernames:
             # Skip usernames ending in "bot" or "_bot" to avoid resolving bots
             if not (username_lower.endswith('bot') or username_lower.endswith('_bot')):
-                return 'public', username
+                # Pure numeric IDs are raw channel/user IDs, not public usernames
+                if not username_lower.isdigit():
+                    return 'public', username
             
     return None, None
 

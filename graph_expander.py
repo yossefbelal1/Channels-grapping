@@ -364,7 +364,7 @@ class GraphExpander:
         for edge in discovered_edges:
             target_user = edge["target_username"]
             target_clean = str(target_user).lower().lstrip('@').strip()
-            if target_clean == username.lower():
+            if not target_clean or target_clean == username.lower() or target_clean.isdigit():
                 continue
 
             target_id = self.insert_or_get_target_lead(target_clean, child_depth, username)
