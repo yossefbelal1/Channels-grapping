@@ -118,14 +118,43 @@ class CorpusHarvester:
 
         negative_channels = []
         query = """
-        SELECT channel_id, channel_username, title, description, reason
-        FROM leads
-        WHERE status = 'rejected'
-          AND (title IS NOT NULL OR description IS NOT NULL)
-          AND channel_username NOT IN (
+        SELECT 
+            l.id::text AS channel_id,
+            l.channel_username,
+            COALESCE(l.metadata->>'title', l.channel_username) AS title,
+            COALESCE(l.description, '') AS description,
+            COALESCE(l.outreach_priority_reason, l.classification, '') AS reason
+        FROM leads l
+        WHERE l.status = 'rejected'
+          AND (l.forex_intent_score = 0 OR l.forex_intent_score IS NULL)
+          AND (l.commercial_intent_score = 0 OR l.commercial_intent_score IS NULL)
+          AND l.channel_username NOT IN (
               SELECT channel_username FROM corpus_channels WHERE corpus_type = 'gold_admin'
           )
-        ORDER BY id DESC
+          AND (l.description IS NOT NULL AND length(l.description) > 15)
+          AND l.description NOT LIKE '%does not exist%'
+          AND l.description NOT LIKE '%Blacklisted entity%'
+          AND l.description NOT LIKE '%Error during validation%'
+          AND l.description NOT LIKE '%Inactive non-forex channel%'
+          AND lower(l.description) NOT LIKE '%xauusd%'
+          AND lower(l.description) NOT LIKE '%forex%'
+          AND lower(l.description) NOT LIKE '%trading%'
+          AND lower(l.description) NOT LIKE '%trader%'
+          AND lower(l.description) NOT LIKE '%crypto%'
+          AND lower(l.description) NOT LIKE '%gold%'
+          AND lower(l.description) NOT LIKE '%signal%'
+          AND lower(l.description) NOT LIKE '%تداول%'
+          AND lower(l.description) NOT LIKE '%فوركس%'
+          AND lower(l.description) NOT LIKE '%تريدر%'
+          AND lower(l.description) NOT LIKE '%ذهب%'
+          AND lower(l.description) NOT LIKE '%عملات%'
+          AND lower(l.description) NOT LIKE '%تحليل%'
+          AND lower(l.description) NOT LIKE '%صفقات%'
+          AND lower(l.description) NOT LIKE '%توصيات%'
+          AND lower(l.description) NOT LIKE '%بيتكوين%'
+          AND lower(l.description) NOT LIKE '%إشارات%'
+          AND lower(l.description) NOT LIKE '%vip%'
+        ORDER BY l.id DESC
         LIMIT %s;
         """
         try:
