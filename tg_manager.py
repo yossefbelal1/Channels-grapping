@@ -663,6 +663,11 @@ class TelegramManager:
                         self.update_health_score(session_name, 1)
                         return True
 
+                    if self.retry_policy.is_permanent_error(e):
+                        self.pool_mgr.record_request_end(session_name, success=False, error_type=type(e).__name__)
+                        logging.warning(f"Permanent/schema error on '{session_name}': {e}")
+                        raise e
+
                     logging.error(f"Telegram API exception on session '{session_name}': {e}")
                     self.update_health_score(session_name, -5)
                     backoff = min(30, (2 ** retries) * 3)

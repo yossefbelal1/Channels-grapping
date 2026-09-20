@@ -78,12 +78,13 @@ class RetryPolicy:
             "AuthKeyInvalidError",
             "SessionRevokedError",
             "ValueError",
-            "TypeError"
+            "TypeError",
+            "TypeNotFoundError"
         }
         if exc_name in permanent_names:
             return True
 
-        if "not found" in exc_str or "private" in exc_str or "invalid" in exc_str:
+        if "not found" in exc_str or "private" in exc_str or "invalid" in exc_str or "matching constructor id" in exc_str:
             return True
 
         return False
