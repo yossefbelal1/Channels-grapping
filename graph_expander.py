@@ -27,6 +27,7 @@ from app.graph.forward_analyzer import ForwardAnalyzer
 from app.graph.graph_importance import GraphImportanceCalculator
 from app.scheduler.watermark_manager import WatermarkManager
 from app.discovery.provenance import ProvenanceManager
+from app.discovery.relevance_evaluator import RelevanceEvaluator
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -91,6 +92,9 @@ RECS_TITLE_FOREX_SIGNALS = {
     # Arabic Forex Phrases
     'داو جونز', 'الفوركس', 'العملات', 'توصيه', 'تحليل فني',
 }
+
+# Maximum recursive expansion hops for Telegram Similar Channels
+MAX_RECURSIVE_DEPTH = 3
 
 
 class GraphExpander:
@@ -363,16 +367,18 @@ class GraphExpander:
 
         return True
 
-    async def process_recommendations_queue(self, max_items: int = 10) -> int:
+    async def process_recommendations_queue(self, max_items: int = 25) -> int:
         """
         Consumes channels queued to recommendations:queue, calls Telegram's
         get_channel_recommendations, records RECOMMENDATION edges in channel_edges,
-        and pushes new candidates to queue:high.
+        and pushes new candidates to queue:high or queue:normal with recursive depth tracking.
         """
         if not self.redis_conn:
             return 0
 
         processed = 0
+        rec_max_depth = getattr(self, 'max_recursive_depth', MAX_RECURSIVE_DEPTH) or MAX_RECURSIVE_DEPTH
+
         for _ in range(max_items):
             if self.shutdown_event.is_set():
                 break
@@ -385,13 +391,22 @@ class GraphExpander:
                 data = json.loads(raw) if isinstance(raw, str) else raw
                 target_user = data.get("username")
                 source_ch_id = data.get("channel_id")
+                current_depth = int(data.get("depth", 0))
+                source_tier = data.get("tier", "Tier_B")
+
                 if not target_user:
                     continue
 
-                target_clean = str(target_user).lstrip('@').strip()
-                logging.info(f"[GRAPH-REC] Processing recommendation request for @{target_clean}...")
+                # Recursive Depth Gate: Stop expansion beyond rec_max_depth
+                if current_depth >= rec_max_depth:
+                    logging.info(f"[GRAPH-REC] @{target_user} at max recursive depth ({current_depth}/{rec_max_depth}). Halting further hops.")
+                    continue
 
-                # Fetch entity
+                child_depth = current_depth + 1
+                target_clean = str(target_user).lstrip('@').strip()
+                logging.info(f"[GRAPH-REC] Fetching similar channels for @{target_clean} (Depth {current_depth} -> {child_depth})...")
+
+                # Fetch entity without joining
                 async def resolve_peer(cl):
                     return await cl.get_entity(target_clean)
 
@@ -403,39 +418,38 @@ class GraphExpander:
                 if not entity or not getattr(entity, 'broadcast', False):
                     continue
 
-                # Fetch similar recommendations
+                # Fetch official Telegram similar channel recommendations
                 recs = await self.tg_manager.get_channel_recommendations(
                     channel_peer=entity,
                     session_name=self.session_name,
                     shutdown_event=self.shutdown_event
                 )
-                if not recs or not hasattr(recs, 'chats'):
+                if not recs or not hasattr(recs, 'chats') or not recs.chats:
+                    logging.info(f"[GRAPH-REC] No similar channels returned for @{target_clean}.")
                     continue
 
                 new_queued = 0
                 skipped_blacklist = 0
+                existing_edges = 0
+
                 for chat in recs.chats:
                     rec_username = getattr(chat, 'username', None)
                     if not rec_username or rec_username.lower() == target_clean.lower():
                         continue
 
-                    # ── Title-based forex relevance gate ──
-                    rec_title = (getattr(chat, 'title', '') or '').lower()
-                    rec_title_combined = f"{rec_title} {rec_username.lower()}"
+                    channel_link = f"https://t.me/{rec_username}"
+                    rec_title = getattr(chat, 'title', '') or ''
+                    combined_check_text = f"{rec_title} {rec_username}"
 
-                    # Check blacklist: reject stores/gaming/betting immediately
-                    is_blacklisted = any(bl in rec_title_combined for bl in RECS_TITLE_BLACKLIST)
-                    if is_blacklisted:
+                    # 1. Fast Disqualification: Reject unambiguous non-financial spam
+                    is_disq, disq_reason = RelevanceEvaluator.is_hard_disqualified(combined_check_text)
+                    if is_disq:
                         skipped_blacklist += 1
-                        logging.info(f"[GRAPH-REC] SKIPPED @{rec_username} (title='{getattr(chat, 'title', '')}') — blacklisted category")
+                        logging.info(f"[GRAPH-REC] Disqualified @{rec_username} ({disq_reason})")
                         continue
 
-                    # Check forex signals: determine queue priority
-                    has_forex_signal = any(fs in rec_title_combined for fs in RECS_TITLE_FOREX_SIGNALS)
-                    target_queue = "queue:high" if has_forex_signal else "queue:normal"
-
-                    # Insert stub lead
-                    target_id = self.insert_or_get_target_lead(rec_username, 1, target_clean)
+                    # 2. Graph Edge Recording (Always record relationship, even if already seen)
+                    target_id = self.insert_or_get_target_lead(rec_username, child_depth, target_clean)
                     if target_id and source_ch_id:
                         self.edge_mgr.record_edge(
                             source_channel_id=str(source_ch_id),
@@ -445,8 +459,22 @@ class GraphExpander:
                             evidence="Telegram official recommendation"
                         )
 
-                    # Record provenance
-                    channel_link = f"https://t.me/{rec_username}"
+                    # 3. Deduplication: Check if already known in Redis or PostgreSQL
+                    is_already_seen = self.redis_conn.sismember("seen_channels", channel_link)
+                    if is_already_seen:
+                        existing_edges += 1
+                        continue
+
+                    # 4. Multi-Signal Relevance Evaluation
+                    decision = RelevanceEvaluator.evaluate(
+                        title=rec_title,
+                        description="",
+                        username=rec_username,
+                        referrer_is_tier_a=(source_tier == "Tier_A"),
+                        discovery_source="telegram_recommendations"
+                    )
+
+                    # 5. Record Provenance
                     is_new = True
                     if self.provenance_mgr:
                         try:
@@ -458,23 +486,27 @@ class GraphExpander:
                         except Exception as prov_err:
                             logging.debug(f"[GRAPH-REC] Provenance error: {prov_err}")
 
-                    # Deduplicate in seen_channels and enqueue to appropriate queue
-                    if is_new and not self.redis_conn.sismember("seen_channels", channel_link):
-                        self.redis_conn.sadd("seen_channels", channel_link)
-                        payload = json.dumps({
-                            "link": channel_link,
-                            "source": f"@{target_clean}",
-                            "method": "recommendation",
-                            "relation": EdgeRelation.RECOMMENDATION,
-                            "depth": 1,
-                            "discovery_source": "telegram_recommendations"
-                        })
-                        self.redis_conn.rpush(target_queue, payload)
-                        new_queued += 1
+                    # 6. Enqueue to Target Priority Queue with rich recursive metadata
+                    self.redis_conn.sadd("seen_channels", channel_link)
+                    payload = json.dumps({
+                        "link": channel_link,
+                        "source": f"@{target_clean}",
+                        "method": "recommendation",
+                        "relation": EdgeRelation.RECOMMENDATION,
+                        "depth": child_depth,
+                        "discovery_source": "telegram_recommendations",
+                        "relevance_score": decision.relevance_score,
+                        "tier_estimate": decision.tier_estimate
+                    })
+                    self.redis_conn.rpush(decision.target_queue, payload)
+                    new_queued += 1
 
-                logging.info(f"[GRAPH-REC] @{target_clean} recommendations: {len(recs.chats)} found -> {new_queued} queued, {skipped_blacklist} blacklisted")
+                logging.info(
+                    f"[GRAPH-REC] @{target_clean} (Depth {current_depth}): {len(recs.chats)} found -> "
+                    f"{new_queued} new queued, {existing_edges} existing mapped, {skipped_blacklist} disqualified."
+                )
                 processed += 1
-                # Rate limit: 2s delay between recommendation API calls to avoid FloodWait
+                # Rate limit safety: 2s delay between Telegram recommendation API calls
                 await asyncio.sleep(2)
             except Exception as err:
                 logging.warning(f"[GRAPH-REC] Error processing recommendation item: {err}")

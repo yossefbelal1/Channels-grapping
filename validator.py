@@ -50,6 +50,8 @@ from app.graph.forward_analyzer import ForwardAnalyzer
 from app.discovery.provenance import ProvenanceManager
 from app.discovery.taxonomy import classify_text_taxonomy
 from app.discovery.arabic_normalizer import calculate_arabic_letter_ratio, normalize_arabic_text
+from app.discovery.relevance_evaluator import RelevanceEvaluator
+from app.core.membership_governor import MembershipGovernor
 
 
 # Configure logging
@@ -2043,6 +2045,7 @@ class LeadValidator:
         crawl_watermark = 0
         scan_depth_tier = "standard"
         max_posts_budget = 100
+        candidate_depth = 0
         try:
             # Unpack JSON payload if applicable
             if isinstance(link, str) and link.startswith("{") and link.endswith("}"):
@@ -2056,6 +2059,7 @@ class LeadValidator:
                     crawl_watermark = int(data.get("watermark") or 0)
                     scan_depth_tier = data.get("scan_depth_tier", "standard")
                     max_posts_budget = int(data.get("max_posts_budget") or 100)
+                    candidate_depth = int(data.get("depth") or 0)
                 except Exception:
                     pass
 
@@ -3038,23 +3042,17 @@ class LeadValidator:
                 'is_private': (parse_telegram_link(link)[0] == 'private')
             }
             
-            # Evaluate final soft failure rules
-            final_failed_rules = []
-            if not metadata['is_arabic']:
-                final_failed_rules.append("non_arabic")
-            if not metadata['is_forex']:
-                final_failed_rules.append("non_forex")
-
-            failed_count = len(final_failed_rules)
-            if failed_count >= 2:
-                failed_reason = f"failed_multiple_filters:{','.join(final_failed_rules)}"
-                logging.info(f"Channel {actual_link} rejected (SOFT - Final): failed rules {final_failed_rules} (failed_count={failed_count} >= 2). Blacklisting...")
+            # ── Fast Unambiguous Disqualification Check (Betting, Gaming, IPTV, Spam) ──
+            is_disq, disq_term = RelevanceEvaluator.is_hard_disqualified(f"{title} {description} {sample_text}")
+            if is_disq:
+                failed_reason = f"hard_disqualifier:{disq_term}"
+                logging.info(f"Channel {actual_link} rejected (HARD DISQUALIFIER): matched '{disq_term}'. Blacklisting...")
                 self.db_helper.add_to_blacklist(actual_link, failed_reason)
                 self.db_helper.upsert_lead(
                     channel_username=username,
                     member_count=member_count,
                     description=description,
-                    language='English/Other' if 'non_arabic' in final_failed_rules else 'Arabic',
+                    language='Non-Financial Spam',
                     arabic_ratio=metadata['arabic_ratio'],
                     website=contacts['website'],
                     email=contacts['email'],
@@ -3062,23 +3060,16 @@ class LeadValidator:
                     contact_username=contacts['contact_username'],
                     is_group=False,
                     marketplace_score=0,
-                    vip=metadata['vip'],
-                    premium=metadata['premium'],
-                    subscription=metadata['subscription'],
-                    monthly_plans=metadata['monthly_plans'],
-                    yearly_plans=metadata['yearly_plans'],
-                    account_management=metadata['account_management'],
-                    copy_trading=metadata['copy_trading'],
-                    funded_accounts=metadata['funded_accounts'],
-                    usdt_payments=metadata['usdt_payments'],
-                    binance_payments=metadata['binance_payments'],
+                    vip=False, premium=False, subscription=False, monthly_plans=False, yearly_plans=False,
+                    account_management=False, copy_trading=False, funded_accounts=False,
+                    usdt_payments=False, binance_payments=False,
                     lead_score=0,
                     tier='Tier_D',
-                    ai_confidence=metadata['confidence'],
+                    ai_confidence=100,
                     last_activity=None,
                     discovery_source=discovery_source,
                     discovery_method=discovery_method,
-                    arabic_score=0 if 'non_arabic' in final_failed_rules else 15,
+                    arabic_score=0,
                     region_score=0,
                     status='rejected',
                     forex_intent_score=0,
@@ -3086,9 +3077,15 @@ class LeadValidator:
                     high_risk_fraud=False
                 )
                 return
-            else:
-                if failed_count > 0:
-                    logging.info(f"Channel {actual_link} passed final validation with soft failures: {final_failed_rules} (failed_count={failed_count} < 2).")
+
+            # Non-blocking soft rules notice: allow full multi-dimensional scoring engine to evaluate
+            final_failed_rules = []
+            if not metadata['is_arabic']:
+                final_failed_rules.append("non_arabic")
+            if not metadata['is_forex']:
+                final_failed_rules.append("non_forex")
+            if final_failed_rules:
+                logging.info(f"Channel {actual_link} noted soft flags: {final_failed_rules}. Proceeding to multi-signal evaluation.")
 
             # Calculate all scores
             arabic_score = calculate_arabic_score(title, description, sample_text, messages, contacts)
@@ -3098,8 +3095,14 @@ class LeadValidator:
 
             logging.info(f"Scores for @{username}: arabic={arabic_score} forex_intent={forex_intent_score} region={region_score} category={forex_category}")
 
-            # Softened Arabic Gate: Retain mixed Arabic/English trading channels as long as they have Arabic context or Forex intent
-            if arabic_score < 15 and not metadata['is_forex'] and forex_intent_score < 20:
+            # Softened Arabic Gate: Retain mixed Arabic/English trading channels as long as they have Arabic context, Forex intent, or RelevanceEvaluator pass
+            relevance_decision = RelevanceEvaluator.evaluate(
+                title=title or '',
+                description=description or '',
+                recent_posts=[m.text for m in messages if getattr(m, 'text', None)],
+                discovery_source=discovery_source
+            )
+            if arabic_score < 15 and not metadata['is_forex'] and forex_intent_score < 20 and not relevance_decision.is_qualified:
                 logging.info(f"Channel {actual_link} has low Arabic score ({arabic_score}<15) and no Forex intent. Saving as rejected.")
                 self.db_helper.upsert_lead(
                     channel_username=username, member_count=member_count, description=description,
@@ -3314,16 +3317,22 @@ class LeadValidator:
 
                 # 3. Queue validated channels for similar channel recommendations discovery
                 # Fully inclusive for channels from ~400 members to 2M+ members
-                if status_val == 'new' and is_channel and is_forex and scoring_dims.tier in ('Tier_A', 'Tier_B', 'Tier_C'):
+                is_qualified_forex = (
+                    is_forex or 
+                    scoring_dims.forex_score >= 15 or 
+                    scoring_dims.classification in ('HIGH_CONFIDENCE_FOREX', 'LIKELY_FOREX', 'POSSIBLE_FOREX')
+                )
+                if status_val == 'new' and is_channel and is_qualified_forex and scoring_dims.tier in ('Tier_A', 'Tier_B', 'Tier_C'):
                     try:
                         self.redis_conn.rpush("recommendations:queue", json.dumps({
                             "username": username,
                             "channel_id": str(channel_db_id),
                             "tier": scoring_dims.tier,
                             "member_count": member_count,
-                            "lead_score": scoring_dims.final_score
+                            "lead_score": scoring_dims.final_score,
+                            "depth": candidate_depth
                         }))
-                        logging.info(f"[RECOMMENDATIONS] Queued @{username} (tier={scoring_dims.tier}, members={member_count}) to recommendations:queue")
+                        logging.info(f"[RECOMMENDATIONS] Queued @{username} (tier={scoring_dims.tier}, members={member_count}, depth={candidate_depth}) to recommendations:queue")
                     except Exception as err:
                         logging.warning(f"Failed to queue recommendation candidate: {err}")
 
@@ -3349,7 +3358,7 @@ class LeadValidator:
 
             # ── Auto Outreach Enqueue for Newly Discovered Qualified Lead ──────────
             contact_user_str = contacts.get('contact_username')
-            if status_val == 'new' and contact_user_str:
+            if (status_val == 'new' or scoring_dims.tier in ('Tier_A', 'Tier_B', 'Tier_C')) and contact_user_str:
                 try:
                     self.db_helper.check_connection()
                     conn = self.db_helper.conn
@@ -4233,239 +4242,43 @@ class LeadValidator:
 
     async def channel_hygiene_loop(self):
         """
-        Background task that runs every 30 minutes to auto-leave stale channels
-        and keep the account under Telegram's 500 channel/group limit.
-
-        Leave criteria (ALL must be true):
-        - User is NOT admin/creator in the channel
-        - Channel is EITHER:
-          a) Already in leads DB with status validated/rejected/sent/skipped, OR
-          b) Joined > 14 days ago without being recorded
-
-        Safety:
-        - Max 30 leaves per day per session (Redis counter with 24h TTL)
-        - 10-15s delay between each leave to avoid FloodWait
-        - Never leaves admin/creator channels
-        - Never leaves channels with status='new' (pending validation)
+        Background task that runs periodically to manage slot capacity across all accounts
+        using MembershipGovernor.
+        Guarantees:
+        - Proactive capacity target: < 400 channels (100 free slots buffer below 500 limit).
+        - 100% Admin & Creator channel immunity.
+        - Discovery value completion assessment before leaving.
+        - Safe pacing (15-25s delay) and max 30 leaves/day/session.
+        - Multi-account coverage across user_client and tg_manager account pool.
         """
-        import random
-        from telethon.tl.functions.channels import LeaveChannelRequest
-        from datetime import timedelta
+        logging.info("[HYGIENE] Multi-Account Membership Governor loop started. Running every 30 minutes.")
 
-        logging.info("[HYGIENE] Channel hygiene loop started. Will clean stale channels every 30 minutes.")
-
-        if not hasattr(self, 'user_client') or not self.user_client:
-            logging.warning("[HYGIENE] User client not initialized. Exiting task.")
-            return
-
-        MAX_LEAVES_PER_DAY = 30
-        MAX_LEAVES_PER_CYCLE = 15
-        CHANNEL_LIMIT = 480  # Safety margin below 500
-        STALE_DAYS = 14
-
-        session_name = os.environ.get('USER_SESSION', 'user_session')
+        governor = MembershipGovernor(
+            db_conn=self.db_helper.conn if hasattr(self, 'db_helper') else None,
+            redis_conn=self.redis_conn
+        )
 
         while not self.shutdown_event.is_set():
             try:
-                leaves_today_key = f"hygiene:leaves_today:{session_name}"
-                leaves_today = int(self.redis_conn.get(leaves_today_key) or 0)
+                # Assemble all connected clients across the entire process
+                clients_map = {}
+                u_sess = os.environ.get('USER_SESSION', 'user_session')
+                if hasattr(self, 'user_client') and self.user_client:
+                    clients_map[u_sess] = self.user_client
 
-                if leaves_today >= MAX_LEAVES_PER_DAY:
-                    logging.info(f"[HYGIENE] Daily leave limit reached ({leaves_today}/{MAX_LEAVES_PER_DAY}). Skipping cycle.")
+                if hasattr(self, 'tg_manager') and self.tg_manager and hasattr(self.tg_manager, 'clients'):
+                    for sess, cl in self.tg_manager.clients.items():
+                        if sess not in clients_map and cl:
+                            clients_map[sess] = cl
+
+                if clients_map:
+                    results = await governor.run_multi_account_cycle(clients_map, shutdown_event=self.shutdown_event)
+                    logging.info(f"[HYGIENE] Governance cycle complete across {len(clients_map)} accounts: {results}")
                 else:
-                    # 1. Fetch all dialogs
-                    dialogs_active = await self.user_client.get_dialogs(limit=None)
-                    dialogs_archived = []
-                    try:
-                        dialogs_archived = await self.user_client.get_dialogs(limit=None, folder=1)
-                    except Exception:
-                        pass
-
-                    all_dialogs = dialogs_active + dialogs_archived
-                    channels = [d for d in all_dialogs if d.is_channel or d.is_group]
-                    total_joined = len(channels)
-                    logging.info(f"[HYGIENE] Account has {total_joined} channels/groups (limit: 500, target: <{CHANNEL_LIMIT}).")
-
-                    # 2. Categorize channels
-                    admin_channels = []
-                    non_admin_channels = []
-
-                    for d in channels:
-                        entity = d.entity
-                        is_admin = False
-                        if not getattr(entity, 'left', False) and not getattr(entity, 'kicked', False):
-                            if (hasattr(entity, 'creator') and entity.creator) or \
-                               (hasattr(entity, 'admin_rights') and entity.admin_rights is not None):
-                                is_admin = True
-
-                        if is_admin:
-                            admin_channels.append(d)
-                        else:
-                            non_admin_channels.append(d)
-
-                    logging.info(f"[HYGIENE] Admin channels: {len(admin_channels)}, Non-admin: {len(non_admin_channels)}")
-
-                    # 3. Check non-admin channels against DB for staleness
-                    leave_candidates = []
-                    self.db_helper.check_connection()
-                    conn = self.db_helper.conn
-
-                    for d in non_admin_channels:
-                        if len(leave_candidates) >= MAX_LEAVES_PER_CYCLE:
-                            break
-
-                        entity = d.entity
-                        ch_username = getattr(entity, 'username', None)
-                        ch_id = getattr(entity, 'id', None)
-
-                        # Determine join date from dialog
-                        dialog_date = getattr(d, 'date', None)
-                        days_since_join = None
-                        if dialog_date:
-                            from datetime import timezone as tz
-                            now_utc = datetime.now(tz.utc)
-                            if dialog_date.tzinfo is None:
-                                dialog_date = dialog_date.replace(tzinfo=tz.utc)
-                            days_since_join = (now_utc - dialog_date).days
-
-                        # Check DB status
-                        db_status = None
-                        if ch_username:
-                            try:
-                                with conn.cursor() as cur:
-                                    cur.execute(
-                                        "SELECT status FROM leads WHERE LOWER(channel_username) = LOWER(%s) LIMIT 1",
-                                        (ch_username,)
-                                    )
-                                    row = cur.fetchone()
-                                    if row:
-                                        db_status = row[0]
-                            except Exception as db_err:
-                                logging.debug(f"[HYGIENE] DB lookup error for @{ch_username}: {db_err}")
-                                try:
-                                    conn.rollback()
-                                except Exception:
-                                    pass
-
-                        # Decision: should we leave?
-                        reason = None
-
-                        # Already processed in DB (validated, rejected, sent, skipped, failed)
-                        if db_status and db_status in ('validated', 'rejected', 'sent', 'skipped', 'failed'):
-                            reason = f"already_{db_status}"
-
-                        # Stale: joined > 14 days ago and not a 'new' lead pending validation
-                        elif days_since_join is not None and days_since_join >= STALE_DAYS:
-                            if db_status != 'new':  # Don't leave channels pending validation
-                                reason = f"stale_{days_since_join}d"
-
-                        # Pressure-based: if over limit, leave oldest non-admin non-new channels
-                        elif total_joined > CHANNEL_LIMIT and db_status is None:
-                            if days_since_join is not None and days_since_join >= 7:
-                                reason = f"over_limit_{total_joined}"
-
-                        if reason:
-                            leave_candidates.append({
-                                'dialog': d,
-                                'username': ch_username or str(ch_id),
-                                'reason': reason,
-                                'days': days_since_join,
-                                'db_status': db_status,
-                            })
-
-                    # 4. Also check expired memberships from telegram_pool
-                    if hasattr(self, 'account_pool') and self.account_pool:
-                        try:
-                            expired = self.account_pool.get_expired_memberships(limit=10)
-                            for mem in expired:
-                                mem_username = mem.get('channel_username', '')
-                                # Avoid duplicates with dialog-based candidates
-                                already_in = any(c['username'].lower() == mem_username.lower() for c in leave_candidates if mem_username)
-                                if not already_in and len(leave_candidates) < MAX_LEAVES_PER_CYCLE:
-                                    leave_candidates.append({
-                                        'dialog': None,
-                                        'username': mem_username,
-                                        'reason': 'membership_ttl_expired',
-                                        'days': None,
-                                        'db_status': None,
-                                        'membership_id': mem.get('id'),
-                                        'account_session': mem.get('account_session'),
-                                    })
-                        except Exception as mem_err:
-                            logging.debug(f"[HYGIENE] Error checking expired memberships: {mem_err}")
-
-                    # 5. Execute leaves safely
-                    left_count = 0
-                    for candidate in leave_candidates:
-                        if self.shutdown_event.is_set():
-                            break
-
-                        # Re-check daily limit
-                        leaves_today = int(self.redis_conn.get(leaves_today_key) or 0)
-                        if leaves_today >= MAX_LEAVES_PER_DAY:
-                            logging.info(f"[HYGIENE] Daily limit reached mid-cycle. Stopping.")
-                            break
-
-                        try:
-                            username = candidate['username']
-                            reason = candidate['reason']
-
-                            if candidate['dialog']:
-                                # Leave via dialog entity
-                                entity = candidate['dialog'].entity
-                                await self.user_client(LeaveChannelRequest(entity))
-                            else:
-                                # Leave via username resolution (for membership TTL entries)
-                                try:
-                                    ch_entity = await self.user_client.get_entity(username)
-                                    await self.user_client(LeaveChannelRequest(ch_entity))
-                                except Exception:
-                                    logging.debug(f"[HYGIENE] Could not resolve @{username} for leave")
-                                    # Mark as left in membership table anyway
-                                    if candidate.get('membership_id') and hasattr(self, 'account_pool') and self.account_pool:
-                                        self.account_pool.mark_left(candidate['membership_id'])
-                                    continue
-
-                            left_count += 1
-
-                            # Update Redis counter
-                            pipe = self.redis_conn.pipeline()
-                            pipe.incr(leaves_today_key)
-                            pipe.expire(leaves_today_key, 86400)  # 24h TTL
-                            pipe.execute()
-
-                            # Mark membership as LEFT if applicable
-                            if candidate.get('membership_id') and hasattr(self, 'account_pool') and self.account_pool:
-                                self.account_pool.mark_left(candidate['membership_id'])
-
-                            logging.info(
-                                f"[HYGIENE] LEFT @{username} "
-                                f"(reason={reason}, days_joined={candidate.get('days', '?')}, "
-                                f"db_status={candidate.get('db_status', 'none')})"
-                            )
-
-                            # Rate-limited delay: 10-15s between leaves
-                            await asyncio.sleep(10 + random.uniform(0, 5))
-
-                        except Exception as leave_err:
-                            err_str = str(leave_err).lower()
-                            if 'floodwait' in err_str or 'flood' in err_str:
-                                logging.warning(f"[HYGIENE] FloodWait while leaving @{candidate['username']}. Stopping cycle.")
-                                break
-                            elif 'not_participant' in err_str or 'user_not_participant' in err_str:
-                                logging.debug(f"[HYGIENE] Already not in @{candidate['username']}")
-                                if candidate.get('membership_id') and hasattr(self, 'account_pool') and self.account_pool:
-                                    self.account_pool.mark_left(candidate['membership_id'])
-                            else:
-                                logging.warning(f"[HYGIENE] Error leaving @{candidate['username']}: {leave_err}")
-
-                    logging.info(
-                        f"[HYGIENE] Cycle complete. Left {left_count} channels. "
-                        f"Remaining: ~{total_joined - left_count} channels/groups."
-                    )
+                    logging.debug("[HYGIENE] No connected clients available for governance cycle.")
 
             except Exception as hygiene_err:
-                logging.error(f"[HYGIENE] Unexpected error in hygiene loop: {hygiene_err}", exc_info=True)
+                logging.error(f"[HYGIENE] Unexpected error in governance loop: {hygiene_err}", exc_info=True)
 
             # Sleep 30 minutes before next cycle
             try:

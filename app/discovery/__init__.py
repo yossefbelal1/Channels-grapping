@@ -17,6 +17,7 @@ from app.discovery.taxonomy import (
 )
 from app.discovery.checkpoint import SearchCheckpointManager
 from app.discovery.provenance import ProvenanceManager
+from app.discovery.relevance_evaluator import RelevanceEvaluator, RelevanceDecision
 
 __all__ = [
     "normalize_arabic_text",
@@ -29,5 +30,7 @@ __all__ = [
     "get_category_keywords",
     "classify_text_taxonomy",
     "SearchCheckpointManager",
-    "ProvenanceManager"
+    "ProvenanceManager",
+    "RelevanceEvaluator",
+    "RelevanceDecision"
 ]

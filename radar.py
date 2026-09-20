@@ -255,7 +255,10 @@ async def slow_joiner_task(tg_manager: TelegramManager, redis_conn: redis.Redis,
 async def leave_rejected_groups_loop(tg_manager: TelegramManager, redis_conn: redis.Redis, shutdown_event: asyncio.Event):
     """
     Periodically checks for groups in rejected_groups_set and leaves them to prevent queue flooding.
+    Strictly guarantees 100% immunity for Admin and Creator groups/channels.
     """
+    from app.core.membership_governor import MembershipGovernor
+
     logging.info("Leave Rejected Groups background task initialized.")
     while not shutdown_event.is_set():
         try:
@@ -271,6 +274,11 @@ async def leave_rejected_groups_loop(tg_manager: TelegramManager, redis_conn: re
                             if dialog.is_group:
                                 entity = dialog.entity
                                 username = getattr(entity, 'username', None)
+
+                                # 100% Admin / Creator Immunity
+                                if MembershipGovernor.is_admin_or_creator(entity):
+                                    continue
+
                                 # Check if group username is rejected
                                 is_rejected = False
                                 if username and username.lower() in rejected_groups:
@@ -281,6 +289,8 @@ async def leave_rejected_groups_loop(tg_manager: TelegramManager, redis_conn: re
                                     try:
                                         await client(LeaveChannelRequest(entity))
                                         logging.info(f"Successfully left group: @{username or entity.id}")
+                                        # Safe pacing between leaves
+                                        await asyncio.sleep(15)
                                     except Exception as le:
                                         logging.error(f"Error leaving group @{username or entity.id}: {le}")
                     except Exception as d_err:

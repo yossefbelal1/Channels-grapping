@@ -11,7 +11,7 @@ stdin, stdout, stderr = ssh.exec_command('docker ps --filter "name=worker_valida
 print("=== Container Status ===")
 print(stdout.read().decode())
 
-stdin, stdout, stderr = ssh.exec_command('docker logs --tail 40 worker_validator')
+stdin, stdout, stderr = ssh.exec_command('docker logs --tail 40 worker_validator 2>&1')
 print("=== worker_validator logs ===")
 print(stdout.read().decode())
 
