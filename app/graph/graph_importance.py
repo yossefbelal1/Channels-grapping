@@ -125,23 +125,37 @@ class GraphImportanceCalculator:
                 """, (str(channel_id),))
                 inbound_rows = cur.fetchall()
 
-                in_degree = sum(r[1] for r in inbound_rows)
-                rel_types = set(str(r[0]).lower() for r in inbound_rows)
-                recs_in = sum(r[1] for r in inbound_rows if str(r[0]).lower() in ('recommendation', 'recommended'))
-                fwds_in = sum(r[1] for r in inbound_rows if str(r[0]).lower() in ('forwarded_from', 'forward', 'forwarded'))
-                mentions_in = sum(r[1] for r in inbound_rows if str(r[0]).lower() in ('mention', 'channel_mention'))
+                in_degree = 0
+                rel_types = set()
+                recs_in = 0
+                fwds_in = 0
+                mentions_in = 0
+                for r in inbound_rows:
+                    rel = (r["relation_type"] if isinstance(r, dict) else r[0]) or ""
+                    cnt = (r["count"] if isinstance(r, dict) else r[1]) or 0
+                    rel_lower = str(rel).lower()
+                    in_degree += cnt
+                    rel_types.add(rel_lower)
+                    if rel_lower in ('recommendation', 'recommended'):
+                        recs_in += cnt
+                    elif rel_lower in ('forwarded_from', 'forward', 'forwarded'):
+                        fwds_in += cnt
+                    elif rel_lower in ('mention', 'channel_mention'):
+                        mentions_in += cnt
 
                 # Outbound edges
                 cur.execute("""
-                    SELECT COUNT(*) FROM channel_edges WHERE source_channel_id = %s;
+                    SELECT COUNT(*) as count FROM channel_edges WHERE source_channel_id = %s;
                 """, (str(channel_id),))
-                out_degree = cur.fetchone()[0] or 0
+                out_row = cur.fetchone()
+                out_degree = (out_row["count"] if isinstance(out_row, dict) else out_row[0]) if out_row else 0
 
                 # Discovery source count
                 cur.execute("""
-                    SELECT COUNT(DISTINCT source_type) FROM channel_sources WHERE channel_id = %s;
+                    SELECT COUNT(DISTINCT source_type) as count FROM channel_sources WHERE channel_id = %s;
                 """, (str(channel_id),))
-                src_count = cur.fetchone()[0] or 1
+                src_row = cur.fetchone()
+                src_count = (src_row["count"] if isinstance(src_row, dict) else src_row[0]) if src_row else 1
 
                 res = self.calculate_importance_score(
                     in_degree=in_degree,
