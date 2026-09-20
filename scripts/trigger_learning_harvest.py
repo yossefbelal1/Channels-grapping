@@ -12,14 +12,21 @@ from app.learning.knowledge_model import KnowledgeModel
 
 def main():
     db_url = os.getenv("DATABASE_URL")
-    if not db_url:
-        print("DATABASE_URL not set")
-        sys.exit(1)
-
-    redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
-
-    conn = psycopg2.connect(db_url)
+    if db_url:
+        conn = psycopg2.connect(db_url)
+    else:
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST", "postgres"),
+            port=int(os.getenv("DB_PORT", 5432)),
+            dbname=os.getenv("DB_NAME", "leadhunter_db"),
+            user=os.getenv("DB_USER", "postgres"),
+            password=os.getenv("DB_PASSWORD", "leadhunter_pass")
+        )
     print("Connected to PostgreSQL database.")
+
+    redis_host = os.getenv("REDIS_HOST", "redis")
+    redis_port = int(os.getenv("REDIS_PORT", 6379))
+    redis_url = os.getenv("REDIS_URL", f"redis://{redis_host}:{redis_port}/0")
 
     # 1. Harvest negative corpus
     print("Harvesting negative corpus from rejected non-trading leads...")
