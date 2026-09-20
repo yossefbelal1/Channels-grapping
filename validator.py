@@ -4424,8 +4424,7 @@ class LeadValidator:
             return
             
         user_client = self.user_client
-        import time
-        import random
+        logging.info("Campaign Dispatcher: Outreach is strictly bound to Tamer's account (user_session). Other accounts are discovery helpers only.")
         
         while not self.shutdown_event.is_set():
             # ── Outreach Engine: Emergency & Circuit Breaker Check ──────────
@@ -4785,7 +4784,7 @@ class LeadValidator:
                         logging.info(f"Campaign Dispatcher: Successfully sent message to @{target_username}!")
                         p_user_id = getattr(peer, 'id', None)
                         cur.execute(
-                            "UPDATE campaign_logs SET status = 'sent', sent_at = %s, telegram_user_id = COALESCE(%s, telegram_user_id) WHERE id = %s",
+                            "UPDATE campaign_logs SET status = 'sent', sent_at = %s, telegram_user_id = COALESCE(%s, telegram_user_id), account_used = 'user_session' WHERE id = %s",
                             (datetime.now(), p_user_id, log_id)
                         )
                         cur.execute(

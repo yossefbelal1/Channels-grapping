@@ -123,3 +123,18 @@ class TestRelevanceEvaluator:
             referrer_is_tier_a=True
         )
         assert boosted_decision.relevance_score >= base_decision.relevance_score + 15
+
+    def test_crypto_arabic_channel_qualification(self):
+        """Crypto channels with BTC/ETH signals, Binance/Bybit or leverage should qualify for high queue."""
+        decision = RelevanceEvaluator.evaluate(
+            title="توصيات بينانس كريبتو VIP",
+            description="تحليل وتوصيات عملات رقمية وفيوتشر على منصة بينانس وباي بيت. صفقات BTC و ETH مع إدارة مخاطر.",
+            recent_posts=[
+                "صفقة شراء BTCUSDT دخول 62500 أهداف 64000 و 66000 وقف خسارة 61200 رافعة 10x",
+                "تحليل الايثيريوم ETH: كسر منطقة المقاومة والهدف القادم 2750$"
+            ]
+        )
+        assert decision.is_qualified is True
+        assert decision.relevance_score >= 60
+        assert decision.target_queue == "queue:high"
+

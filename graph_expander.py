@@ -80,6 +80,10 @@ RECS_TITLE_FOREX_SIGNALS = {
     # Core Forex
     'forex', 'فوركس', 'gold', 'ذهب', 'الذهب', 'دهب', 'xauusd', 'eurusd',
     'gbpusd', 'usdjpy', 'us30', 'nasdaq', 'ناسداك',
+    # Crypto Assets & Platforms
+    'crypto', 'كريبتو', 'بيتكوين', 'bitcoin', 'btc', 'eth', 'ethereum',
+    'solana', 'sol', 'عملات رقمية', 'العملات الرقمية', 'binance', 'بينانس',
+    'bybit', 'باي بيت', 'فيوتشر', 'futures', 'سبوت', 'spot', 'usdt',
     # Trading Activity
     'trading', 'تداول', 'trade', 'trader', 'تريد', 'تريدر',
     'توصيات', 'signals', 'signal', 'صفقات', 'صفقة',

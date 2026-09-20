@@ -34,19 +34,29 @@ HARD_DISQUALIFIERS: List[str] = [
     "فيزا وهمية", "هكر", "بروكسي", "crack", "identity logs", "ssn"
 ]
 
-# Common Currency Tickers and Trading Assets
+# Common Currency Tickers and Trading Assets (Forex & Crypto)
 CORE_CURRENCY_PAIRS: List[str] = [
+    # Forex Fiat Pairs & Commodities
     "xauusd", "xau/usd", "eurusd", "eur/usd", "gbpusd", "gbp/usd",
     "usdjpy", "usd/jpy", "usdcad", "usd/cad", "audusd", "aud/usd",
     "nzdusd", "nzd/usd", "usdchf", "usd/chf", "us30", "dow jones",
-    "nas100", "nasdaq", "dax40", "dax", "sp500", "wti", "brent"
+    "nas100", "nasdaq", "dax40", "dax", "sp500", "wti", "brent",
+    # Crypto Pairs & Major Assets
+    "btcusdt", "btc/usdt", "btc/usd", "ethusdt", "eth/usdt", "eth/usd",
+    "solusdt", "sol/usdt", "xrpusdt", "bnbusdt", "dogeusdt",
+    "bitcoin", "بيتكوين", "ethereum", "ايثيريوم", "solana", "سولانا",
+    "crypto", "كريبتو", "عملات رقمية", "العملات الرقمية",
+    "binance", "بينانس", "bybit", "باي بيت", "okx", "فيوتشر", "futures",
+    "سبوت", "spot"
 ]
 
-# Signal Technical Patterns
+# Signal Technical Patterns (Forex & Crypto)
 SIGNAL_SYNTAX_REGEX = re.compile(
     r'\b(sl\s*[:=-]?\s*\d+|tp\s*[:=-]?\s*\d+|tp[1-4]\s*[:=-]?\s*\d+|'
     r'entry\s*[:=-]?\s*\d+|stop\s*loss|take\s*profit|'
-    r'هدف\s*[1-4]?|وقف\s*خسارة|دخول\s*صفقة|شراء\s*من|بيع\s*من)\b',
+    r'هدف\s*[1-4]?|وقف\s*خسارة|دخول\s*صفقة|شراء\s*من|بيع\s*من|'
+    r'long|short|لونج|شورت|leverage|رافعة\s*\d*x?|'
+    r'cross|isolated|target\s*[1-4]?|dca)\b',
     re.IGNORECASE
 )
 

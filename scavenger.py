@@ -47,17 +47,20 @@ logging.basicConfig(
     ]
 )
 
-# Top Trading Hashtags for Global Post Search
+# Top Trading Hashtags for Global Post Search (Forex & Crypto)
 POPULAR_HASHTAGS = [
     "ذهب", "فوركس", "xauusd", "توصيات_ذهب", "تداول_العملات",
     "توصيات_فوركس", "smc", "ict", "تحليل_فني", "سكالبينج",
-    "حسابات_ممولة", "ادارة_محافظ", "نسخ_صفقات", "بيتكوين"
+    "حسابات_ممولة", "ادارة_محافظ", "نسخ_صفقات", "بيتكوين",
+    "كريبتو", "عملات_رقمية", "بينانس", "توصيات_كريبتو", "crypto", "btc"
 ]
 
-# High-Intent Post Search Phrases
+# High-Intent Post Search Phrases (Forex & Crypto)
 POPULAR_POST_QUERIES = [
     "XAUUSD", "Forex", "Forex signals", "gold signals",
-    "توصيات ذهب", "توصيات فوركس", "إشارات فوركس", "تداول"
+    "توصيات ذهب", "توصيات فوركس", "إشارات فوركس", "تداول",
+    "توصيات كريبتو", "توصيات فيوتشر", "BTCUSDT", "Crypto signals",
+    "تحليل بيتكوين", "صفقات عملات رقمية"
 ]
 
 
