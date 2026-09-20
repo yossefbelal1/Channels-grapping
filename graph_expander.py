@@ -51,6 +51,47 @@ JUNK_USERNAMES = {
 
 PROMO_KEYWORDS = ["تبادل", "إعلان", "اشتركوا", "انضموا", "قناتنا", "برعاية", "vip", "توصيات"]
 
+# ── Recommendation Title Filters ──────────────────────────────────────────────
+# Quick title-based forex relevance gate for Similar Channels recommendations.
+# Applied BEFORE enqueue to prevent stores/gaming/betting from entering pipeline.
+RECS_TITLE_BLACKLIST = {
+    # Betting & Gambling
+    '1xbet', 'bet365', 'betway', 'melbet', 'betwinner', 'mostbet',
+    'casino', 'كازينو', 'مراهنات', 'مراهنه', 'سلوتس', 'slots', 'poker', 'بوكر',
+    'wolf bet', 'رهان', 'رهانات', 'odds', 'bookmaker', 'betting',
+    # Gaming
+    'pubg', 'ببجي', 'fortnite', 'فورتنايت', 'free fire', 'فري فاير',
+    'clash', 'كلاش', 'valorant', 'gaming', 'العاب', 'ألعاب', 'games',
+    'robux', 'roblox', 'minecraft', 'genshin',
+    # Stores & Shopping
+    'store', 'shop', 'متجر', 'تسوق', 'خصومات', 'عروض', 'كوبون', 'coupon',
+    # Entertainment / Non-Trading
+    'iptv', 'netflix', 'نتفليكس', 'مسلسلات', 'افلام', 'movies', 'anime', 'انمي',
+    'مانجا', 'manga', 'wallpaper', 'خلفيات', 'ringtone', 'رنات',
+    'sticker', 'ستيكر', 'ستيكرز',
+    # Tech / Hacking
+    'vpn', 'proxy', 'بروكسي', 'hack', 'هكر', 'كراك', 'crack',
+    # Account selling (non-forex)
+    'nitro', 'giftcard', 'gift card', 'steam',
+}
+
+RECS_TITLE_FOREX_SIGNALS = {
+    # Core Forex
+    'forex', 'فوركس', 'gold', 'ذهب', 'الذهب', 'دهب', 'xauusd', 'eurusd',
+    'gbpusd', 'usdjpy', 'us30', 'nasdaq', 'ناسداك',
+    # Trading Activity
+    'trading', 'تداول', 'trade', 'trader', 'تريد', 'تريدر',
+    'توصيات', 'signals', 'signal', 'صفقات', 'صفقة',
+    'تحليل', 'analysis', 'chart', 'شارت',
+    # Business Models
+    'vip', 'funded', 'prop', 'ftmo',
+    'ادارة', 'إدارة', 'محافظ', 'نسخ', 'copy',
+    # Scalping / Styles
+    'scalping', 'سكالبينج', 'سمارت موني', 'smc', 'ict',
+    # Arabic Forex Phrases
+    'داو جونز', 'الفوركس', 'العملات', 'توصيه', 'تحليل فني',
+}
+
 
 class GraphExpander:
     """
@@ -371,10 +412,26 @@ class GraphExpander:
                     continue
 
                 new_queued = 0
+                skipped_blacklist = 0
                 for chat in recs.chats:
                     rec_username = getattr(chat, 'username', None)
                     if not rec_username or rec_username.lower() == target_clean.lower():
                         continue
+
+                    # ── Title-based forex relevance gate ──
+                    rec_title = (getattr(chat, 'title', '') or '').lower()
+                    rec_title_combined = f"{rec_title} {rec_username.lower()}"
+
+                    # Check blacklist: reject stores/gaming/betting immediately
+                    is_blacklisted = any(bl in rec_title_combined for bl in RECS_TITLE_BLACKLIST)
+                    if is_blacklisted:
+                        skipped_blacklist += 1
+                        logging.info(f"[GRAPH-REC] SKIPPED @{rec_username} (title='{getattr(chat, 'title', '')}') — blacklisted category")
+                        continue
+
+                    # Check forex signals: determine queue priority
+                    has_forex_signal = any(fs in rec_title_combined for fs in RECS_TITLE_FOREX_SIGNALS)
+                    target_queue = "queue:high" if has_forex_signal else "queue:normal"
 
                     # Insert stub lead
                     target_id = self.insert_or_get_target_lead(rec_username, 1, target_clean)
@@ -400,7 +457,7 @@ class GraphExpander:
                         except Exception as prov_err:
                             logging.debug(f"[GRAPH-REC] Provenance error: {prov_err}")
 
-                    # Deduplicate in seen_channels and enqueue to queue:high
+                    # Deduplicate in seen_channels and enqueue to appropriate queue
                     if is_new and not self.redis_conn.sismember("seen_channels", channel_link):
                         self.redis_conn.sadd("seen_channels", channel_link)
                         payload = json.dumps({
@@ -411,12 +468,13 @@ class GraphExpander:
                             "depth": 1,
                             "discovery_source": "telegram_recommendations"
                         })
-                        self.redis_conn.rpush("queue:high", payload)
+                        self.redis_conn.rpush(target_queue, payload)
                         new_queued += 1
 
-                logging.info(f"[GRAPH-REC] @{target_clean} recommendations complete: {len(recs.chats)} found -> {new_queued} new queued to queue:high")
+                logging.info(f"[GRAPH-REC] @{target_clean} recommendations: {len(recs.chats)} found -> {new_queued} queued, {skipped_blacklist} blacklisted")
                 processed += 1
-                await asyncio.sleep(1)
+                # Rate limit: 2s delay between recommendation API calls to avoid FloodWait
+                await asyncio.sleep(2)
             except Exception as err:
                 logging.warning(f"[GRAPH-REC] Error processing recommendation item: {err}")
 
@@ -425,7 +483,7 @@ class GraphExpander:
     async def run_expansion_cycle(self):
         # 1. First drain and process any freshly validated channels waiting for recommendations
         try:
-            await self.process_recommendations_queue(max_items=10)
+            await self.process_recommendations_queue(max_items=25)
         except Exception as q_err:
             logging.warning(f"[GRAPH] Error draining recommendations:queue: {q_err}")
 

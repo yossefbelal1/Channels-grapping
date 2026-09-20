@@ -20,6 +20,7 @@ from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.functions.messages import CheckChatInviteRequest
 from tg_manager import TelegramManager, get_session_path
 from keyword_frequency_service import KeywordFrequencyService
+from app.core.telegram_pool import AccountPoolManager
 
 # Outreach Engine imports
 from app.outreach.emergency import is_outreach_enabled, is_account_enabled
@@ -593,8 +594,17 @@ def check_is_forex(combined_text: str, is_group: bool = False) -> bool:
         "حسابات العاب", "فيزا وهمية", "حسابات نتفليكس", "اشتراكات نتفلكس", "نتفلكس", "نتفليكس",
         "توزيع حسابات", "حسابات مجانية", "حسابات مجانيه", "شراء حسابات", "بيع حسابات",
         "فري فاير", "ببجي", "فورتنايت", "كلاش", "جواهر فري", "شدات ببجي", "شحن العاب",
+        "roblox", "minecraft", "genshin", "gaming",
+        # Betting & Gambling
+        "1xbet", "bet365", "betway", "melbet", "betwinner", "mostbet",
+        "casino", "كازينو", "مراهنات", "مراهنه", "سلوتس", "slots", "poker", "بوكر",
+        "wolf bet", "رهان", "رهانات", "bookmaker", "betting", "gambling",
         # Non-Forex Accounts/IPTV Shops
         "crunchyroll", "iptv",
+        # Stores & Shopping
+        "متجر الكتروني", "متجر إلكتروني", "كوبون", "كوبونات",
+        # Entertainment
+        "مسلسلات", "افلام", "انمي", "مانجا", "خلفيات", "رنات", "ستيكرز",
         # Generic Underground Marketplace Terms (never used by legit Forex signal channels)
         "wtb", "wts", "wtt", "middleman", "middlemen", "escrow", 
         "ssn", "passport", "id card", "identity", "logs", "accs", "underground", "leaks", "leaked", "marketplace",
@@ -3689,6 +3699,20 @@ class LeadValidator:
                         self.redis_conn.sadd("user_joined_links", link)
                         self.redis_conn.incr(joins_today_key)
                         self.redis_conn.expire(joins_today_key, 86400) # Expire in 24 hours
+
+                        # Record membership join with 14-day TTL in PostgreSQL
+                        if hasattr(self, 'account_pool') and self.account_pool:
+                            try:
+                                ch_id = getattr(target_entity, 'id', identifier)
+                                self.account_pool.record_membership_join(
+                                    channel_id=str(ch_id),
+                                    channel_username=identifier if link_type == 'public' else None,
+                                    account_session=session_name,
+                                    ttl_hours=336,  # 14 days (336 hours)
+                                    reason="auto_join"
+                                )
+                            except Exception as mem_rec_err:
+                                logging.debug(f"User Joiner: Could not record membership: {mem_rec_err}")
                         
                         # 5. Cooldown: Sleep 5 to 10 minutes (300 to 600 seconds) between joins
                         cooldown_sec = random.randint(300, 600)
@@ -4204,6 +4228,248 @@ class LeadValidator:
             # Sleep 5 minutes before next scan
             try:
                 await asyncio.wait_for(self.shutdown_event.wait(), timeout=300)
+            except asyncio.TimeoutError:
+                pass
+
+    async def channel_hygiene_loop(self):
+        """
+        Background task that runs every 30 minutes to auto-leave stale channels
+        and keep the account under Telegram's 500 channel/group limit.
+
+        Leave criteria (ALL must be true):
+        - User is NOT admin/creator in the channel
+        - Channel is EITHER:
+          a) Already in leads DB with status validated/rejected/sent/skipped, OR
+          b) Joined > 14 days ago without being recorded
+
+        Safety:
+        - Max 30 leaves per day per session (Redis counter with 24h TTL)
+        - 10-15s delay between each leave to avoid FloodWait
+        - Never leaves admin/creator channels
+        - Never leaves channels with status='new' (pending validation)
+        """
+        import random
+        from telethon.tl.functions.channels import LeaveChannelRequest
+        from datetime import timedelta
+
+        logging.info("[HYGIENE] Channel hygiene loop started. Will clean stale channels every 30 minutes.")
+
+        if not hasattr(self, 'user_client') or not self.user_client:
+            logging.warning("[HYGIENE] User client not initialized. Exiting task.")
+            return
+
+        MAX_LEAVES_PER_DAY = 30
+        MAX_LEAVES_PER_CYCLE = 15
+        CHANNEL_LIMIT = 480  # Safety margin below 500
+        STALE_DAYS = 14
+
+        session_name = os.environ.get('USER_SESSION', 'user_session')
+
+        while not self.shutdown_event.is_set():
+            try:
+                leaves_today_key = f"hygiene:leaves_today:{session_name}"
+                leaves_today = int(self.redis_conn.get(leaves_today_key) or 0)
+
+                if leaves_today >= MAX_LEAVES_PER_DAY:
+                    logging.info(f"[HYGIENE] Daily leave limit reached ({leaves_today}/{MAX_LEAVES_PER_DAY}). Skipping cycle.")
+                else:
+                    # 1. Fetch all dialogs
+                    dialogs_active = await self.user_client.get_dialogs(limit=None)
+                    dialogs_archived = []
+                    try:
+                        dialogs_archived = await self.user_client.get_dialogs(limit=None, folder=1)
+                    except Exception:
+                        pass
+
+                    all_dialogs = dialogs_active + dialogs_archived
+                    channels = [d for d in all_dialogs if d.is_channel or d.is_group]
+                    total_joined = len(channels)
+                    logging.info(f"[HYGIENE] Account has {total_joined} channels/groups (limit: 500, target: <{CHANNEL_LIMIT}).")
+
+                    # 2. Categorize channels
+                    admin_channels = []
+                    non_admin_channels = []
+
+                    for d in channels:
+                        entity = d.entity
+                        is_admin = False
+                        if not getattr(entity, 'left', False) and not getattr(entity, 'kicked', False):
+                            if (hasattr(entity, 'creator') and entity.creator) or \
+                               (hasattr(entity, 'admin_rights') and entity.admin_rights is not None):
+                                is_admin = True
+
+                        if is_admin:
+                            admin_channels.append(d)
+                        else:
+                            non_admin_channels.append(d)
+
+                    logging.info(f"[HYGIENE] Admin channels: {len(admin_channels)}, Non-admin: {len(non_admin_channels)}")
+
+                    # 3. Check non-admin channels against DB for staleness
+                    leave_candidates = []
+                    self.db_helper.check_connection()
+                    conn = self.db_helper.conn
+
+                    for d in non_admin_channels:
+                        if len(leave_candidates) >= MAX_LEAVES_PER_CYCLE:
+                            break
+
+                        entity = d.entity
+                        ch_username = getattr(entity, 'username', None)
+                        ch_id = getattr(entity, 'id', None)
+
+                        # Determine join date from dialog
+                        dialog_date = getattr(d, 'date', None)
+                        days_since_join = None
+                        if dialog_date:
+                            from datetime import timezone as tz
+                            now_utc = datetime.now(tz.utc)
+                            if dialog_date.tzinfo is None:
+                                dialog_date = dialog_date.replace(tzinfo=tz.utc)
+                            days_since_join = (now_utc - dialog_date).days
+
+                        # Check DB status
+                        db_status = None
+                        if ch_username:
+                            try:
+                                with conn.cursor() as cur:
+                                    cur.execute(
+                                        "SELECT status FROM leads WHERE LOWER(channel_username) = LOWER(%s) LIMIT 1",
+                                        (ch_username,)
+                                    )
+                                    row = cur.fetchone()
+                                    if row:
+                                        db_status = row[0]
+                            except Exception as db_err:
+                                logging.debug(f"[HYGIENE] DB lookup error for @{ch_username}: {db_err}")
+                                try:
+                                    conn.rollback()
+                                except Exception:
+                                    pass
+
+                        # Decision: should we leave?
+                        reason = None
+
+                        # Already processed in DB (validated, rejected, sent, skipped, failed)
+                        if db_status and db_status in ('validated', 'rejected', 'sent', 'skipped', 'failed'):
+                            reason = f"already_{db_status}"
+
+                        # Stale: joined > 14 days ago and not a 'new' lead pending validation
+                        elif days_since_join is not None and days_since_join >= STALE_DAYS:
+                            if db_status != 'new':  # Don't leave channels pending validation
+                                reason = f"stale_{days_since_join}d"
+
+                        # Pressure-based: if over limit, leave oldest non-admin non-new channels
+                        elif total_joined > CHANNEL_LIMIT and db_status is None:
+                            if days_since_join is not None and days_since_join >= 7:
+                                reason = f"over_limit_{total_joined}"
+
+                        if reason:
+                            leave_candidates.append({
+                                'dialog': d,
+                                'username': ch_username or str(ch_id),
+                                'reason': reason,
+                                'days': days_since_join,
+                                'db_status': db_status,
+                            })
+
+                    # 4. Also check expired memberships from telegram_pool
+                    if hasattr(self, 'account_pool') and self.account_pool:
+                        try:
+                            expired = self.account_pool.get_expired_memberships(limit=10)
+                            for mem in expired:
+                                mem_username = mem.get('channel_username', '')
+                                # Avoid duplicates with dialog-based candidates
+                                already_in = any(c['username'].lower() == mem_username.lower() for c in leave_candidates if mem_username)
+                                if not already_in and len(leave_candidates) < MAX_LEAVES_PER_CYCLE:
+                                    leave_candidates.append({
+                                        'dialog': None,
+                                        'username': mem_username,
+                                        'reason': 'membership_ttl_expired',
+                                        'days': None,
+                                        'db_status': None,
+                                        'membership_id': mem.get('id'),
+                                        'account_session': mem.get('account_session'),
+                                    })
+                        except Exception as mem_err:
+                            logging.debug(f"[HYGIENE] Error checking expired memberships: {mem_err}")
+
+                    # 5. Execute leaves safely
+                    left_count = 0
+                    for candidate in leave_candidates:
+                        if self.shutdown_event.is_set():
+                            break
+
+                        # Re-check daily limit
+                        leaves_today = int(self.redis_conn.get(leaves_today_key) or 0)
+                        if leaves_today >= MAX_LEAVES_PER_DAY:
+                            logging.info(f"[HYGIENE] Daily limit reached mid-cycle. Stopping.")
+                            break
+
+                        try:
+                            username = candidate['username']
+                            reason = candidate['reason']
+
+                            if candidate['dialog']:
+                                # Leave via dialog entity
+                                entity = candidate['dialog'].entity
+                                await self.user_client(LeaveChannelRequest(entity))
+                            else:
+                                # Leave via username resolution (for membership TTL entries)
+                                try:
+                                    ch_entity = await self.user_client.get_entity(username)
+                                    await self.user_client(LeaveChannelRequest(ch_entity))
+                                except Exception:
+                                    logging.debug(f"[HYGIENE] Could not resolve @{username} for leave")
+                                    # Mark as left in membership table anyway
+                                    if candidate.get('membership_id') and hasattr(self, 'account_pool') and self.account_pool:
+                                        self.account_pool.mark_left(candidate['membership_id'])
+                                    continue
+
+                            left_count += 1
+
+                            # Update Redis counter
+                            pipe = self.redis_conn.pipeline()
+                            pipe.incr(leaves_today_key)
+                            pipe.expire(leaves_today_key, 86400)  # 24h TTL
+                            pipe.execute()
+
+                            # Mark membership as LEFT if applicable
+                            if candidate.get('membership_id') and hasattr(self, 'account_pool') and self.account_pool:
+                                self.account_pool.mark_left(candidate['membership_id'])
+
+                            logging.info(
+                                f"[HYGIENE] LEFT @{username} "
+                                f"(reason={reason}, days_joined={candidate.get('days', '?')}, "
+                                f"db_status={candidate.get('db_status', 'none')})"
+                            )
+
+                            # Rate-limited delay: 10-15s between leaves
+                            await asyncio.sleep(10 + random.uniform(0, 5))
+
+                        except Exception as leave_err:
+                            err_str = str(leave_err).lower()
+                            if 'floodwait' in err_str or 'flood' in err_str:
+                                logging.warning(f"[HYGIENE] FloodWait while leaving @{candidate['username']}. Stopping cycle.")
+                                break
+                            elif 'not_participant' in err_str or 'user_not_participant' in err_str:
+                                logging.debug(f"[HYGIENE] Already not in @{candidate['username']}")
+                                if candidate.get('membership_id') and hasattr(self, 'account_pool') and self.account_pool:
+                                    self.account_pool.mark_left(candidate['membership_id'])
+                            else:
+                                logging.warning(f"[HYGIENE] Error leaving @{candidate['username']}: {leave_err}")
+
+                    logging.info(
+                        f"[HYGIENE] Cycle complete. Left {left_count} channels. "
+                        f"Remaining: ~{total_joined - left_count} channels/groups."
+                    )
+
+            except Exception as hygiene_err:
+                logging.error(f"[HYGIENE] Unexpected error in hygiene loop: {hygiene_err}", exc_info=True)
+
+            # Sleep 30 minutes before next cycle
+            try:
+                await asyncio.wait_for(self.shutdown_event.wait(), timeout=1800)
             except asyncio.TimeoutError:
                 pass
 
@@ -5051,8 +5317,9 @@ class LeadValidator:
             self.watermark_mgr = WatermarkManager(self.redis_conn, self.db_helper.conn)
             self.edge_mgr = GraphEdgeManager(self.db_helper.conn, self.redis_conn)
             self.provenance_mgr = ProvenanceManager(self.redis_conn, self.db_helper.conn)
+            self.account_pool = AccountPoolManager(redis_conn=self.redis_conn, db_conn=self.db_helper.conn)
 
-            logging.info("Outreach, Scheduler & Graph engine modules initialized.")
+            logging.info("Outreach, Scheduler, Graph & Account Pool engine modules initialized.")
         except Exception as oe_err:
             logging.error(f"Engine initialization error (non-fatal): {oe_err}")
 
@@ -5090,6 +5357,8 @@ class LeadValidator:
             self.register_auto_reply_handler()
             # Start fallback auto-reply checker
             self.auto_reply_fallback_task = asyncio.create_task(self.auto_reply_fallback_loop())
+            # Start channel hygiene loop: auto-leave stale non-admin channels to stay under 500 limit
+            self.channel_hygiene_task = asyncio.create_task(self.channel_hygiene_loop())
         else:
             logging.warning("User client not initialized. Auto-joiner, Campaign dispatcher, Follow-up dispatcher and Auto Dialog Scanner are disabled.")
         
@@ -5142,6 +5411,7 @@ class LeadValidator:
                 getattr(self, 'auto_scan_task', None),
                 getattr(self, 'private_invite_task', None),
                 getattr(self, 'auto_reply_fallback_task', None),
+                getattr(self, 'channel_hygiene_task', None),
                 getattr(self, 'rescan_scheduler_task', None),
             ]
             valid_tasks = [t for t in tasks_to_cancel if t and not t.done()]
