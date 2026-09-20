@@ -4425,6 +4425,8 @@ class LeadValidator:
             
         user_client = self.user_client
         logging.info("Campaign Dispatcher: Outreach is strictly bound to Tamer's account (user_session). Other accounts are discovery helpers only.")
+        import time
+        import random
         
         while not self.shutdown_event.is_set():
             # ── Outreach Engine: Emergency & Circuit Breaker Check ──────────
