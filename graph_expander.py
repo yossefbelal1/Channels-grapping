@@ -177,7 +177,8 @@ class GraphExpander:
             return str(self.db_helper.get_lead_id_by_username(username) or '')
 
     async def fetch_posts(self, entity, limit: int = 300) -> list:
-        username = getattr(entity, 'username', str(getattr(entity, 'id', 'unknown'))).lower()
+        raw_username = getattr(entity, 'username', None) or str(getattr(entity, 'id', 'unknown'))
+        username = str(raw_username).lower()
         watermark_key = f"graph:watermark:{username}"
         last_max_id = self.redis_conn.get(watermark_key)
         min_id = int(last_max_id) if last_max_id and str(last_max_id).isdigit() else 0
