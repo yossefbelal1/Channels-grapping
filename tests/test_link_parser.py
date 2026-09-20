@@ -18,6 +18,15 @@ class TestLinkParser(unittest.TestCase):
         self.assertEqual(link_type, "public")
         self.assertEqual(identifier, "arabic_crypto_hub")
 
+    def test_parse_bare_username(self):
+        link_type, identifier = parse_telegram_link("fvgtrading")
+        self.assertEqual(link_type, "public")
+        self.assertEqual(identifier, "fvgtrading")
+
+        link_type, identifier = parse_telegram_link("@qasim_amer11")
+        self.assertEqual(link_type, "public")
+        self.assertEqual(identifier, "qasim_amer11")
+
     def test_parse_private_invite_plus(self):
         link_type, identifier = parse_telegram_link("https://t.me/+AbCdEfGhIjKlMnOp")
         self.assertEqual(link_type, "private")

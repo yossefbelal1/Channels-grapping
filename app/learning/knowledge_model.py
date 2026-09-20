@@ -62,15 +62,26 @@ class KnowledgeModel:
                 self._clear()
 
                 for r in rows:
-                    sig_type = r[0]
-                    sig_val = r[1]
-                    norm_val = r[2]
-                    category = r[3]
-                    status = r[4]
-                    conf = float(r[5] or 0.5)
-                    contrast = float(r[6] or 0.0)
-                    pos_count = int(r[7] or 1)
-                    disc_count = int(r[8] or 0)
+                    if isinstance(r, dict):
+                        sig_type = r["signal_type"]
+                        sig_val = r["signal_value"]
+                        norm_val = r["normalized_value"]
+                        category = r.get("category")
+                        status = r["status"]
+                        conf = float(r.get("confidence_score") or 0.5)
+                        contrast = float(r.get("contrast_score") or 0.0)
+                        pos_count = int(r.get("positive_support_count") or 1)
+                        disc_count = int(r.get("discovery_count") or 0)
+                    else:
+                        sig_type = r[0]
+                        sig_val = r[1]
+                        norm_val = r[2]
+                        category = r[3]
+                        status = r[4]
+                        conf = float(r[5] or 0.5)
+                        contrast = float(r[6] or 0.0)
+                        pos_count = int(r[7] or 1)
+                        disc_count = int(r[8] or 0)
 
                     sig_info = {
                         "signal_type": sig_type,

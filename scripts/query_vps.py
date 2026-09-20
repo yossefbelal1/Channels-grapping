@@ -14,7 +14,10 @@ if arg.upper().startswith("SELECT") or arg.upper().startswith("UPDATE") or arg.u
 else:
     cmd = ["ssh", "-i", pem, "-o", "StrictHostKeyChecking=no", host, arg]
 
-res = subprocess.run(cmd, capture_output=True, text=True)
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
 print(res.stdout)
 if res.stderr:
     print("STDERR:", res.stderr, file=sys.stderr)

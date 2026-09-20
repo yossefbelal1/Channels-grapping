@@ -164,6 +164,8 @@ class GraphExpander:
         SELECT id, channel_username, lead_score, depth, is_group, tier
         FROM leads
         WHERE status != 'rejected'
+          AND channel_username NOT LIKE 'invite_%%'
+          AND channel_username NOT LIKE 'admin_%%'
           AND (description IS NULL OR (description NOT LIKE 'Blacklisted entity%%' AND description NOT LIKE 'Entity does not exist%%'))
           AND (depth IS NULL OR depth < %s)
           AND (last_graph_scan IS NULL OR last_graph_scan < NOW() - INTERVAL '3 days')

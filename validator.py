@@ -143,6 +143,22 @@ def parse_telegram_link(link: str):
                 if not username_lower.isdigit():
                     return 'public', username
             
+    # Bare username fallback: e.g. @fvgtrading or fvgtrading
+    bare_match = re.match(r"^@?([a-zA-Z0-9_]{4,32})$", link)
+    if bare_match and "t.me" not in link and "/" not in link:
+        uname = bare_match.group(1)
+        uname_lower = uname.lower()
+        junk_usernames = {
+            'joinchat', 'share', 'addstickers', 'addlist', 'gmail', 'hotmail', 'yahoo', 'outlook',
+            'icloud', 'mail', 'yandex', 'protonmail', 'proton', 'telegram', 'spambot', 'sticker',
+            'gif', 'bot', 'username', 'ads', 'advertise', 'channel', 'group', 'chat', 'support',
+            'help', 'admin', 'contact', 'info', 'service', 'feedback', 'terms', 'privacy'
+        }
+        if uname_lower not in junk_usernames:
+            if not (uname_lower.endswith('bot') or uname_lower.endswith('_bot')):
+                if not uname_lower.isdigit():
+                    return 'public', uname
+
     return None, None
 
 def normalize_telegram_link(link: str) -> str:

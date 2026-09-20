@@ -43,7 +43,18 @@ def parse_telegram_link(link: str) -> tuple:
         username_lower = username.lower()
         if username_lower not in JUNK_USERNAMES:
             if not (username_lower.endswith('bot') or username_lower.endswith('_bot')):
-                return 'public', username
+                if not username_lower.isdigit():
+                    return 'public', username
+
+    # Bare username fallback: e.g. @fvgtrading or fvgtrading
+    bare_match = re.match(r'^@?([a-zA-Z0-9_]{4,32})$', link)
+    if bare_match and 't.me' not in link and '/' not in link:
+        username = bare_match.group(1)
+        username_lower = username.lower()
+        if username_lower not in JUNK_USERNAMES:
+            if not (username_lower.endswith('bot') or username_lower.endswith('_bot')):
+                if not username_lower.isdigit():
+                    return 'public', username
 
     return None, None
 

@@ -133,11 +133,18 @@ class CorpusHarvester:
                 cur.execute(query, (limit,))
                 rows = cur.fetchall()
                 for r in rows:
-                    ch_id = str(r[0] or '')
-                    username = r[1] or f"neg_{ch_id}"
-                    title = r[2] or ''
-                    desc = r[3] or ''
-                    reason = r[4] or ''
+                    if isinstance(r, dict):
+                        ch_id = str(r.get("channel_id") or "")
+                        username = r.get("channel_username") or f"neg_{ch_id}"
+                        title = r.get("title") or ""
+                        desc = r.get("description") or ""
+                        reason = r.get("reason") or ""
+                    else:
+                        ch_id = str(r[0] or "")
+                        username = r[1] or f"neg_{ch_id}"
+                        title = r[2] or ""
+                        desc = r[3] or ""
+                        reason = r[4] or ""
 
                     ch_data = {
                         "channel_id": ch_id,
@@ -178,17 +185,29 @@ class CorpusHarvester:
             with db_conn.cursor() as cur:
                 cur.execute(query, (corpus_type,))
                 for row in cur.fetchall():
-                    posts = row[4]
+                    if isinstance(row, dict):
+                        ch_id = row["channel_id"]
+                        ch_user = row["channel_username"]
+                        ch_title = row.get("title") or ""
+                        ch_about = row.get("about") or ""
+                        posts = row.get("sample_posts") or []
+                    else:
+                        ch_id = row[0]
+                        ch_user = row[1]
+                        ch_title = row[2] or ""
+                        ch_about = row[3] or ""
+                        posts = row[4] or []
+
                     if isinstance(posts, str):
                         try:
                             posts = json.loads(posts)
                         except Exception:
                             posts = []
                     channels.append({
-                        "channel_id": row[0],
-                        "channel_username": row[1],
-                        "title": row[2] or "",
-                        "about": row[3] or "",
+                        "channel_id": ch_id,
+                        "channel_username": ch_user,
+                        "title": ch_title,
+                        "about": ch_about,
                         "posts": posts or []
                     })
         except Exception as e:

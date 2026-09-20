@@ -169,6 +169,14 @@ class SignalLifecycle:
                 row = cur.fetchone()
                 db_conn.commit()
                 if row:
+                    if isinstance(row, dict):
+                        return {
+                            "id": row["id"],
+                            "signal_value": row["signal_value"],
+                            "status": row["status"],
+                            "confidence_score": row["confidence_score"],
+                            "contrast_score": row["contrast_score"]
+                        }
                     return {
                         "id": row[0],
                         "signal_value": row[1],
