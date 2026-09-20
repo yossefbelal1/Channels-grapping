@@ -132,28 +132,8 @@ class CorpusHarvester:
               SELECT channel_username FROM corpus_channels WHERE corpus_type = 'gold_admin'
           )
           AND (l.description IS NOT NULL AND length(l.description) > 15)
-          AND l.description NOT LIKE '%does not exist%'
-          AND l.description NOT LIKE '%Blacklisted entity%'
-          AND l.description NOT LIKE '%Error during validation%'
-          AND l.description NOT LIKE '%Inactive non-forex channel%'
-          AND lower(l.description) NOT LIKE '%xauusd%'
-          AND lower(l.description) NOT LIKE '%forex%'
-          AND lower(l.description) NOT LIKE '%trading%'
-          AND lower(l.description) NOT LIKE '%trader%'
-          AND lower(l.description) NOT LIKE '%crypto%'
-          AND lower(l.description) NOT LIKE '%gold%'
-          AND lower(l.description) NOT LIKE '%signal%'
-          AND lower(l.description) NOT LIKE '%تداول%'
-          AND lower(l.description) NOT LIKE '%فوركس%'
-          AND lower(l.description) NOT LIKE '%تريدر%'
-          AND lower(l.description) NOT LIKE '%ذهب%'
-          AND lower(l.description) NOT LIKE '%عملات%'
-          AND lower(l.description) NOT LIKE '%تحليل%'
-          AND lower(l.description) NOT LIKE '%صفقات%'
-          AND lower(l.description) NOT LIKE '%توصيات%'
-          AND lower(l.description) NOT LIKE '%بيتكوين%'
-          AND lower(l.description) NOT LIKE '%إشارات%'
-          AND lower(l.description) NOT LIKE '%vip%'
+          AND l.description !~* 'does not exist|Blacklisted entity|Error during validation|Inactive non-forex channel'
+          AND l.description !~* 'xauusd|forex|trading|trader|crypto|gold|signal|تداول|فوركس|تريدر|ذهب|عملات|تحليل|صفقات|توصيات|بيتكوين|إشارات|vip'
         ORDER BY l.id DESC
         LIMIT %s;
         """
@@ -192,7 +172,7 @@ class CorpusHarvester:
 
             logger.info(f"[HARVESTER] Harvested {len(negative_channels)} negative spam channels from leads.")
         except Exception as e:
-            logger.error(f"[HARVESTER] Error harvesting negative corpus: {e}")
+            logger.error(f"[HARVESTER] Error harvesting negative corpus: {e}", exc_info=True)
 
         return negative_channels
 
