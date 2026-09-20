@@ -52,6 +52,9 @@ from app.discovery.taxonomy import classify_text_taxonomy
 from app.discovery.arabic_normalizer import calculate_arabic_letter_ratio, normalize_arabic_text
 from app.discovery.relevance_evaluator import RelevanceEvaluator
 from app.core.membership_governor import MembershipGovernor
+from app.learning.corpus_harvester import CorpusHarvester
+from app.learning.knowledge_model import KnowledgeModel
+from app.learning.signal_lifecycle import SignalStatus
 
 
 # Configure logging
@@ -1353,6 +1356,8 @@ class LeadValidator:
         self.watermark_mgr = None
         self.edge_mgr = None
         self.provenance_mgr = None
+        self.knowledge_model = KnowledgeModel()
+        self.adaptive_learning_task = None
 
     def is_all_sessions_rate_limited(self) -> bool:
         """Check if ALL Telegram sessions are currently rate-limited."""
@@ -3102,7 +3107,8 @@ class LeadValidator:
                 title=title or '',
                 description=description or '',
                 recent_posts=[m.text for m in messages if getattr(m, 'text', None)],
-                discovery_source=discovery_source
+                discovery_source=discovery_source,
+                knowledge_model=getattr(self, 'knowledge_model', None)
             )
             if arabic_score < 15 and not metadata['is_forex'] and forex_intent_score < 20 and not relevance_decision.is_qualified:
                 logging.info(f"Channel {actual_link} has low Arabic score ({arabic_score}<15) and no Forex intent. Saving as rejected.")
@@ -3219,6 +3225,10 @@ class LeadValidator:
             ):
                 status_val = 'new'
                 logging.info(f"Channel @{username} PASSED gate (FinalScore={scoring_dims.final_score}, Class={scoring_dims.classification}, Forex={scoring_dims.forex_score}, Tier={scoring_dims.tier})")
+                if getattr(self, 'knowledge_model', None) and getattr(self, 'db_helper', None):
+                    for sig in relevance_decision.evidence.get("learned_signals_matched", []):
+                        val = sig.split(":", 1)[1] if ":" in sig else sig
+                        KnowledgeModel.increment_discovery_yield(self.db_helper.conn, val)
             else:
                 status_val = 'rejected'
                 logging.info(f"Channel @{username} below qualification threshold (FinalScore={scoring_dims.final_score}, Class={scoring_dims.classification}). Marking rejected.")
@@ -4288,6 +4298,43 @@ class LeadValidator:
             except asyncio.TimeoutError:
                 pass
 
+    async def adaptive_learning_loop(self):
+        """
+        Periodically runs the Adaptive Learning Engine using Tamer's shared user_client:
+        1. Harvests Tamer's Admin Channels (Gold Positive Corpus) and samples posts.
+        2. Harvests Negative Corpus from rejected leads.
+        3. Mines high-contrast trading patterns and manages signal lifecycle.
+        4. Upserts discovered signals to PostgreSQL and caches to Redis.
+        Runs on startup after 30 seconds delay, then every 6 hours.
+        """
+        logging.info("[ADAPTIVE-LEARN] Background adaptive learning loop active.")
+        await asyncio.sleep(30)
+
+        while not self.shutdown_event.is_set():
+            try:
+                logging.info("[ADAPTIVE-LEARN] Initiating ground-truth learning cycle from Tamer's Admin channels...")
+                summary = await CorpusHarvester.run_learning_cycle(
+                    client=self.user_client,
+                    db_conn=self.db_helper.conn if hasattr(self, 'db_helper') else None,
+                    harvest_fresh=True
+                )
+                logging.info(f"[ADAPTIVE-LEARN] Learning cycle completed: {summary}")
+
+                if self.knowledge_model and hasattr(self, 'db_helper') and self.db_helper:
+                    if self.knowledge_model.load_from_db(self.db_helper.conn):
+                        self.knowledge_model.sync_to_redis(self.redis_conn)
+                        logging.info(
+                            f"[ADAPTIVE-LEARN] Synced updated knowledge model ({len(self.knowledge_model.active_keywords)} keywords, "
+                            f"{len(self.knowledge_model.active_phrases)} phrases, {len(self.knowledge_model.active_symbols)} symbols) to Redis."
+                        )
+            except Exception as e:
+                logging.error(f"[ADAPTIVE-LEARN] Error in adaptive learning loop: {e}", exc_info=True)
+
+            try:
+                await asyncio.wait_for(self.shutdown_event.wait(), timeout=6 * 3600)
+            except asyncio.TimeoutError:
+                pass
+
     async def private_invite_resolver_loop(self):
         """
         Background loop to resolve private Telegram invite links (t.me/+<hash>).
@@ -5139,6 +5186,14 @@ class LeadValidator:
         except Exception as oe_err:
             logging.error(f"Engine initialization error (non-fatal): {oe_err}")
 
+        # Initialize KnowledgeModel from DB and sync to Redis
+        try:
+            if self.knowledge_model.load_from_db(self.db_helper.conn):
+                self.knowledge_model.sync_to_redis(self.redis_conn)
+                logging.info(f"Knowledge model loaded ({len(self.knowledge_model.active_keywords)} keywords, {len(self.knowledge_model.active_phrases)} phrases, {len(self.knowledge_model.active_symbols)} symbols).")
+        except Exception as km_err:
+            logging.debug(f"Could not load initial knowledge model: {km_err}")
+
         # Crawl Scheduling: Single source of truth is worker_scheduler (scheduler_worker.py).
         # Only start embedded loop if explicitly enabled for single-process development.
         if os.getenv("ENABLE_EMBEDDED_SCHEDULER", "false").lower() == "true":
@@ -5175,6 +5230,8 @@ class LeadValidator:
             self.auto_reply_fallback_task = asyncio.create_task(self.auto_reply_fallback_loop())
             # Start channel hygiene loop: auto-leave stale non-admin channels to stay under 500 limit
             self.channel_hygiene_task = asyncio.create_task(self.channel_hygiene_loop())
+            # Start adaptive self-learning loop: mines Tamer's Admin channels for ground-truth patterns
+            self.adaptive_learning_task = asyncio.create_task(self.adaptive_learning_loop())
         else:
             logging.warning("User client not initialized. Auto-joiner, Campaign dispatcher, Follow-up dispatcher and Auto Dialog Scanner are disabled.")
         
@@ -5229,6 +5286,7 @@ class LeadValidator:
                 getattr(self, 'auto_reply_fallback_task', None),
                 getattr(self, 'channel_hygiene_task', None),
                 getattr(self, 'rescan_scheduler_task', None),
+                getattr(self, 'adaptive_learning_task', None),
             ]
             valid_tasks = [t for t in tasks_to_cancel if t and not t.done()]
             for t in valid_tasks:

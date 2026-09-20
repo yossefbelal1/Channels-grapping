@@ -134,8 +134,32 @@ class GraphExpander:
         self.shutdown_event = asyncio.Event()
 
     def get_channels_for_expansion(self, batch_size: int = 20) -> list:
-        """Pulls priority leads ready for graph traversal."""
+        """Pulls priority leads ready for graph traversal, prioritizing Tamer's Admin Golden Seeds."""
         self.db_helper.check_connection()
+
+        # 1. First priority: Tamer's Gold Admin Channels from corpus_channels
+        gold_seeds = []
+        try:
+            gold_query = """
+            SELECT l.id, c.channel_username, COALESCE(l.lead_score, 100) as lead_score,
+                   COALESCE(l.depth, 0) as depth, COALESCE(l.is_group, false) as is_group,
+                   COALESCE(l.tier, 'Tier_A') as tier
+            FROM corpus_channels c
+            LEFT JOIN leads l ON (c.channel_username = l.channel_username)
+            WHERE c.corpus_type = 'gold_admin'
+              AND c.channel_username NOT LIKE 'admin_%%'
+              AND (l.last_graph_scan IS NULL OR l.last_graph_scan < NOW() - INTERVAL '2 days')
+            ORDER BY l.last_graph_scan ASC NULLS FIRST
+            LIMIT 5;
+            """
+            with self.db_helper.conn.cursor() as cur:
+                cur.execute(gold_query)
+                gold_seeds = cur.fetchall() or []
+        except Exception as ge:
+            logging.debug(f"[GRAPH] Could not fetch gold admin seeds: {ge}")
+
+        # 2. Main traversal query
+        remaining_slots = max(1, batch_size - len(gold_seeds))
         query = """
         SELECT id, channel_username, lead_score, depth, is_group, tier
         FROM leads
@@ -158,11 +182,18 @@ class GraphExpander:
         """
         try:
             with self.db_helper.conn.cursor() as cur:
-                cur.execute(query, (self.max_depth, batch_size))
-                return cur.fetchall() or []
+                cur.execute(query, (self.max_depth, remaining_slots))
+                regular_rows = cur.fetchall() or []
+
+                seen_usernames = {g['channel_username'] for g in gold_seeds}
+                combined = list(gold_seeds)
+                for r in regular_rows:
+                    if r['channel_username'] not in seen_usernames:
+                        combined.append(r)
+                return combined
         except Exception as e:
             logging.error(f"[GRAPH] Error fetching expansion candidates: {e}")
-            return []
+            return gold_seeds
 
     def update_last_graph_scan(self, username: str):
         self.db_helper.check_connection()

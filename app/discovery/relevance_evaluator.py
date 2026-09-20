@@ -105,7 +105,8 @@ class RelevanceEvaluator:
         recent_posts: Optional[List[str]] = None,
         referrer_is_tier_a: bool = False,
         discovery_source: str = "",
-        in_degree: int = 0
+        in_degree: int = 0,
+        knowledge_model: Optional[Any] = None
     ) -> RelevanceDecision:
         """
         Performs holistic relevance evaluation across bio, recent messages, and graph context.
@@ -191,6 +192,17 @@ class RelevanceEvaluator:
         if in_degree >= 2:
             score += 10
 
+        # Dynamic Learned Knowledge Boost (up to 20 pts)
+        learned_boost = 0.0
+        learned_signals = []
+        if knowledge_model is not None:
+            try:
+                learned_boost, learned_signals = knowledge_model.evaluate_text_boost(combined_text)
+                if learned_boost > 0:
+                    score += int(round(learned_boost))
+            except Exception as e:
+                logger.debug(f"[RELEVANCE] Error evaluating learned knowledge boost: {e}")
+
         score = min(100, score)
 
         # ── 7. Classification & Tiering ───────────────────────────────────────
@@ -200,7 +212,8 @@ class RelevanceEvaluator:
             len(forex_terms) > 0 or
             len(gold_terms) > 0 or
             len(smc_terms) > 0 or
-            (len(signals_terms) > 0 and len(comm_terms) > 0)
+            (len(signals_terms) > 0 and len(comm_terms) > 0) or
+            len(learned_signals) > 0
         )
 
         if score >= 65 and has_trading_evidence:
@@ -235,7 +248,9 @@ class RelevanceEvaluator:
             "commercial_terms_count": len(comm_terms),
             "arabic_ratio": round(arabic_ratio, 2),
             "referrer_is_tier_a": referrer_is_tier_a,
-            "in_degree": in_degree
+            "in_degree": in_degree,
+            "learned_signals_boost": learned_boost,
+            "learned_signals_matched": learned_signals
         }
 
         return RelevanceDecision(

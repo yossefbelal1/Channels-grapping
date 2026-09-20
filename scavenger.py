@@ -37,6 +37,8 @@ from app.discovery.arabic_normalizer import generate_query_variants, normalize_a
 from app.discovery.taxonomy import get_all_keywords, KEYWORD_TAXONOMY
 from app.discovery.checkpoint import SearchCheckpointManager
 from app.discovery.provenance import ProvenanceManager
+from app.learning.knowledge_model import KnowledgeModel
+from app.learning.adaptive_query_generator import AdaptiveQueryGenerator
 
 # Configure logging
 logging.basicConfig(
@@ -159,6 +161,17 @@ async def run_scavenger(
         global_search_engine=global_search_engine
     )
 
+    # Load adaptive learned knowledge model
+    knowledge_model = KnowledgeModel()
+    if not knowledge_model.load_from_redis(redis_conn):
+        try:
+            from app.core.db import get_connection
+            with get_connection() as db_conn:
+                if knowledge_model.load_from_db(db_conn):
+                    knowledge_model.sync_to_redis(redis_conn)
+        except Exception as e:
+            logging.debug(f"[Scavenger] Could not load knowledge model: {e}")
+
     all_keywords = get_all_keywords()
     random.shuffle(all_keywords)
 
@@ -178,10 +191,14 @@ async def run_scavenger(
         )
         total_new += new_contacts
 
-    # ── Source 2: Telegram Global Content Search (messages.searchGlobal) ──────
-    for kw in all_keywords[:15]:
+    # ── Source 2: Telegram Global Content Search (Adaptive 80/20 Exploit/Explore) ──
+    adaptive_queries = AdaptiveQueryGenerator.generate_queries(knowledge_model, count=15, exploit_ratio=0.8)
+    for q_item in adaptive_queries:
         if shutdown_event.is_set():
             break
+
+        kw = q_item["query"]
+        strategy = q_item.get("strategy", "exploit")
 
         # Check backpressure
         try:
@@ -197,7 +214,7 @@ async def run_scavenger(
             pass
 
         await tg_manager.sleep_adaptive_jitter(session_name, shutdown_event)
-        logging.info(f"[Scavenger] Running Telegram Global Search for '{kw}'...")
+        logging.info(f"[Scavenger] Running Telegram Global Search ({strategy}) for '{kw}'...")
         stats_global = await global_search_engine.search_query_paginated(
             query=kw,
             max_pages=2,
@@ -221,12 +238,21 @@ async def run_scavenger(
         )
         total_new += stats_tag.get("new_channels_found", 0)
 
-    # 3b. High-intent text queries search
-    for pq in random.sample(POPULAR_POST_QUERIES, min(2, len(POPULAR_POST_QUERIES))):
+    # 3b. High-intent text queries search (Adaptive)
+    if knowledge_model and (knowledge_model.active_phrases or knowledge_model.active_symbols):
+        adaptive_post_queries = AdaptiveQueryGenerator.generate_queries(knowledge_model, count=4, exploit_ratio=0.8)
+    else:
+        adaptive_post_queries = [
+            {"query": pq, "strategy": "fallback"}
+            for pq in random.sample(POPULAR_POST_QUERIES, min(2, len(POPULAR_POST_QUERIES)))
+        ]
+    for pq_item in adaptive_post_queries:
         if shutdown_event.is_set():
             break
+        pq = pq_item["query"]
+        strategy = pq_item.get("strategy", "exploit")
         await tg_manager.sleep_adaptive_jitter(session_name, shutdown_event)
-        logging.info(f"[Scavenger] Running Telegram Text Post Search for '{pq}'...")
+        logging.info(f"[Scavenger] Running Telegram Text Post Search ({strategy}) for '{pq}'...")
         stats_pq = await post_search_engine.search_query_paginated(
             query=pq,
             max_pages=2,
