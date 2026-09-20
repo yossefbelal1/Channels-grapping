@@ -118,3 +118,56 @@ class TestRecursiveExpansion:
         expander.edge_mgr.record_edge.assert_called_once()
         # NOT queued again to prevent infinite loops
         mock_redis.rpush.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_expand_entity_filters_disqualified_and_routes_relevant(self):
+        """expand_entity filters out casinos/gaming recommendations and enqueues forex/crypto to appropriate queues."""
+        mock_redis = MagicMock()
+        mock_redis.sismember.return_value = False
+
+        mock_tg = AsyncMock()
+        parent_entity = DummyChat("vip_forex_parent", "VIP Forex Gold Arabic")
+        mock_tg.execute_request.return_value = parent_entity
+
+        # 3 recommendations: 1 casino (disqualified), 1 gaming (disqualified), 1 crypto signals (qualified)
+        recs = [
+            DummyChat("casino_1xbet_bonus", "1xBet Casino Betting"),
+            DummyChat("pubg_mobile_hacks", "PUBG Mobile Free Fire"),
+            DummyChat("binance_crypto_vip", "Binance Futures VIP Signals البيتكوين")
+        ]
+        mock_tg.get_channel_recommendations.return_value = DummyRecs(recs)
+
+        expander = GraphExpander()
+        expander.redis_conn = mock_redis
+        expander.tg_manager = mock_tg
+        expander.insert_or_get_target_lead = MagicMock(return_value="555")
+        expander.edge_mgr = MagicMock()
+        expander.provenance_mgr = MagicMock()
+        expander.provenance_mgr.record_candidate_discovery.return_value = (True, 1, ["graph"])
+        dummy_msg = MagicMock()
+        dummy_msg.message = "تحليل يومي للذهب والعملات XAUUSD"
+        expander.fetch_posts = AsyncMock(return_value=[dummy_msg])
+        expander.update_last_graph_scan = MagicMock()
+        expander.shutdown_event = MagicMock(is_set=MagicMock(return_value=False))
+
+        row = {
+            "id": "111-222",
+            "channel_username": "vip_forex_parent",
+            "lead_score": 95,
+            "tier": "Tier_A",
+            "depth": 0
+        }
+
+        success = await expander.expand_entity(row)
+        assert success is True
+
+        # Only the qualified crypto channel should be queued
+        queued_calls = mock_redis.rpush.call_args_list
+        assert len(queued_calls) == 1
+        target_q, payload_raw = queued_calls[0][0]
+        assert target_q == "queue:high"
+        payload = json.loads(payload_raw)
+        assert "binance_crypto_vip" in payload["link"]
+        assert payload["depth"] == 1
+        assert payload["relevance_score"] >= 60
+

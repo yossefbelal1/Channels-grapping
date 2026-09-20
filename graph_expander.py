@@ -137,15 +137,23 @@ class GraphExpander:
         """Pulls priority leads ready for graph traversal."""
         self.db_helper.check_connection()
         query = """
-        SELECT id, channel_username, lead_score, depth, is_group
+        SELECT id, channel_username, lead_score, depth, is_group, tier
         FROM leads
         WHERE status != 'rejected'
           AND (description IS NULL OR (description NOT LIKE 'Blacklisted entity%%' AND description NOT LIKE 'Entity does not exist%%'))
           AND (depth IS NULL OR depth < %s)
           AND (last_graph_scan IS NULL OR last_graph_scan < NOW() - INTERVAL '3 days')
+          AND (
+            COALESCE(lead_score, 0) >= 40
+            OR tier IN ('Tier_A', 'Tier_B', 'Tier_C')
+            OR forex_category IS NOT NULL
+            OR forex_intent_score >= 35
+          )
         ORDER BY
+          COALESCE(lead_score, 0) DESC,
+          CASE WHEN tier = 'Tier_A' THEN 1 WHEN tier = 'Tier_B' THEN 2 WHEN tier = 'Tier_C' THEN 3 ELSE 4 END,
           CASE WHEN last_graph_scan IS NULL THEN 1 ELSE 2 END,
-          lead_score DESC NULLS LAST
+          last_graph_scan ASC NULLS FIRST
         LIMIT %s;
         """
         try:
@@ -214,8 +222,10 @@ class GraphExpander:
         source_id = str(row['id'])
         parent_depth = int(row.get('depth') or 0)
         child_depth = parent_depth + 1
+        lead_score = int(row.get('lead_score') or 0)
+        source_tier = str(row.get('tier') or 'Tier_B')
 
-        logging.info(f"[GRAPH] Traversing @{username} (depth={parent_depth}, limit={self.post_limit})...")
+        logging.info(f"[GRAPH] Traversing @{username} (depth={parent_depth}, tier={source_tier}, score={lead_score}, limit={self.post_limit})...")
 
         async def resolve(cl):
             return await cl.get_entity(username)
@@ -263,14 +273,17 @@ class GraphExpander:
                     target_ident = fwd["peer_id"]
 
                 if target_ident:
-                    evidence_payload = fwd.get("evidence")
-                    evidence_str = json.dumps(evidence_payload) if isinstance(evidence_payload, dict) else f"Forwarded message ID {getattr(msg, 'id', '')}"
-                    discovered_edges.append({
-                        "target_username": target_ident,
-                        "relation": EdgeRelation.FORWARDED_FROM,
-                        "evidence": evidence_str,
-                        "confidence": 95
-                    })
+                    ident_str = str(target_ident).strip()
+                    is_disq, _ = RelevanceEvaluator.is_hard_disqualified(ident_str)
+                    if not is_disq and ident_str.lower() not in JUNK_USERNAMES:
+                        evidence_payload = fwd.get("evidence")
+                        evidence_str = json.dumps(evidence_payload) if isinstance(evidence_payload, dict) else f"Forwarded message ID {getattr(msg, 'id', '')}"
+                        discovered_edges.append({
+                            "target_username": target_ident,
+                            "relation": EdgeRelation.FORWARDED_FROM,
+                            "evidence": evidence_str,
+                            "confidence": 95
+                        })
 
             # 2. Telegram Link Regex
             for raw_link in TELEGRAM_LINK_REGEX.findall(msg_text):
@@ -278,25 +291,29 @@ class GraphExpander:
                 normalized = normalize_telegram_link(clean)
                 link_type, target_user = parse_telegram_link(normalized)
                 if link_type == 'public' and target_user:
-                    is_promo = any(kw in msg_text for kw in PROMO_KEYWORDS)
-                    rel = EdgeRelation.PROMOTED if is_promo else EdgeRelation.LINKED
-                    discovered_edges.append({
-                        "target_username": target_user,
-                        "relation": rel,
-                        "evidence": msg_text[:200],
-                        "confidence": 85 if is_promo else 75
-                    })
+                    is_disq, _ = RelevanceEvaluator.is_hard_disqualified(target_user)
+                    if not is_disq and target_user.lower() not in JUNK_USERNAMES:
+                        is_promo = any(kw in msg_text for kw in PROMO_KEYWORDS)
+                        rel = EdgeRelation.PROMOTED if is_promo else EdgeRelation.LINKED
+                        discovered_edges.append({
+                            "target_username": target_user,
+                            "relation": rel,
+                            "evidence": msg_text[:200],
+                            "confidence": 85 if is_promo else 75
+                        })
 
             # 3. Mention Regex (@username)
             for mention in USERNAME_REGEX.findall(msg_text):
                 m_lower = mention.lower()
                 if m_lower not in JUNK_USERNAMES and not (m_lower.endswith("bot") or m_lower.endswith("_bot")):
-                    discovered_edges.append({
-                        "target_username": mention,
-                        "relation": EdgeRelation.MENTION,
-                        "evidence": msg_text[:200],
-                        "confidence": 70
-                    })
+                    is_disq, _ = RelevanceEvaluator.is_hard_disqualified(mention)
+                    if not is_disq:
+                        discovered_edges.append({
+                            "target_username": mention,
+                            "relation": EdgeRelation.MENTION,
+                            "evidence": msg_text[:200],
+                            "confidence": 70
+                        })
 
         # 4. Similar Channel Recommendations (Phase 2)
         # Target validated public broadcast channels (any member count 400 to 2M+)
@@ -311,13 +328,34 @@ class GraphExpander:
                 if recs and hasattr(recs, 'chats'):
                     for chat in recs.chats:
                         rec_username = getattr(chat, 'username', None)
-                        if rec_username:
-                            discovered_edges.append({
-                                "target_username": rec_username,
-                                "relation": EdgeRelation.RECOMMENDATION,
-                                "evidence": "Telegram official recommendation",
-                                "confidence": 90
-                            })
+                        if not rec_username or rec_username.lower() == username.lower():
+                            continue
+
+                        rec_title = getattr(chat, 'title', '') or ''
+                        combined_check_text = f"{rec_title} {rec_username}"
+
+                        # Fast Disqualification
+                        is_disq, disq_reason = RelevanceEvaluator.is_hard_disqualified(combined_check_text)
+                        if is_disq:
+                            logging.info(f"[GRAPH] Disqualified recommendation @{rec_username} ({disq_reason})")
+                            continue
+
+                        # Multi-Signal Relevance Evaluation
+                        decision = RelevanceEvaluator.evaluate(
+                            title=rec_title,
+                            description="",
+                            username=rec_username,
+                            referrer_is_tier_a=(lead_score >= 80 or source_tier == "Tier_A"),
+                            discovery_source="telegram_recommendations"
+                        )
+
+                        discovered_edges.append({
+                            "target_username": rec_username,
+                            "relation": EdgeRelation.RECOMMENDATION,
+                            "evidence": "Telegram official recommendation",
+                            "confidence": 90,
+                            "decision": decision
+                        })
             except Exception as e:
                 logging.warning(f"[GRAPH] Failed to fetch channel recommendations for @{username}: {e}")
 
@@ -325,11 +363,11 @@ class GraphExpander:
         new_queued = 0
         for edge in discovered_edges:
             target_user = edge["target_username"]
-            target_clean = target_user.lower()
+            target_clean = str(target_user).lower().lstrip('@').strip()
             if target_clean == username.lower():
                 continue
 
-            target_id = self.insert_or_get_target_lead(target_user, child_depth, username)
+            target_id = self.insert_or_get_target_lead(target_clean, child_depth, username)
             if target_id and source_id:
                 self.edge_mgr.record_edge(
                     source_channel_id=source_id,
@@ -341,14 +379,28 @@ class GraphExpander:
 
             # Record provenance
             is_new, count, sources = self.provenance_mgr.record_candidate_discovery(
-                username_or_link=target_user,
+                username_or_link=target_clean,
                 source_type="graph" if edge["relation"] != EdgeRelation.FORWARDED_FROM else "forwards",
                 referrer_channel_id=source_id
             )
 
             # Check seen_channels
-            channel_link = f"https://t.me/{target_user}"
-            if is_new:
+            channel_link = f"https://t.me/{target_clean}"
+            if is_new and not self.redis_conn.sismember("seen_channels", channel_link):
+                decision = edge.get("decision")
+                if not decision:
+                    decision = RelevanceEvaluator.evaluate(
+                        title="",
+                        description="",
+                        username=target_clean,
+                        referrer_is_tier_a=(lead_score >= 80 or source_tier == "Tier_A"),
+                        discovery_source="graph"
+                    )
+
+                # Reject unambiguous non-financial spam
+                if RelevanceEvaluator.is_hard_disqualified(target_clean)[0]:
+                    continue
+
                 self.redis_conn.sadd("seen_channels", channel_link)
                 payload = json.dumps({
                     "link": channel_link,
@@ -357,9 +409,13 @@ class GraphExpander:
                     "relation": edge["relation"],
                     "depth": child_depth,
                     "discovered_count": count,
-                    "sources": sources
+                    "sources": sources,
+                    "relevance_score": decision.relevance_score,
+                    "tier_estimate": decision.tier_estimate
                 })
-                self.redis_conn.rpush("queue:high", payload)
+                # Route dynamically based on relevance evaluation
+                target_q = decision.target_queue
+                self.redis_conn.rpush(target_q, payload)
                 new_queued += 1
 
         logging.info(f"[GRAPH] @{username} crawl complete: {len(messages)} posts -> {len(discovered_edges)} edges -> {new_queued} new candidates queued.")
