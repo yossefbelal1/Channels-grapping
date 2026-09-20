@@ -156,6 +156,9 @@ async def slow_joiner_task(tg_manager: TelegramManager, redis_conn: redis.Redis,
             active_session = None
             best_score = -1
             for name in list(tg_manager.clients.keys()):
+                client = tg_manager.clients.get(name)
+                if not client or not client.is_connected():
+                    continue
                 if tg_manager.is_account_banned(name):
                     continue
                 until_ts = redis_conn.get(f"health:{name}:rate_limited_until:join")
@@ -313,8 +316,10 @@ def setup_listener_task(tg_manager: TelegramManager, redis_conn: redis.Redis, db
     # Enforces priority routing based on keywords
     high_value_kws = ["vip", "premium", "اشتراك", "ادارة", "نسخ", "funded"]
     
-    # Register message handler on ALL active accounts in the pool
+    # Register message handler on active connected accounts in the pool
     for session_name, client in tg_manager.clients.items():
+        if not client.is_connected():
+            continue
         @client.on(events.NewMessage)
         async def new_message_handler(event):
             # Exclude private chats and broadcast channels
@@ -551,11 +556,15 @@ async def main():
         watcher_task = asyncio.create_task(watch_shutdown())
         
         # Block main thread until watcher task signals disconnection
-        # Run client loops indefinitely
-        await asyncio.gather(
-            *[client.run_until_disconnected() for client in tg_manager.clients.values()],
-            return_exceptions=True
-        )
+        # Run client loops indefinitely on connected clients
+        connected_clients = [client for client in tg_manager.clients.values() if client.is_connected()]
+        if connected_clients:
+            await asyncio.gather(
+                *[client.run_until_disconnected() for client in connected_clients],
+                return_exceptions=True
+            )
+        else:
+            await shutdown_event.wait()
         
         # Ensure joiner task is cancelled and cleaned up
         joiner_task.cancel()

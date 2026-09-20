@@ -227,8 +227,6 @@ class TelegramManager:
             w_type = session_to_load.replace("_session", "")
         backup_role = f"backup_{w_type}"
         backup_roles = [backup_role]
-        if w_type == "radar":
-            backup_roles.append("backup_validator")
 
         if os.path.exists(json_path):
             try:
@@ -544,9 +542,12 @@ class TelegramManager:
             if not eligible_candidates:
                 break # All candidates exhausted
 
-            session_name = self.pool_mgr.select_least_loaded(eligible_candidates)
-            if not session_name:
-                session_name = eligible_candidates[0]
+            if preferred_session and preferred_session in eligible_candidates:
+                session_name = preferred_session
+            else:
+                session_name = self.pool_mgr.select_least_loaded(eligible_candidates)
+                if not session_name:
+                    session_name = eligible_candidates[0]
 
             attempted_sessions.add(session_name)
             client = self.clients.get(session_name)
