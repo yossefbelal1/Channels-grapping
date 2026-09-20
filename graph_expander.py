@@ -146,7 +146,7 @@ class GraphExpander:
           AND (
             COALESCE(lead_score, 0) >= 40
             OR tier IN ('Tier_A', 'Tier_B', 'Tier_C')
-            OR forex_category IS NOT NULL
+            OR (forex_category IS NOT NULL AND forex_category != 'unknown')
             OR forex_intent_score >= 35
           )
         ORDER BY
