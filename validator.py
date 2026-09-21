@@ -4640,7 +4640,7 @@ class LeadValidator:
                     jitter_profile = int(self.adaptive_throttle.get_next_delay())
                 else:
                     jitter_profile = random.randint(jitter_min, jitter_max)
-                logging.info(f"Campaign Dispatcher: Pacing sleep: {jitter_profile}s (~{jitter_profile//60}m {jitter_profile%60}s). Daily sent: {sent_today}/{daily_limit}.")
+                logging.info(f"Campaign Dispatcher: Pacing sleep: {jitter_profile}s (~{jitter_profile//60}m {jitter_profile%60}s). Daily sent: {new_sent_count if 'new_sent_count' in locals() else sent_today}/{daily_target}.")
                 await asyncio.wait_for(self.shutdown_event.wait(), timeout=jitter_profile)
                 
             except asyncio.TimeoutError:
