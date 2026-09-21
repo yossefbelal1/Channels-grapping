@@ -281,9 +281,9 @@ def get_discovered_24h(
             # 1. 24h Summary KPI Metrics
             cur.execute("""
                 SELECT 
-                    COUNT(*) FILTER (WHERE status != 'user_account' AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as total_discovered,
+                    COUNT(*) FILTER (WHERE (outreach_priority_reason IS NULL OR outreach_priority_reason != 'user_account') AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as total_discovered,
                     COUNT(*) FILTER (WHERE status = 'new' AND (lead_score >= 10 OR tier IS NOT NULL)) as qualified_count,
-                    COUNT(*) FILTER (WHERE (member_count > 0 OR lead_score >= 10 OR (description IS NOT NULL AND description != '')) AND status != 'user_account' AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as verified_count,
+                    COUNT(*) FILTER (WHERE (member_count > 0 OR lead_score >= 10 OR (description IS NOT NULL AND description != '')) AND (outreach_priority_reason IS NULL OR outreach_priority_reason != 'user_account') AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as verified_count,
                     COUNT(*) FILTER (WHERE status = 'new' AND lead_score IS NULL AND tier IS NULL AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as pending_scan_count,
                     COUNT(*) FILTER (WHERE status = 'rejected') as rejected_count,
                     COUNT(*) FILTER (WHERE (contact_username IS NOT NULL AND contact_username != '') OR (whatsapp IS NOT NULL AND whatsapp != '')) as with_contact_count,
@@ -348,7 +348,7 @@ def get_discovered_24h(
             # 5. Query Channels list with filters and campaign approval state
             where_clauses = [
                 "l.discovered_at >= NOW() - INTERVAL '24 HOURS'",
-                "l.status != 'user_account'",
+                "(l.outreach_priority_reason IS NULL OR l.outreach_priority_reason != 'user_account')",
                 "l.channel_username ~ '^[a-zA-Z0-9_]{4,32}$'"
             ]
             params = []

@@ -160,20 +160,19 @@ def run_scan():
             # STEP 1: Prune non-username junk rows
             # ─────────────────────────────────────────────────────────────────
             cur.execute("""
-                UPDATE leads 
-                SET status = 'invalid_entity'
+                DELETE FROM leads 
                 WHERE channel_username ~ '[^a-zA-Z0-9_]'
-                  AND status != 'invalid_entity';
+                   OR length(channel_username) < 4;
             """)
             pruned_count = cur.rowcount
-            logger.info(f"Step 1: Pruned {pruned_count} non-username junk records from active leads.")
+            logger.info(f"Step 1: Pruned {pruned_count} non-username junk records from leads table.")
 
             # ─────────────────────────────────────────────────────────────────
             # STEP 2: Handle known user accounts (e.g. ksa_trader11 -> ABOSALEM2003)
             # ─────────────────────────────────────────────────────────────────
             cur.execute("""
                 UPDATE leads 
-                SET status = 'user_account'
+                SET status = 'rejected', outreach_priority_reason = 'user_account'
                 WHERE channel_username = 'ksa_trader11';
                 
                 UPDATE leads
@@ -226,7 +225,7 @@ def run_scan():
 
                 if info.get('is_user'):
                     # It's a personal user account, not a channel!
-                    cur.execute("UPDATE leads SET status = 'user_account', last_scan = NOW() WHERE id = %s;", (ch_id,))
+                    cur.execute("UPDATE leads SET status = 'rejected', outreach_priority_reason = 'user_account', last_scan = NOW() WHERE id = %s;", (ch_id,))
                     user_accounts_found += 1
                     
                     # Link to source channel if available

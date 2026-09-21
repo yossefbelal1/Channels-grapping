@@ -2185,11 +2185,11 @@ class LeadValidator:
                 logging.info(f"Target {actual_link} is neither a Group nor a broadcast Channel (resolved as {resolved_type}).")
                 self.db_helper.add_to_blacklist(actual_link, 'invalid_entity_type')
 
-                # Update lead record to 'user_account' so it does not clutter channels list
+                # Update lead record to 'rejected' (user_account) so it does not clutter channels list
                 clean_ident = identifier.lstrip('@') if identifier else username
                 try:
                     with self.db_helper.conn.cursor() as cur:
-                        cur.execute("UPDATE leads SET status = 'user_account', last_scan = NOW() WHERE channel_username = %s;", (clean_ident,))
+                        cur.execute("UPDATE leads SET status = 'rejected', outreach_priority_reason = 'user_account', last_scan = NOW() WHERE channel_username = %s;", (clean_ident,))
                         
                         # If this user account was discovered from a parent channel, link it as contact!
                         if discovery_source and discovery_source != 'unknown':
