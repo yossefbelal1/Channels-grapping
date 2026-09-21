@@ -467,7 +467,7 @@ def approve_discovered_leads(payload: dict = Body(default={})):
             cur.execute("""
                 UPDATE campaign_logs
                 SET status = 'approved'
-                WHERE lead_id = ANY(%s) AND status IN ('pending', 'pending_review');
+                WHERE lead_id = ANY(%s::uuid[]) AND status IN ('pending', 'pending_review');
             """, (lead_ids,))
             updated_count = cur.rowcount
 
@@ -480,7 +480,7 @@ def approve_discovered_leads(payload: dict = Body(default={})):
                        'Approved via 24h Review Page',
                        COALESCE(l.commercial_fit_score, 0)
                 FROM leads l
-                WHERE l.id = ANY(%s)
+                WHERE l.id = ANY(%s::uuid[])
                   AND NOT EXISTS (
                       SELECT 1 FROM campaign_logs cl WHERE cl.lead_id = l.id
                   );
