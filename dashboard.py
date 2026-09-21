@@ -281,16 +281,16 @@ def get_discovered_24h(
             # 1. 24h Summary KPI Metrics
             cur.execute("""
                 SELECT 
-                    COUNT(*) FILTER (WHERE (outreach_priority_reason IS NULL OR outreach_priority_reason != 'user_account') AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as total_discovered,
-                    COUNT(*) FILTER (WHERE status = 'new' AND (lead_score >= 10 OR tier IS NOT NULL)) as qualified_count,
-                    COUNT(*) FILTER (WHERE (member_count > 0 OR lead_score >= 10 OR (description IS NOT NULL AND description != '')) AND (outreach_priority_reason IS NULL OR outreach_priority_reason != 'user_account') AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as verified_count,
-                    COUNT(*) FILTER (WHERE status = 'new' AND lead_score IS NULL AND tier IS NULL AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as pending_scan_count,
+                    COUNT(*) FILTER (WHERE (outreach_priority_reason IS NULL OR outreach_priority_reason != 'user_account') AND (entity_type IS NULL OR entity_type != 'user') AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as total_discovered,
+                    COUNT(*) FILTER (WHERE status = 'new' AND (lead_score >= 10 OR tier IS NOT NULL) AND (entity_type IS NULL OR entity_type != 'user')) as qualified_count,
+                    COUNT(*) FILTER (WHERE (member_count > 0 OR lead_score >= 10 OR (description IS NOT NULL AND description != '')) AND (outreach_priority_reason IS NULL OR outreach_priority_reason != 'user_account') AND (entity_type IS NULL OR entity_type != 'user') AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as verified_count,
+                    COUNT(*) FILTER (WHERE status = 'new' AND lead_score IS NULL AND tier IS NULL AND (entity_type IS NULL OR entity_type != 'user') AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as pending_scan_count,
                     COUNT(*) FILTER (WHERE status = 'rejected') as rejected_count,
-                    COUNT(*) FILTER (WHERE (contact_username IS NOT NULL AND contact_username != '') OR (whatsapp IS NOT NULL AND whatsapp != '')) as with_contact_count,
-                    COUNT(*) FILTER (WHERE status = 'new' AND (lead_score >= 10 OR tier IS NOT NULL) AND ((contact_username IS NOT NULL AND contact_username != '') OR (whatsapp IS NOT NULL AND whatsapp != ''))) as qualified_with_contact_count,
+                    COUNT(*) FILTER (WHERE ((contact_username IS NOT NULL AND contact_username != '') OR (whatsapp IS NOT NULL AND whatsapp != '')) AND (entity_type IS NULL OR entity_type != 'user')) as with_contact_count,
+                    COUNT(*) FILTER (WHERE status = 'new' AND (lead_score >= 10 OR tier IS NOT NULL) AND ((contact_username IS NOT NULL AND contact_username != '') OR (whatsapp IS NOT NULL AND whatsapp != '')) AND (entity_type IS NULL OR entity_type != 'user')) as qualified_with_contact_count,
                     COUNT(*) FILTER (WHERE whatsapp IS NOT NULL AND whatsapp != '') as with_whatsapp_count,
                     COUNT(*) FILTER (WHERE is_group = TRUE) as groups_count,
-                    COUNT(*) FILTER (WHERE is_group = FALSE) as channels_count,
+                    COUNT(*) FILTER (WHERE is_group = FALSE AND (entity_type IS NULL OR entity_type != 'user')) as channels_count,
                     ROUND(AVG(COALESCE(lead_score, 0)) FILTER (WHERE lead_score IS NOT NULL), 1) as avg_score,
                     ROUND(AVG(COALESCE(forex_intent_score, 0)) FILTER (WHERE forex_intent_score IS NOT NULL), 1) as avg_forex_score
                 FROM leads
@@ -349,6 +349,7 @@ def get_discovered_24h(
             where_clauses = [
                 "l.discovered_at >= NOW() - INTERVAL '24 HOURS'",
                 "(l.outreach_priority_reason IS NULL OR l.outreach_priority_reason != 'user_account')",
+                "(l.entity_type IS NULL OR l.entity_type != 'user')",
                 "l.channel_username ~ '^[a-zA-Z0-9_]{4,32}$'"
             ]
             params = []

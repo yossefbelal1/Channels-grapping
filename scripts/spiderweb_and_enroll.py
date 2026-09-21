@@ -26,8 +26,13 @@ async def main():
     conn = get_db_connection()
     logger.info("Connected to PostgreSQL for Spiderweb Channel Ingestion.")
 
-    # 1. Fetch top seeds from database or default list
-    seeds = ["AlmaalFOREX", "SarhanIndicators", "fftrader", "sh0wmethemarket", "goldzone_trade", "kinforexs"]
+    # 1. High-Intent Forex Seeds with strong recommendation spiderwebs
+    seeds = [
+        "AlmaalFOREX", "SarhanIndicators", "ABOSALEM2003", "ForexBreakingNews",
+        "fx5orx", "wolftrading25", "BEFXTRADING", "v3tradingfx", "forexiqfx",
+        "angrymandubaiolllll", "wolftrading26", "forexnewspaper", "CRTFOX12",
+        "mehmetwehbe", "fftrader", "goldzone_trade", "sh0wmethemarket", "kinforexs"
+    ]
 
     try:
         with conn.cursor() as cur:
@@ -36,9 +41,10 @@ async def main():
                 FROM leads 
                 WHERE status = 'new' 
                   AND (lead_score >= 75 OR forex_intent_score >= 60)
+                  AND (entity_type IS NULL OR entity_type != 'user')
                   AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$'
                 ORDER BY member_count DESC NULLS LAST
-                LIMIT 10;
+                LIMIT 15;
             """)
             db_seeds = [r['channel_username'] for r in cur.fetchall() if r.get('channel_username')]
             for s in db_seeds:

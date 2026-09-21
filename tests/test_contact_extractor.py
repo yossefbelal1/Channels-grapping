@@ -44,5 +44,22 @@ class TestContactExtractor(unittest.TestCase):
         self.assertIsNone(contacts['contact_username'])
 
 
+    def test_extract_pinned_admin_handle(self):
+        pinned = "📩 للاشتراك أو معرفة شروط الوكالة، راسل الإدارة: @G0ld_c"
+        contacts = extract_contacts("", "", "almaalforex", pinned_text=pinned)
+        self.assertEqual(contacts['contact_username'], "G0ld_c")
+        self.assertEqual(contacts['admin_username'], "G0ld_c")
+
+    def test_extract_multiline_support_handle(self):
+        desc = "📲 الدعم:\n@BlackWolf_Support"
+        contacts = extract_contacts("", desc, "test_channel")
+        self.assertEqual(contacts['contact_username'], "BlackWolf_Support")
+
+    def test_extract_analyst_multiline_handle(self):
+        pinned = "🔥 خسران وعايز تعوّض؟\n📩 تواصل :\n@KSA_Trader11"
+        contacts = extract_contacts("", "", "ABOSALEM2003", pinned_text=pinned)
+        self.assertEqual(contacts['contact_username'], "KSA_Trader11")
+
+
 if __name__ == '__main__':
     unittest.main()

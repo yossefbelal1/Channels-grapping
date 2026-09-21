@@ -12,12 +12,15 @@ import os
 import sys
 import json
 import re
+import shutil
 import asyncio
 import logging
 from typing import Dict, Any, List, Optional, Tuple, Set
 from datetime import datetime, timezone
 from telethon import TelegramClient, errors
+from telethon.tl import types
 from telethon.tl.functions.channels import GetFullChannelRequest, GetChannelRecommendationsRequest
+from telethon.tl.functions.users import GetFullUserRequest
 
 from app.core.db import get_db_connection
 from app.core.redis_client import get_redis_client
@@ -32,12 +35,25 @@ SESSION_DIR = os.getenv("TELEGRAM_SESSIONS_DIR", "/app/sessions" if os.path.exis
 
 # Default research account pool (NEVER include user_session / @tamerads1 here)
 RESEARCH_SESSIONS = [
+    "spiderweb_session",
     "acc_12723433281",
     "acc_14809564829",
-    "radar_session"
+    "scavenger_session"
 ]
 
 USERNAME_CLEAN_RE = re.compile(r'^[a-zA-Z0-9_]{4,32}$')
+
+FOREX_KEYWORDS = [
+    "forex", "فوركس", "ذهب", "الذهب", "دهب", "xauusd", "eurusd", "gbpusd", "us30", "nasdaq",
+    "تداول", "trading", "توصيات", "signals", "signal", "صفقات", "تحليل", "analysis",
+    "vip", "ادارة", "إدارة", "محافظ", "نسخ", "copy", "scalping", "سكالبينج", "عملات"
+]
+
+BLACKLIST_KEYWORDS = [
+    "bet", "casino", "كازينو", "مراهنات", "slots", "poker", "pubg", "ببجي",
+    "fortnite", "free fire", "games", "العاب", "store", "متجر", "netflix",
+    "movies", "افلام", "anime", "vpn", "proxy", "hack"
+]
 
 
 class SimilarChannelsCrawler:
@@ -46,6 +62,16 @@ class SimilarChannelsCrawler:
     """
 
     def __init__(self, sessions: Optional[List[str]] = None):
+        # Auto-clone spiderweb_session from acc_12723433281 to prevent SQLite lock with active workers
+        spiderweb_file = os.path.join(SESSION_DIR, "spiderweb_session.session")
+        acc_file = os.path.join(SESSION_DIR, "acc_12723433281.session")
+        if not os.path.exists(spiderweb_file) and os.path.exists(acc_file):
+            try:
+                shutil.copyfile(acc_file, spiderweb_file)
+                logger.info(f"Initialized isolated spiderweb_session from {acc_file}")
+            except Exception as e:
+                logger.warning(f"Could not clone spiderweb_session: {e}")
+
         self.sessions = sessions or RESEARCH_SESSIONS
         self.session_index = 0
         self.clients: Dict[str, TelegramClient] = {}
@@ -107,8 +133,8 @@ class SimilarChannelsCrawler:
         max_recs: int = 15
     ) -> Dict[str, Any]:
         """
-        Inspects channel, extracts pinned messages, mines contacts, auto-enrolls,
-        and retrieves similar channel recommendations.
+        Inspects channel, extracts pinned messages, mines contacts from pinned & recent posts,
+        distinguishes users vs channels, auto-enrolls qualified Forex leads, and retrieves recommendations.
         """
         clean_user = target_username.strip().lstrip('@')
         result = {
@@ -119,6 +145,7 @@ class SimilarChannelsCrawler:
             "contacts": {},
             "recommendations": [],
             "enrolled": False,
+            "is_user": False,
             "error": None
         }
 
@@ -132,6 +159,44 @@ class SimilarChannelsCrawler:
             try:
                 # 1. Resolve entity
                 entity = await client.get_entity(clean_user)
+
+                # ── Handle Individual User Accounts (e.g. @ksa_trader11) ──────────────
+                if isinstance(entity, types.User):
+                    first_n = getattr(entity, 'first_name', '') or ''
+                    last_n = getattr(entity, 'last_name', '') or ''
+                    full_name = f"{first_n} {last_n}".strip() or clean_user
+                    result["title"] = full_name
+                    result["is_user"] = True
+
+                    # Fetch user bio/about
+                    user_bio = ""
+                    try:
+                        full_user_resp = await client(GetFullUserRequest(entity))
+                        full_user_obj = getattr(full_user_resp, 'full_user', None)
+                        user_bio = getattr(full_user_obj, 'about', '') or ''
+                        logger.info(f"[@{clean_user}] Resolved as USER: '{full_name}', Bio: '{user_bio[:100]}'")
+                    except Exception as bio_err:
+                        logger.debug(f"Could not fetch full user for @{clean_user}: {bio_err}")
+
+                    # Mark in Postgres as user account
+                    self._mark_as_user(clean_user, full_name, user_bio)
+
+                    # Extract any channel links in user's bio (e.g. "قناتي: @channel" or "t.me/channel")
+                    bio_channels = re.findall(r'(?:t\.me/|@)([a-zA-Z0-9_]{4,32})', user_bio)
+                    discovered_from_user = []
+                    for bc in bio_channels:
+                        bc_clean = bc.strip().lstrip('@')
+                        if bc_clean.lower() != clean_user.lower() and bc_clean.lower() not in JUNK_USERNAMES:
+                            discovered_from_user.append({
+                                "username": bc_clean,
+                                "title": f"Channel via @{clean_user}",
+                                "members": 0
+                            })
+                    result["recommendations"] = discovered_from_user
+                    # User inspected successfully, exit loop
+                    break
+
+                # ── Handle Broadcast Channels & Supergroups ─────────────────────────
                 title = getattr(entity, 'title', clean_user) or clean_user
                 result["title"] = title
 
@@ -155,8 +220,20 @@ class SimilarChannelsCrawler:
                     except Exception as p_err:
                         logger.warning(f"Could not fetch pinned message for @{clean_user}: {p_err}")
 
-                # 4. Extract Structured Contacts (prioritizing pinned text)
-                contacts = extract_contacts(text="", description=about, channel_username=clean_user, pinned_text=pinned_text)
+                # 3.5. Search Recent Messages for Contact Triggers (الدعم, للتواصل, للاشتراك, الإدارة, etc.)
+                recent_contact_text = ""
+                try:
+                    msgs = await client.get_messages(entity, limit=35)
+                    for m in msgs:
+                        if m and m.message:
+                            m_text = m.message
+                            if any(kw in m_text for kw in ["دعم", "الدعم", "تواصل", "للتواصل", "اشتراك", "للاشتراك", "إدارة", "ادارة", "وكالة", "استفسار", "معرف", "خدمة العملاء", "شروط الوكالة"]):
+                                recent_contact_text += "\n" + m_text
+                except Exception as m_err:
+                    logger.debug(f"Could not scan recent messages for @{clean_user}: {m_err}")
+
+                # 4. Extract Structured Contacts (prioritizing pinned text, then bio, then message triggers)
+                contacts = extract_contacts(text=recent_contact_text, description=about, channel_username=clean_user, pinned_text=pinned_text)
                 result["contacts"] = contacts
                 contact_user = contacts.get('contact_username')
                 admin_user = contacts.get('admin_username')
@@ -165,12 +242,15 @@ class SimilarChannelsCrawler:
 
                 logger.info(f"[@{clean_user}] Contacts Extracted: Contact=@{contact_user} | Admin=@{admin_user} | WhatsApp={wa}")
 
+                # 4.5. Compute Forex Intent Score & Tier
+                forex_score, tier, lead_score = self._evaluate_channel_forex(title, about, pinned_text, recent_contact_text, members)
+
                 # 5. Update leads record in PostgreSQL
-                self._update_channel_record(clean_user, title, members, about, contacts)
+                self._update_channel_record(clean_user, title, members, about, contacts, forex_score, tier, lead_score)
 
                 # 6. Auto-enroll into campaign if qualified with contact
-                if self.active_campaign_id and contact_user:
-                    enrolled = self._auto_enroll_channel(clean_user, title, members, contact_user)
+                if self.active_campaign_id and contact_user and forex_score >= 50:
+                    enrolled = self._auto_enroll_channel(clean_user, title, members, contact_user, forex_score)
                     result["enrolled"] = enrolled
 
                 # 7. Fetch Telegram Similar Channels (Recommendations)
@@ -189,6 +269,12 @@ class SimilarChannelsCrawler:
                         r_members = getattr(chat, 'participants_count', 0) or 0
 
                         if not r_username or not USERNAME_CLEAN_RE.match(r_username):
+                            continue
+
+                        # Filter out spam/blacklist
+                        combined_rec = f"{r_title} {r_username}".lower()
+                        if any(bkw in combined_rec for bkw in BLACKLIST_KEYWORDS):
+                            logger.info(f"  -> Skipped non-financial channel @{r_username} ('{r_title}')")
                             continue
 
                         # Ingest candidate into leads table & Redis queue:high
@@ -237,13 +323,58 @@ class SimilarChannelsCrawler:
 
         return result
 
+    def _evaluate_channel_forex(self, title: str, about: str, pinned_text: str, recent_msgs: str, members: int) -> Tuple[int, str, int]:
+        combined = f"{title} {about} {pinned_text} {recent_msgs}".lower()
+        matches = sum(1 for kw in FOREX_KEYWORDS if kw in combined)
+
+        # Base forex intent score
+        forex_score = min(100, 40 + matches * 10) if matches > 0 else 20
+
+        # Lead score combines members and forex score
+        lead_score = int(forex_score * 0.7 + min(30, int(members / 1000)))
+        lead_score = min(100, max(10, lead_score))
+
+        # Tier assignment
+        if members >= 15000 and forex_score >= 80:
+            tier = 'Tier_A'
+        elif members >= 2500 and forex_score >= 60:
+            tier = 'Tier_B'
+        elif members >= 500 and forex_score >= 40:
+            tier = 'Tier_C'
+        else:
+            tier = 'Tier_D'
+
+        return forex_score, tier, lead_score
+
+    def _mark_as_user(self, username: str, full_name: str, bio: str):
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE leads
+                    SET title = COALESCE(NULLIF(%s, ''), title),
+                        description = COALESCE(NULLIF(%s, ''), description),
+                        entity_type = 'user',
+                        outreach_priority_reason = 'user_account',
+                        last_scan = NOW()
+                    WHERE channel_username = %s;
+                """, (full_name, bio, username))
+            conn.commit()
+            conn.close()
+            logger.info(f"[@{username}] Marked as user_account in PostgreSQL (entity_type='user')")
+        except Exception as e:
+            logger.warning(f"Could not mark @{username} as user: {e}")
+
     def _update_channel_record(
         self,
         username: str,
         title: str,
         members: int,
         description: str,
-        contacts: Dict[str, Any]
+        contacts: Dict[str, Any],
+        forex_score: int = 50,
+        tier: str = 'Tier_C',
+        lead_score: int = 50
     ):
         try:
             conn = get_db_connection()
@@ -257,6 +388,11 @@ class SimilarChannelsCrawler:
                         admin_username = COALESCE(NULLIF(%s, ''), admin_username),
                         owner_username = COALESCE(NULLIF(%s, ''), owner_username),
                         whatsapp = COALESCE(NULLIF(%s, ''), whatsapp),
+                        forex_intent_score = GREATEST(COALESCE(forex_intent_score, 0), %s),
+                        tier = COALESCE(tier, %s::tier_level),
+                        lead_score = GREATEST(COALESCE(lead_score, 0), %s),
+                        entity_type = 'channel',
+                        status = 'new',
                         last_scan = NOW()
                     WHERE channel_username = %s;
                 """, (
@@ -265,6 +401,7 @@ class SimilarChannelsCrawler:
                     contacts.get('admin_username'),
                     contacts.get('owner_username'),
                     contacts.get('whatsapp'),
+                    forex_score, tier, lead_score,
                     username
                 ))
             conn.commit()
@@ -272,7 +409,7 @@ class SimilarChannelsCrawler:
         except Exception as e:
             logger.error(f"Failed to update lead record for @{username}: {e}")
 
-    def _auto_enroll_channel(self, username: str, title: str, members: int, contact: str) -> bool:
+    def _auto_enroll_channel(self, username: str, title: str, members: int, contact: str, forex_score: int = 80) -> bool:
         if not self.active_campaign_id:
             return False
         try:
@@ -286,11 +423,11 @@ class SimilarChannelsCrawler:
                     return False
 
                 lead_id = row['id']
-                score = row['lead_score'] or 80
+                score = max(forex_score, row['lead_score'] or 80)
 
                 # Priority: P0 (VIP / high member count), P1 (Active Forex), P2 (Normal)
                 priority = 'P1'
-                if members >= 20000 or score >= 90:
+                if members >= 15000 or score >= 90:
                     priority = 'P0'
                 elif members < 2000:
                     priority = 'P2'
@@ -300,7 +437,7 @@ class SimilarChannelsCrawler:
                     INSERT INTO campaign_logs (
                         id, campaign_id, lead_id, status, priority, priority_score, priority_reason, commercial_fit_score
                     )
-                    SELECT gen_random_uuid(), %s, %s, 'approved', %s, %s, 'Spiderweb Pinned Contact Auto-Enrolled', %s
+                    SELECT gen_random_uuid(), %s, %s, 'approved', %s, %s, 'Spiderweb Pinned/Recent Contact Auto-Enrolled', %s
                     WHERE NOT EXISTS (
                         SELECT 1 FROM campaign_logs cl
                         JOIN leads l ON cl.lead_id = l.id
@@ -332,12 +469,13 @@ class SimilarChannelsCrawler:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO leads (
-                        channel_username, title, member_count, discovery_source, discovery_method, depth, status, discovered_at, last_scan
+                        channel_username, title, member_count, discovery_source, discovery_method, depth, status, entity_type, discovered_at, last_scan
                     )
-                    VALUES (%s, %s, %s, %s, 'similar_channel', %s, 'new', NOW(), NOW())
+                    VALUES (%s, %s, %s, %s, 'similar_channel', %s, 'new', 'channel', NOW(), NOW())
                     ON CONFLICT (channel_username) DO UPDATE SET
                         title = COALESCE(NULLIF(EXCLUDED.title, ''), leads.title),
                         member_count = GREATEST(leads.member_count, EXCLUDED.member_count),
+                        entity_type = 'channel',
                         discovery_source = COALESCE(leads.discovery_source, EXCLUDED.discovery_source);
                 """, (channel_username, title, member_count, source_username, depth))
             conn.commit()
