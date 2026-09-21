@@ -126,18 +126,17 @@ def backfill_all():
                 ex_affinity = lead.get('exchange_affinity_score', 0)
                 is_hub = lead.get('is_exchange_hub', False)
 
-                prio_eval = OutreachPriorityEngine.calculate_priority(
-                    lead_score=lead.get('lead_score', 0),
-                    forex_score=forex_score,
-                    exchange_affinity_score=ex_affinity,
-                    member_count=mem_count,
-                    has_contact=bool(final_contact),
-                    has_channel_username=bool(ch_user),
-                    is_exchange_hub=is_hub
+                prio_eval = OutreachPriorityEngine.evaluate_priority(
+                    title="",
+                    description=desc,
+                    recent_messages=[posts_text] if posts_text else [],
+                    contacts_dict={'contact_username': final_contact, 'source': 'backfill'},
+                    forex_relevance_score=forex_score,
+                    member_count=mem_count
                 )
-                assigned_prio = prio_eval.priority
-                assigned_score = prio_eval.priority_score
-                assigned_reason = prio_eval.priority_reason
+                assigned_prio = prio_eval.get("priority", "P3")
+                assigned_score = prio_eval.get("priority_score", 25)
+                assigned_reason = prio_eval.get("priority_reason", "Auto-reconciled via contact backfill")
 
                 # Reclaim previously failed or skipped Forex leads in campaign_logs
                 if final_contact and not _is_bot(final_contact) and final_contact.lower() not in JUNK_USERNAMES:
