@@ -523,9 +523,23 @@ class TelegramManager:
         target_kwargs = {k: v for k, v in kwargs.items() if not k.startswith('_') and k != 'shutdown_event'}
 
         attempted_sessions = set()
-        total_candidates = list(self.clients.keys())
-        if preferred_session and preferred_session not in total_candidates:
-            total_candidates.insert(0, preferred_session)
+        
+        # ── Two-Way Strict Isolation Guard ────────────────────────────────────
+        # Guard 1: If campaign/outreach or preferred_session is user_session,
+        # ONLY user_session is permitted. Zero failover to helper accounts.
+        outbound_names = {'send_message', 'send_file', 'forward_messages', 'send_telegram_message'}
+        func_name = getattr(request_func, '__name__', '')
+        is_outbound_request = (func_name in outbound_names) or (self.worker_type == 'campaign')
+
+        if is_outbound_request or preferred_session == 'user_session':
+            total_candidates = ['user_session']
+        else:
+            # Guard 2: For discovery/scraping/radar/graph, EXCLUDE user_session from candidate pool.
+            # Tamer's account must never be used as a generic failover for bulk discovery.
+            total_candidates = [k for k in self.clients.keys() if k != 'user_session']
+            if preferred_session and preferred_session != 'user_session' and preferred_session not in total_candidates:
+                total_candidates.insert(0, preferred_session)
+
         max_session_attempts = max(1, len(total_candidates))
 
         last_exception = None
@@ -594,6 +608,12 @@ class TelegramManager:
                 await self.sleep_adaptive_jitter(session_name, shutdown_event)
                 if shutdown_event.is_set():
                     return None
+
+                # Hard assertion on outbound messaging
+                if is_outbound_request and session_name != 'user_session':
+                    raise PermissionError(
+                        f"CRITICAL SAFETY VIOLATION: Helper account '{session_name}' is strictly forbidden from executing outbound action '{func_name}'."
+                    )
 
                 self.pool_mgr.record_request_start(session_name)
                 try:

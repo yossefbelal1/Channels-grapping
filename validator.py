@@ -23,7 +23,7 @@ from keyword_frequency_service import KeywordFrequencyService
 from app.core.telegram_pool import AccountPoolManager
 
 # Outreach Engine imports
-from app.outreach.emergency import is_outreach_enabled, is_account_enabled
+from app.outreach.emergency import is_outreach_enabled, is_account_enabled, is_kill_switch_active, check_outreach_safety_gate, emergency_stop
 from app.outreach.dry_run import is_dry_run, log_dry_run_decision
 from app.outreach.risk_scorer import calculate_risk_score, classify_risk_level
 from app.outreach.eligibility import check_eligibility
@@ -181,6 +181,52 @@ def normalize_telegram_link(link: str) -> str:
         return f"https://t.me/{clean_link}"
     
     return f"https://{clean_link}"
+
+def apply_natural_greeting_variation(text: str) -> str:
+    """
+    Applies natural greeting variations to the opening line of an outreach message.
+    This breaks exact Telegram message-hash fingerprinting across daily outreach
+    while preserving genuine, polite business Arabic communication.
+    """
+    if not text:
+        return text
+
+    import random
+    greetings = [
+        "السلام عليكم ورحمة الله وبركاته",
+        "السلام عليكم ورحمة الله",
+        "السلام عليكم",
+        "مرحباً، السلام عليكم",
+        "أهلاً بك، السلام عليكم ورحمة الله",
+        "تحياتي لك، السلام عليكم",
+    ]
+    chosen_greeting = random.choice(greetings)
+
+    if "{greeting}" in text:
+        return text.replace("{greeting}", chosen_greeting)
+
+    # Check if text already starts with a greeting pattern to substitute smoothly
+    known_openings = [
+        r"^السلام عليكم ورحمة الله وبركاته[،,\s]*",
+        r"^السلام عليكم ورحمة الله[،,\s]*",
+        r"^السلام عليكم[،,\s]*",
+        r"^مرحباً[،,\s]*",
+        r"^مرحبا[،,\s]*",
+        r"^أهلاً بك[،,\s]*",
+        r"^أهلا بك[،,\s]*",
+        r"^تحياتي لك[،,\s]*",
+        r"^تحياتي[،,\s]*",
+    ]
+    for pattern in known_openings:
+        match = re.match(pattern, text)
+        if match:
+            rest = text[match.end():].lstrip()
+            if "\n" in match.group(0):
+                return f"{chosen_greeting}\n{rest}"
+            else:
+                return f"{chosen_greeting}، {rest}"
+
+    return f"{chosen_greeting}،\n{text}"
 
 def extract_contacts(text: str, description: str, channel_username: str) -> dict:
     """
@@ -1811,12 +1857,6 @@ class LeadValidator:
             else:
                 status_val = 'new'
                 logging.info(f"HTTP fallback: Channel @{username} PASSED gate 🎉 Real CRM Lead! (score={score} forex_intent={forex_intent_score})")
-                try:
-                    payload = json.dumps({"link": actual_link})
-                    self.redis_conn.rpush("user_join_queue", payload)
-                    logging.info(f"User Joiner: Queued verified Forex channel {actual_link} from HTTP fallback for auto-join.")
-                except Exception as q_err:
-                    logging.warning(f"Failed to queue user join from HTTP fallback: {q_err}")
                 
             last_activity_ts = messages[-1].date.astimezone(timezone.utc) if messages else None
             
@@ -2476,18 +2516,20 @@ class LeadValidator:
                     is_inactive = True
                     inactive_reason = f"Only {msgs_7d} messages posted in the last 7 days (minimum 5 required)"
 
-            # Views validation for channels with < 1000 members (must be >= 50 average views)
+            # Views validation for channels with < 1000 members:
+            # If recent 10 posts have average views >= 20, channel qualifies as active without penalty.
             is_low_views = False
             is_medium_views_penalty = False
             if not is_inactive and is_channel and member_count < 1000:
-                channel_views = [msg.views for msg in messages if getattr(msg, 'views', None) is not None]
+                recent_10_msgs = messages[-10:] if len(messages) >= 10 else messages
+                channel_views = [msg.views for msg in recent_10_msgs if getattr(msg, 'views', None) is not None]
                 avg_views = int(sum(channel_views) / len(channel_views)) if channel_views else 0
-                if avg_views < 50:
+                if avg_views < 20:
                     is_low_views = True
-                    logging.info(f"Channel @{username} has very low average views ({avg_views} < 50) for small channel ({member_count} members). (Flagged as soft failure)")
-                elif avg_views < 100:
                     is_medium_views_penalty = True
-                    logging.info(f"Channel @{username} has medium average views ({avg_views} in [50, 99]) for small channel. Penalty will be applied.")
+                    logging.info(f"Channel @{username} has low average views ({avg_views} < 20) on recent posts for small channel ({member_count} members). Penalty applied.")
+                else:
+                    logging.info(f"Channel @{username} qualified as active small channel ({member_count} members, {avg_views} avg views on recent posts >= 20).")
             
             if is_inactive:
                 sample_text_list = []
@@ -2514,13 +2556,6 @@ class LeadValidator:
                 
                 if passes_inactive_gate:
                     logging.info(f"Inactive channel {actual_link} passed niche filters. Saving as low-tier qualified.")
-                    try:
-                        payload = json.dumps({"link": actual_link})
-                        self.redis_conn.rpush("user_join_queue", payload)
-                        logging.info(f"User Joiner: Queued verified Forex inactive channel {actual_link} for auto-join.")
-                    except Exception as q_err:
-                        logging.warning(f"Failed to queue user join for inactive channel: {q_err}")
-                        
                     self.db_helper.upsert_lead(
                         channel_username=username, member_count=member_count, description=f"Inactive channel: {inactive_reason}",
                         language='Arabic', arabic_ratio=100, website='', email='',
@@ -2660,13 +2695,6 @@ class LeadValidator:
                 is_group_forex = check_is_forex(combined_group_text) or forex_intent_score >= 40
                 group_status = 'new' if is_group_forex else 'rejected'
                 
-                if group_status == 'new':
-                    try:
-                        payload = json.dumps({"link": actual_link})
-                        self.redis_conn.rpush("user_join_queue", payload)
-                        logging.info(f"User Joiner: Queued verified Forex group {actual_link} for auto-join.")
-                    except Exception as q_err:
-                        logging.warning(f"Failed to queue user join for group: {q_err}")
 
                 # Update group metadata in database
                 self.db_helper.upsert_lead(
@@ -3401,7 +3429,7 @@ class LeadValidator:
                                 cur_enqueue.execute("""
                                     INSERT INTO campaign_logs (id, campaign_id, lead_id, status, sent_at,
                                                                priority, priority_score, priority_reason, commercial_fit_score)
-                                    SELECT gen_random_uuid(), %s, l.id, 'pending', NULL,
+                                    SELECT gen_random_uuid(), %s, l.id, 'pending_review', NULL,
                                            COALESCE(l.outreach_priority, 'P3'),
                                            COALESCE(l.outreach_priority_score, 25),
                                            l.outreach_priority_reason,
@@ -3416,9 +3444,9 @@ class LeadValidator:
                                 """, (active_camp_id, lead_db_row['id'], contact_user_str))
                                 conn.commit()
                                 if cur_enqueue.rowcount > 0:
-                                    logging.info(f"🚀 Auto Outreach Enqueue: Added NEW validated lead @{username} (contact @{contact_user_str}) to active campaign {active_camp_id}!")
+                                    logging.info(f"📋 Outreach Review Queue: Lead @{username} (contact @{contact_user_str}) queued for HUMAN REVIEW (status: pending_review). Automatic dispatch is strictly disabled.")
                 except Exception as enqueue_err:
-                    logging.warning(f"Auto Outreach Enqueue note for @{username}: {enqueue_err}")
+                    logging.warning(f"Outreach Review Queue note for @{username}: {enqueue_err}")
 
             # Track discovery source analytics
             is_high_quality = (status_val == 'new' and score >= 70 and forex_intent_score >= 60)
@@ -3572,218 +3600,11 @@ class LeadValidator:
 
     async def user_joiner_loop(self):
         """
-        Monitors 'user_join_queue' in Redis and slowly, safely joins the user's account
-        to newly verified Forex public/private links. Capped at 10 joins per day, with
-        30-45 minutes interval between joins to prevent bans on a new account.
+        PERMANENTLY DISABLED: Auto-joining channels/groups from Tamer's account
+        is strictly forbidden to protect the account from Telegram automation detection.
         """
-        logging.info("User Auto-Joiner background task started.")
-        
-        async def add_to_folder(client, peer):
-            from telethon.tl.functions.messages import GetDialogFiltersRequest, UpdateDialogFilterRequest
-            from telethon.tl.types import DialogFilter, TextWithEntities
-            
-            try:
-                # 1. Get existing filters
-                res = await client(GetDialogFiltersRequest())
-                filters = res.filters if hasattr(res, 'filters') else []
-                
-                # 2. Find filter with title "Bot_Channels"
-                target_filter = None
-                for f in filters:
-                    title_str = ""
-                    if hasattr(f, 'title'):
-                        if isinstance(f.title, str):
-                            title_str = f.title
-                        elif hasattr(f.title, 'text'):
-                            title_str = f.title.text
-                            
-                    if title_str == "Bot_Channels":
-                        target_filter = f
-                        break
-                        
-                if target_filter:
-                    # Check if already in include_peers to avoid duplicates
-                    peer_id = getattr(peer, 'channel_id', None) or getattr(peer, 'chat_id', None) or getattr(peer, 'user_id', None)
-                    
-                    exists = False
-                    for p in target_filter.include_peers:
-                        p_id = getattr(p, 'channel_id', None) or getattr(p, 'chat_id', None) or getattr(p, 'user_id', None)
-                        if p_id == peer_id:
-                            exists = True
-                            break
-                            
-                    if not exists:
-                        target_filter.include_peers.append(peer)
-                        await client(UpdateDialogFilterRequest(
-                            id=target_filter.id,
-                            filter=target_filter
-                        ))
-                        logging.info(f"User Joiner: Added channel/group to existing folder 'Bot_Channels'")
-                    else:
-                        logging.info(f"User Joiner: Channel/group already exists in folder 'Bot_Channels'")
-                else:
-                    # Create a new filter
-                    existing_ids = [f.id for f in filters if hasattr(f, 'id')]
-                    new_id = max(existing_ids) + 1 if existing_ids else 2
-                    if new_id < 2:
-                        new_id = 2
-                        
-                    new_filter = DialogFilter(
-                        id=new_id,
-                        title=TextWithEntities(text="Bot_Channels", entities=[]),
-                        pinned_peers=[],
-                        include_peers=[peer],
-                        exclude_peers=[],
-                        contacts=False,
-                        non_contacts=False,
-                        groups=False,
-                        broadcasts=False,
-                        bots=False
-                    )
-                    await client(UpdateDialogFilterRequest(
-                        id=new_id,
-                        filter=new_filter
-                    ))
-                    logging.info(f"User Joiner: Created new folder 'Bot_Channels' and added the channel/group to it")
-            except Exception as folder_err:
-                logging.error(f"User Joiner: Failed to add channel to folder: {folder_err}")
-
-        # Use shared user_client connection
-        user_client = getattr(self, 'user_client', None)
-        if not user_client:
-            logging.warning("User Joiner: Shared user client not initialized. Auto-joiner is disabled.")
-            return
-            
-        try:
-            from telethon.tl.functions.channels import JoinChannelRequest
-            from telethon.tl.functions.messages import ImportChatInviteRequest
-            from telethon.errors import FloodWaitError, ChannelsTooMuchError, InviteHashExpiredError, InviteHashInvalidError
-            
-            while not self.shutdown_event.is_set():
-                try:
-                    # 1. Enforce Daily Cap (max 10 joins per 24 hours / calendar day)
-                    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                    joins_today_key = f"user_joins_today:{today_str}"
-                    joins_today = int(self.redis_conn.get(joins_today_key) or 0)
-                    
-                    if joins_today >= 30:
-                        logging.info(f"User Joiner: Daily join limit reached (30/30) for {today_str}. Sleeping for 30 minutes...")
-                        await asyncio.wait_for(self.shutdown_event.wait(), timeout=1800)
-                        continue
-                        
-                    # 2. Pop link from user_join_queue
-                    # Run blpop in executor to avoid blocking event loop
-                    loop = asyncio.get_running_loop()
-                    res = await loop.run_in_executor(
-                        None,
-                        self.redis_conn.blpop,
-                        "user_join_queue",
-                        5
-                    )
-                    
-                    if not res:
-                        continue
-                        
-                    _, raw_payload = res
-                    try:
-                        payload = json.loads(raw_payload)
-                    except Exception:
-                        payload = {"link": raw_payload}
-                        
-                    link = payload.get("link")
-                    if not link:
-                        continue
-                        
-                    # 3. Check if already joined
-                    is_joined = self.redis_conn.sismember("user_joined_links", link)
-                    if is_joined:
-                        logging.info(f"User Joiner: Already joined {link} previously. Skipping.")
-                        continue
-                        
-                    logging.info(f"User Joiner: Attempting to join {link}... (Joins today: {joins_today}/30)")
-                    
-                    # 4. Resolve link type and perform join
-                    link_type, identifier = parse_telegram_link(link)
-                    
-                    try:
-                        updates = None
-                        if link_type == 'public':
-                            # Public channel/group join
-                            updates = await user_client(JoinChannelRequest(identifier))
-                            logging.info(f"User Joiner: Successfully joined public channel/group: @{identifier}")
-                        elif link_type == 'private':
-                            # Private invite link join
-                            updates = await user_client(ImportChatInviteRequest(identifier))
-                            logging.info(f"User Joiner: Successfully joined private invite link: {identifier}")
-                        else:
-                            logging.warning(f"User Joiner: Invalid link type '{link_type}' for {link}. Skipping.")
-                            continue
-                            
-                        # Resolve input peer and add to folder
-                        try:
-                            target_entity = None
-                            if updates and hasattr(updates, 'chats') and updates.chats:
-                                target_entity = updates.chats[0]
-                            else:
-                                target_entity = await user_client.get_input_entity(identifier if link_type == 'public' else link)
-                                
-                            input_peer = await user_client.get_input_entity(target_entity)
-                            await add_to_folder(user_client, input_peer)
-                        except Exception as folder_err:
-                            logging.warning(f"User Joiner: Failed to add chat to folder 'Bot_Channels': {folder_err}")
-
-                        # Save success state
-                        self.redis_conn.sadd("user_joined_links", link)
-                        self.redis_conn.incr(joins_today_key)
-                        self.redis_conn.expire(joins_today_key, 86400) # Expire in 24 hours
-
-                        # Record membership join with 14-day TTL in PostgreSQL
-                        if hasattr(self, 'account_pool') and self.account_pool:
-                            try:
-                                ch_id = getattr(target_entity, 'id', identifier)
-                                self.account_pool.record_membership_join(
-                                    channel_id=str(ch_id),
-                                    channel_username=identifier if link_type == 'public' else None,
-                                    account_session=session_name,
-                                    ttl_hours=336,  # 14 days (336 hours)
-                                    reason="auto_join"
-                                )
-                            except Exception as mem_rec_err:
-                                logging.debug(f"User Joiner: Could not record membership: {mem_rec_err}")
-                        
-                        # 5. Cooldown: Sleep 5 to 10 minutes (300 to 600 seconds) between joins
-                        cooldown_sec = random.randint(300, 600)
-                        logging.info(f"User Joiner: Safe cooldown initiated. Sleeping for {cooldown_sec // 60} minutes and {cooldown_sec % 60} seconds before next join...")
-                        await asyncio.wait_for(self.shutdown_event.wait(), timeout=cooldown_sec)
-                        
-                    except FloodWaitError as flood_err:
-                        # Wait the requested duration plus 60 seconds
-                        wait_sec = flood_err.seconds + 60
-                        logging.warning(f"User Joiner: Telegram FloodWaitError! Must sleep for {wait_sec} seconds...")
-                        # Put link back to head of queue
-                        self.redis_conn.lpush("user_join_queue", raw_payload)
-                        await asyncio.wait_for(self.shutdown_event.wait(), timeout=wait_sec)
-                        
-                    except ChannelsTooMuchError:
-                        logging.error("User Joiner: Account limit reached! You are already in 500 channels/groups. Auto-joiner is paused.")
-                        # Put link back to queue
-                        self.redis_conn.lpush("user_join_queue", raw_payload)
-                        # Sleep 1 hour and try again
-                        await asyncio.wait_for(self.shutdown_event.wait(), timeout=3600)
-                        
-                    except (InviteHashExpiredError, InviteHashInvalidError) as invite_err:
-                        logging.warning(f"User Joiner: Invite link expired or invalid for {link}: {invite_err}")
-                        
-                    except Exception as join_err:
-                        logging.error(f"User Joiner: Failed to join {link}: {join_err}")
-                        
-                except asyncio.TimeoutError:
-                    pass
-                except Exception as loop_err:
-                    logging.error(f"User Joiner loop error: {loop_err}")
-                    await asyncio.sleep(10)
-        finally:
-            logging.info("User Auto-Joiner background task stopped.")
+        logging.info("🛡️ User Auto-Joiner is PERMANENTLY DISABLED to safeguard Tamer's account from Telegram automation detection.")
+        return
 
     async def init_user_client(self):
         user_config = None
@@ -4178,7 +3999,7 @@ class LeadValidator:
                                                 cur2.execute("""
                                                     INSERT INTO campaign_logs (id, campaign_id, lead_id, status, sent_at,
                                                                                priority, priority_score, priority_reason, commercial_fit_score)
-                                                    SELECT gen_random_uuid(), %s, l.id, 'pending', NULL,
+                                                    SELECT gen_random_uuid(), %s, l.id, 'pending_review', NULL,
                                                            COALESCE(l.outreach_priority, 'P3'),
                                                            COALESCE(l.outreach_priority_score, 25),
                                                            l.outreach_priority_reason,
@@ -4192,7 +4013,7 @@ class LeadValidator:
                                                 """, (auto_campaign_id, lead_row['id'], auto_campaign_id, lead_row['id']))
                                                 conn.commit()
                                                 if cur2.rowcount > 0:
-                                                    logging.info(f"Auto Dialog Scanner: Auto-enqueued UPDATED lead @{ch_username} -> @{contact_username} for outreach!")
+                                                    logging.info(f"📋 Outreach Review Queue: UPDATED lead @{ch_username} -> @{contact_username} queued for human review (pending_review).")
                             else:
                                 # Insert as a new lead
                                 cur.execute("""
@@ -4228,7 +4049,7 @@ class LeadValidator:
                                                 cur2.execute("""
                                                     INSERT INTO campaign_logs (id, campaign_id, lead_id, status, sent_at,
                                                                                priority, priority_score, priority_reason, commercial_fit_score)
-                                                    SELECT gen_random_uuid(), %s, l.id, 'pending', NULL,
+                                                    SELECT gen_random_uuid(), %s, l.id, 'pending_review', NULL,
                                                            COALESCE(l.outreach_priority, 'P3'),
                                                            COALESCE(l.outreach_priority_score, 25),
                                                            l.outreach_priority_reason,
@@ -4242,7 +4063,7 @@ class LeadValidator:
                                                 """, (auto_campaign_id, lead_row['id'], auto_campaign_id, lead_row['id']))
                                                 conn.commit()
                                                 if cur2.rowcount > 0:
-                                                    logging.info(f"Auto Dialog Scanner: Auto-enqueued NEW lead @{ch_username} -> @{contact_username} for outreach!")
+                                                    logging.info(f"📋 Outreach Review Queue: NEW lead @{ch_username} -> @{contact_username} queued for human review (pending_review).")
                                 else:
                                     logging.info(f"Auto Dialog Scanner: Added new lead @{ch_username} (no contact found yet)")
 
@@ -4439,13 +4260,13 @@ class LeadValidator:
                                         camp_id_val = camp_row.get('id') if isinstance(camp_row, dict) else camp_row[0]
                                         cur.execute("""
                                             INSERT INTO campaign_logs (id, campaign_id, lead_id, status, sent_at, priority, priority_score)
-                                            SELECT gen_random_uuid(), %s, %s, 'pending', NULL, 'P1', 90
+                                            SELECT gen_random_uuid(), %s, %s, 'pending_review', NULL, 'P1', 90
                                             WHERE NOT EXISTS (
                                                 SELECT 1 FROM campaign_logs WHERE campaign_id = %s AND lead_id = %s
                                             );
                                         """, (camp_id_val, lead_id, camp_id_val, lead_id))
                                 self.db_helper.conn.commit()
-                                logging.info(f"Private Invite Resolver: Processed Forex hash {h} -> @{primary_contact}")
+                                logging.info(f"Private Invite Resolver: Processed Forex hash {h} -> @{primary_contact} (queued for review: pending_review)")
 
                         self.redis_conn.sadd("resolved_private_hashes", h)
                         # Pacing: 35s between requests to respect Telegram Flood limits
@@ -4494,11 +4315,18 @@ class LeadValidator:
         import random
         
         while not self.shutdown_event.is_set():
-            # ── Outreach Engine: Emergency & Circuit Breaker Check ──────────
+            # ── Outreach Engine: Emergency & Kill Switch Check ──────────
+            is_killed, kill_reason = is_kill_switch_active(self.redis_conn)
+            if is_killed:
+                logging.info(f"Campaign Dispatcher: Kill switch active ({kill_reason}). Sleeping 30s.")
+                await asyncio.sleep(30)
+                continue
+
             if not is_outreach_enabled(self.redis_conn):
                 logging.info("Campaign Dispatcher: Outreach globally disabled. Sleeping 60s.")
                 await asyncio.sleep(60)
                 continue
+
             if self.circuit_breaker and self.circuit_breaker.check_account_circuit('user_session')[0]:
                 reason = self.circuit_breaker.check_account_circuit('user_session')[1]
                 logging.warning(f"Campaign Dispatcher: Account circuit breaker OPEN: {reason}. Sleeping 120s.")
@@ -4524,7 +4352,7 @@ class LeadValidator:
                                     intent_evidence = l.commercial_evidence
                                 FROM leads l
                                 WHERE cl.lead_id = l.id
-                                  AND cl.status = 'pending'
+                                  AND cl.status IN ('pending', 'pending_review', 'approved')
                                   AND l.outreach_priority IS NOT NULL
                                   AND (cl.priority != l.outreach_priority OR cl.priority_score != l.outreach_priority_score);
                             """)
@@ -4533,6 +4361,7 @@ class LeadValidator:
                         logging.debug(f"Campaign dispatcher background sync note: {sync_err}")
 
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    # STRICT APPROVAL GATE: Only claim rows explicitly marked as 'approved' by a human
                     cur.execute("""
                         SELECT cl.id as log_id, cl.campaign_id, cl.lead_id, c.message_text, c.media_path,
                                l.contact_username, l.channel_username,
@@ -4541,7 +4370,7 @@ class LeadValidator:
                         FROM campaign_logs cl
                         JOIN campaigns c ON cl.campaign_id = c.id
                         JOIN leads l ON cl.lead_id = l.id
-                        WHERE cl.status = 'pending'
+                        WHERE cl.status = 'approved'
                            OR (cl.status = 'processing' AND cl.sent_at IS NULL AND cl.last_attempt_at < NOW() - INTERVAL '15 minutes')
                         ORDER BY 
                             CASE COALESCE(l.outreach_priority, cl.priority, 'P3')
@@ -4656,17 +4485,31 @@ class LeadValidator:
                             self.outreach_metrics.record_dry_run_decision()
                         continue
                     
-                    # 1. Enforce configurable daily cap
+                    # 1. Enforce strict risk-minimization daily target (15-20 messages/day, hard cap 20)
                     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                     campaign_sent_key = f"campaign_sent_today:{today_str}"
+                    target_key = f"campaign_daily_target:{today_str}"
                     sent_today = int(self.redis_conn.get(campaign_sent_key) or 0)
-                    daily_limit = int(os.getenv("CAMPAIGN_DAILY_LIMIT", 60))
+
+                    env_max = int(os.getenv("CAMPAIGN_DAILY_LIMIT", 20))
+                    hard_cap = min(env_max, 20)  # Absolute hard maximum: never exceed 20/day
+                    
+                    stored_target = self.redis_conn.get(target_key)
+                    if stored_target:
+                        try:
+                            daily_target = min(int(stored_target), hard_cap)
+                        except (ValueError, TypeError):
+                            daily_target = random.randint(min(15, hard_cap), hard_cap)
+                    else:
+                        daily_target = random.randint(min(15, hard_cap), hard_cap)
+                        self.redis_conn.set(target_key, str(daily_target), ex=86400 * 2)
+
                     jitter_min = int(os.getenv("CAMPAIGN_JITTER_MIN", 90))
                     jitter_max = int(os.getenv("CAMPAIGN_JITTER_MAX", 210))
                     burst_size = int(os.getenv("CAMPAIGN_BURST_SIZE", 5))
 
-                    if sent_today >= daily_limit:
-                        logging.info(f"Campaign Dispatcher: Daily outreach limit reached ({sent_today}/{daily_limit}) for {today_str}. Sleeping for 60 minutes...")
+                    if sent_today >= daily_target:
+                        logging.info(f"Campaign Dispatcher: Daily outreach target reached ({sent_today}/{daily_target}, hard cap={hard_cap}) for {today_str}. Sleeping for 60 minutes...")
                         await asyncio.wait_for(self.shutdown_event.wait(), timeout=3600)
                         continue
 
@@ -4738,26 +4581,42 @@ class LeadValidator:
                             UPDATE campaign_logs cl_sub
                             SET status = 'skipped', error_message = 'Skipped: Contact username already messaged', sent_at = %s
                             FROM leads l_sub
-                            WHERE cl_sub.lead_id = l_sub.id AND LOWER(l_sub.contact_username) = LOWER(%s) AND cl_sub.status = 'pending'
+                            WHERE cl_sub.lead_id = l_sub.id AND LOWER(l_sub.contact_username) = LOWER(%s) AND cl_sub.status IN ('pending', 'pending_review', 'approved')
                         """, (datetime.now(), target_username))
                         conn.commit()
                         continue
                         
+                    # ── Comprehensive Safety Gate Enforcement ─────────────────
+                    gate_ok, gate_reason = check_outreach_safety_gate(
+                        redis_conn=self.redis_conn,
+                        session_name='user_session',
+                        target_username=target_username,
+                        log_status='approved',
+                        campaign_mode=os.getenv("CAMPAIGN_MODE", "dry_run")
+                    )
+                    if not gate_ok:
+                        logging.warning(f"Campaign Dispatcher: Safety gate blocked outreach to @{target_username}: {gate_reason}")
+                        if "BLOCKED_BY_KILL_SWITCH" in gate_reason or "OUTREACH_DISABLED" in gate_reason:
+                            cur.execute("UPDATE campaign_logs SET status = 'approved' WHERE id = %s", (log_id,))
+                            conn.commit()
+                            await asyncio.sleep(30)
+                            continue
+                        else:
+                            cur.execute(
+                                "UPDATE campaign_logs SET status = 'skipped', error_message = %s, sent_at = %s WHERE id = %s",
+                                (f"Safety Gate: {gate_reason}", datetime.now(), log_id)
+                            )
+                            conn.commit()
+                            continue
+
                     # 3. Message sending with multi-tier fallback (Album -> Single Photo -> Text Pitch)
                     logging.info(f"Campaign Dispatcher: Attempting outreach message delivery to @{target_username} (associated with channel @{channel_username})...")
                     
                     success = False
                     error_message = None
                     
-                    # Anti-Fingerprinting Spintax for initial greeting
-                    greeting_variants = [
-                        "السلام عليكم",
-                        "السلام عليكم ورحمة الله",
-                        "السلام عليكم يا غالي",
-                        "مرحباً، السلام عليكم",
-                        "أهلاً بك، السلام عليكم"
-                    ]
-                    dispatch_text = random.choice(greeting_variants) if message_text and message_text.strip() == "السلام عليكم" else message_text
+                    # Direct, transparent, professional message with natural greeting variation to prevent Telegram hash fingerprinting
+                    dispatch_text = apply_natural_greeting_variation(message_text)
 
                     try:
                         peer = await user_client.get_entity(target_username)
@@ -4779,7 +4638,9 @@ class LeadValidator:
                     except errors.FloodWaitError as flood_err:
                         wait_seconds = flood_err.seconds + 60
                         error_message = f"Telegram rate limit: FloodWaitError ({flood_err.seconds}s)"
-                        logging.warning(f"Campaign Dispatcher: Rate limit triggered for @{target_username}: {error_message}. Cooling down for {wait_seconds}s...")
+                        logging.error(f"🚨 Campaign Dispatcher: Rate limit triggered for @{target_username}: {error_message}. TRIPPING EMERGENCY STOP TO PROTECT TAMER'S ACCOUNT!")
+                        # Immediately trip emergency stop so no further outreach runs
+                        emergency_stop(self.redis_conn)
                         self.redis_conn.set("health:user_session:dm_rate_limited_until", time.time() + wait_seconds, ex=wait_seconds + 3600)
                         # ── Outreach Engine: Record FloodWait ──────────────
                         if self.account_health_mgr:
@@ -4791,17 +4652,18 @@ class LeadValidator:
                         if self.outreach_metrics:
                             self.outreach_metrics.record_flood_wait('user_session', flood_err.seconds)
                             self.outreach_metrics.record_failure('user_session', str(campaign_id), 'FloodWait')
-                        # Keep lead as pending so it will be retried safely after cooldown
+                        # Mark as failed: DO NOT AUTO-RETRY ON SAFETY RESTRICTION
                         cur.execute(
-                            "UPDATE campaign_logs SET status = 'pending', error_message = NULL, sent_at = NULL WHERE id = %s",
-                            (log_id,)
+                            "UPDATE campaign_logs SET status = 'failed', error_message = %s, sent_at = %s WHERE id = %s",
+                            (f"Telegram FloodWaitError ({flood_err.seconds}s). Emergency stop tripped.", datetime.now(), log_id)
                         )
                         conn.commit()
                         await asyncio.sleep(min(wait_seconds, 1800))
                         continue
                     except errors.PeerFloodError as peer_flood:
                         error_message = "Telegram PeerFloodError: Account is in temporary spam cooldown."
-                        logging.warning(f"Campaign Dispatcher: PeerFloodError hit on @{target_username}! Pausing outreach for 2 hours to protect account.")
+                        logging.error(f"🚨🚨 Campaign Dispatcher: PeerFloodError hit on @{target_username}! TRIPPING EMERGENCY STOP TO PROTECT TAMER'S ACCOUNT!")
+                        emergency_stop(self.redis_conn)
                         self.redis_conn.set("health:user_session:dm_rate_limited_until", time.time() + 7200, ex=8000)
                         # ── Outreach Engine: Record PeerFlood ──────────────
                         if self.account_health_mgr:
@@ -4810,10 +4672,10 @@ class LeadValidator:
                             self.circuit_breaker.record_flood_wait('user_session')
                         if self.outreach_metrics:
                             self.outreach_metrics.record_failure('user_session', str(campaign_id), 'PeerFlood')
-                        # Keep lead as pending
+                        # Mark as failed: DO NOT AUTO-RETRY ON SPAM RESTRICTION
                         cur.execute(
-                            "UPDATE campaign_logs SET status = 'pending', error_message = NULL, sent_at = NULL WHERE id = %s",
-                            (log_id,)
+                            "UPDATE campaign_logs SET status = 'failed', error_message = %s, sent_at = %s WHERE id = %s",
+                            ("Telegram PeerFloodError: Spam cooldown. Emergency stop tripped.", datetime.now(), log_id)
                         )
                         conn.commit()
                         await asyncio.sleep(3600)
@@ -4822,30 +4684,18 @@ class LeadValidator:
                         error_message = str(dispatch_err)
                         err_lower = error_message.lower()
                         
-                        # Check if error is a temporary rate limit or connection issue
-                        is_temporary = (
+                        # Check if error is related to rate limits or privacy
+                        is_rate_limit = (
                             "too many requests" in err_lower or
                             "flood" in err_lower or
-                            "wait" in err_lower or
-                            "timeout" in err_lower or
-                            "connection" in err_lower or
-                            "network" in err_lower or
-                            "rpc" in err_lower
+                            "wait" in err_lower
                         )
-                        
-                        if is_temporary:
-                            logging.warning(f"Campaign Dispatcher: Temporary issue detected for @{target_username}: {error_message}. Will retry after cooldown.")
-                            self.redis_conn.set("health:user_session:dm_rate_limited_until", time.time() + 300, ex=600)
-                            cur.execute(
-                                "UPDATE campaign_logs SET status = 'pending', error_message = NULL, sent_at = NULL WHERE id = %s",
-                                (log_id,)
-                            )
-                            conn.commit()
-                            await asyncio.sleep(300)
-                            continue
-                        else:
-                            # Permanent error: privacy settings, deleted account, blocked DMs
-                            logging.warning(f"Campaign Dispatcher: Permanent delivery failure for @{target_username}: {error_message}")
+                        if is_rate_limit:
+                            logging.error(f"🚨 Campaign Dispatcher: Rate limit / flood detected for @{target_username}: {error_message}. TRIPPING EMERGENCY STOP.")
+                            emergency_stop(self.redis_conn)
+                            self.redis_conn.set("health:user_session:dm_rate_limited_until", time.time() + 600, ex=1200)
+
+                        logging.warning(f"Campaign Dispatcher: Delivery failure for @{target_username}: {error_message}")
                         
                     if success:
                         logging.info(f"Campaign Dispatcher: Successfully sent message to @{target_username}!")
@@ -4864,12 +4714,13 @@ class LeadValidator:
                             UPDATE campaign_logs cl_sub
                             SET status = 'skipped', error_message = %s, sent_at = %s
                             FROM leads l_sub
-                            WHERE cl_sub.lead_id = l_sub.id AND LOWER(l_sub.contact_username) = LOWER(%s) AND cl_sub.status = 'pending' AND cl_sub.id != %s
+                            WHERE cl_sub.lead_id = l_sub.id AND LOWER(l_sub.contact_username) = LOWER(%s) AND cl_sub.status IN ('pending', 'pending_review', 'approved') AND cl_sub.id != %s
                         """, (f"Skipped: Contact username messaged via channel @{channel_username}", datetime.now(), target_username, log_id))
 
                         # Increment daily sent count in Redis
-                        self.redis_conn.incr(campaign_sent_key)
-                        self.redis_conn.expire(campaign_sent_key, 86400)
+                        new_sent_count = self.redis_conn.incr(campaign_sent_key)
+                        self.redis_conn.expire(campaign_sent_key, 86400 * 2)
+                        logging.info(f"Campaign Dispatcher: Successfully recorded sent message #{new_sent_count}/{daily_target} for today ({today_str}).")
                         
                         # ── Outreach Engine: Record Success ────────────────
                         if self.account_health_mgr:
@@ -4937,6 +4788,18 @@ class LeadValidator:
         import random
 
         while not self.shutdown_event.is_set():
+            # ── Outreach Engine: Emergency & Kill Switch Check ──────────
+            is_killed, kill_reason = is_kill_switch_active(self.redis_conn)
+            if is_killed:
+                logging.info(f"Follow-up Dispatcher: Kill switch active ({kill_reason}). Sleeping 60s.")
+                await asyncio.sleep(60)
+                continue
+
+            if not is_outreach_enabled(self.redis_conn):
+                logging.info("Follow-up Dispatcher: Outreach globally disabled. Sleeping 60s.")
+                await asyncio.sleep(60)
+                continue
+
             try:
                 self.db_helper.check_connection()
                 conn = self.db_helper.conn
@@ -5029,6 +4892,20 @@ class LeadValidator:
                     except Exception as peer_err:
                         logging.warning(f"Follow-up Dispatcher: Could not inspect chat with @{target_username}: {peer_err}")
 
+                    # ── Safety Gate Check for Followup ────────────────────────
+                    gate_ok, gate_reason = check_outreach_safety_gate(
+                        redis_conn=self.redis_conn,
+                        session_name='user_session',
+                        target_username=target_username,
+                        log_status='approved',
+                        campaign_mode=os.getenv("CAMPAIGN_MODE", "dry_run")
+                    )
+                    if not gate_ok:
+                        logging.warning(f"Follow-up Dispatcher: Safety gate blocked outreach: {gate_reason}")
+                        cur.execute("UPDATE campaign_logs SET followup_status = 'skipped', followup_error_message = %s WHERE id = %s", (f"Safety Gate: {gate_reason}", log_id))
+                        conn.commit()
+                        continue
+
                     # 4. Send follow-up message
                     logging.info(f"Follow-up Dispatcher: Sending follow-up message to @{target_username} (associated with @{channel_username})...")
                     success = False
@@ -5048,12 +4925,29 @@ class LeadValidator:
                         success = True
                     except errors.FloodWaitError as flood_err:
                         wait_seconds = flood_err.seconds + 60
-                        logging.warning(f"Follow-up Dispatcher: FloodWait ({flood_err.seconds}s). Cooling down...")
+                        error_message = f"Telegram rate limit: FloodWaitError ({flood_err.seconds}s)"
+                        logging.error(f"🚨 Follow-up Dispatcher: FloodWait ({flood_err.seconds}s). TRIPPING EMERGENCY STOP!")
+                        emergency_stop(self.redis_conn)
                         self.redis_conn.set("health:user_session:followup_rate_limited_until", time.time() + wait_seconds, ex=wait_seconds + 3600)
+                        cur.execute("UPDATE campaign_logs SET followup_status = 'failed', followup_error_message = %s WHERE id = %s", (f"FloodWait ({flood_err.seconds}s). Emergency stop tripped.", log_id))
+                        conn.commit()
                         await asyncio.sleep(min(wait_seconds, 1800))
+                        continue
+                    except errors.PeerFloodError as peer_flood:
+                        error_message = "Telegram PeerFloodError: Account is in temporary spam cooldown."
+                        logging.error(f"🚨🚨 Follow-up Dispatcher: PeerFloodError hit! TRIPPING EMERGENCY STOP!")
+                        emergency_stop(self.redis_conn)
+                        self.redis_conn.set("health:user_session:followup_rate_limited_until", time.time() + 7200, ex=8000)
+                        cur.execute("UPDATE campaign_logs SET followup_status = 'failed', followup_error_message = %s WHERE id = %s", ("PeerFloodError. Emergency stop tripped.", log_id))
+                        conn.commit()
+                        await asyncio.sleep(3600)
                         continue
                     except Exception as send_err:
                         error_message = str(send_err)
+                        err_lower = error_message.lower()
+                        if "flood" in err_lower or "wait" in err_lower or "too many" in err_lower:
+                            logging.error(f"🚨 Follow-up Dispatcher: Rate limit error: {error_message}. TRIPPING EMERGENCY STOP.")
+                            emergency_stop(self.redis_conn)
                         logging.error(f"Follow-up Dispatcher: Send error for @{target_username}: {error_message}")
 
                     if success:

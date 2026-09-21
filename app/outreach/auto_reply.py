@@ -10,6 +10,8 @@ import asyncio
 from typing import Optional, Callable, List
 from psycopg2.extras import RealDictCursor
 from telethon import events, errors
+from app.outreach.emergency import is_kill_switch_active, is_outreach_enabled, emergency_stop
+from app.outreach.dry_run import is_dry_run
 
 
 class AutoReplyEngine:
@@ -147,6 +149,12 @@ class AutoReplyEngine:
                         logging.info("Auto-Reply Engine: Auto-reply disabled or text unset. user_replied recorded.")
                         return
 
+                    # ── Multi-Tier Safety Guard Check ────────────────────────
+                    is_killed, kill_reason = is_kill_switch_active(self.redis_conn)
+                    if is_killed or not is_outreach_enabled(self.redis_conn) or is_dry_run(self.redis_conn):
+                        logging.info(f"Auto-Reply Engine: Outbound dispatch blocked by safety gate (kill_switch={is_killed}, reason={kill_reason}). Skipping 2nd message.")
+                        return
+
                     # Human-like delay
                     delay_sec = random.randint(6, 15)
                     logging.info(f"Auto-Reply Engine: Waiting {delay_sec}s human delay before replying to @{raw_username}...")
@@ -182,8 +190,12 @@ class AutoReplyEngine:
                     logging.info(f"Auto-Reply Engine: Successfully sent 2nd message to @{raw_username} (ID: {sender_id})!")
 
             except errors.FloodWaitError as fw:
-                logging.warning(f"Auto-Reply FloodWait: {fw.seconds}s. Cooling down...")
+                logging.error(f"🚨 Auto-Reply FloodWait: {fw.seconds}s. TRIPPING EMERGENCY STOP TO PROTECT ACCOUNT!")
+                emergency_stop(self.redis_conn)
                 await asyncio.sleep(fw.seconds)
+            except errors.PeerFloodError as pf:
+                logging.error(f"🚨🚨 Auto-Reply PeerFloodError: {pf}. TRIPPING EMERGENCY STOP TO PROTECT ACCOUNT!")
+                emergency_stop(self.redis_conn)
             except Exception as e:
                 logging.error(f"Auto-Reply Engine error: {e}", exc_info=True)
                 try:

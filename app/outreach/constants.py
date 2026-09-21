@@ -35,6 +35,8 @@ class Eligibility:
 class DeliveryState:
     """States of message delivery."""
     PENDING = 'pending'
+    PENDING_REVIEW = 'pending_review'
+    APPROVED = 'approved'
     CLAIMED = 'processing'  # matches existing DB values
     SENDING = 'sending'
     SENT = 'sent'
@@ -43,7 +45,8 @@ class DeliveryState:
     RETRY_WAIT = 'retry_wait'
     UNKNOWN = 'unknown'
     RECONCILIATION = 'reconciliation'
-    ALL = [PENDING, CLAIMED, SENDING, SENT, FAILED, SKIPPED, RETRY_WAIT, UNKNOWN, RECONCILIATION]
+    QUARANTINED = 'quarantined'
+    ALL = [PENDING, PENDING_REVIEW, APPROVED, CLAIMED, SENDING, SENT, FAILED, SKIPPED, RETRY_WAIT, UNKNOWN, RECONCILIATION, QUARANTINED]
 
 class CampaignMode:
     """Operational modes for campaigns."""

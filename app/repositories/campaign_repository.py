@@ -54,7 +54,7 @@ class CampaignRepository:
                     id, campaign_id, lead_id, status, priority, priority_score,
                     priority_reason, commercial_fit_score, likely_services, intent_evidence
                 )
-                SELECT gen_random_uuid(), %s, l.id, 'pending',
+                SELECT gen_random_uuid(), %s, l.id, 'pending_review',
                        COALESCE(l.outreach_priority, 'P3'),
                        COALESCE(l.outreach_priority_score, 25),
                        l.outreach_priority_reason,
@@ -69,6 +69,22 @@ class CampaignRepository:
                   AND l.id NOT IN (SELECT lead_id FROM campaign_logs WHERE campaign_id = %s)
                 ON CONFLICT (id) DO NOTHING
             """, (campaign_id, campaign_id))
+            return cur.rowcount
+
+    @staticmethod
+    def approve_campaign_leads(campaign_id: str, lead_ids: list = None) -> int:
+        """Explicitly approves pending_review leads for outbound delivery by human review."""
+        with get_db_cursor() as cur:
+            if lead_ids:
+                cur.execute(
+                    "UPDATE campaign_logs SET status = 'approved' WHERE campaign_id = %s AND lead_id = ANY(%s) AND status IN ('pending', 'pending_review')",
+                    (campaign_id, lead_ids)
+                )
+            else:
+                cur.execute(
+                    "UPDATE campaign_logs SET status = 'approved' WHERE campaign_id = %s AND status IN ('pending', 'pending_review')",
+                    (campaign_id,)
+                )
             return cur.rowcount
 
     @staticmethod

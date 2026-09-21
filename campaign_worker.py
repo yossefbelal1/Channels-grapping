@@ -38,6 +38,7 @@ logging.basicConfig(
 load_dotenv()
 
 from app.core.db import get_db_connection
+from app.outreach.emergency import is_kill_switch_active, is_outreach_enabled, check_outreach_safety_gate, emergency_stop
 
 
 async def send_telegram_message(client, peer, text, media_path=None):
@@ -107,6 +108,12 @@ async def main():
     if not preferred_session:
         preferred_session = os.getenv("SESSION_NAME", "user_session")
 
+    # Hard Safety Guard: Campaign outbound worker must ONLY run on Tamer's account
+    if preferred_session != "user_session":
+        raise PermissionError(
+            f"CRITICAL SAFETY VIOLATION: Outreach worker cannot run under helper session '{preferred_session}'. Only 'user_session' is permitted."
+        )
+
     # Initialize Telegram Manager
     tg_manager = TelegramManager(redis_conn, session_name=preferred_session, worker_type="campaign")
     await tg_manager.start_all()
@@ -127,6 +134,18 @@ async def main():
     logging.info(f"Campaign dispatcher preferred session set to: {preferred_session}")
 
     while not shutdown_event.is_set():
+        # Kill switch & outreach enable check
+        is_killed, kill_reason = is_kill_switch_active(redis_conn)
+        if is_killed:
+            logging.info(f"Campaign Worker: Kill switch active ({kill_reason}). Sleeping 30s.")
+            await asyncio.sleep(30)
+            continue
+
+        if not is_outreach_enabled(redis_conn):
+            logging.info("Campaign Worker: Outreach globally disabled. Sleeping 60s.")
+            await asyncio.sleep(60)
+            continue
+
         conn = None
         cur = None
         try:
@@ -134,6 +153,7 @@ async def main():
             cur = conn.cursor()
 
             # ── 1. Atomic Row Claiming with Priority-First FOR UPDATE SKIP LOCKED ──
+            # STRICT APPROVAL GATE: Only claim rows explicitly marked as 'approved' by a human
             cur.execute("""
                 SELECT cl.id as log_id, cl.campaign_id, cl.lead_id, c.message_text, c.media_path,
                        l.contact_username, l.channel_username, l.is_group,
@@ -142,7 +162,7 @@ async def main():
                 FROM campaign_logs cl
                 JOIN campaigns c ON cl.campaign_id = c.id
                 JOIN leads l ON cl.lead_id = l.id
-                WHERE cl.status = 'pending'
+                WHERE cl.status = 'approved'
                    OR (cl.status = 'processing' AND cl.sent_at IS NULL AND cl.last_attempt_at < NOW() - INTERVAL '15 minutes')
                 ORDER BY 
                     CASE COALESCE(l.outreach_priority, cl.priority, 'P3')
@@ -236,7 +256,7 @@ async def main():
                     UPDATE campaign_logs cl_sub
                     SET status = 'skipped', error_message = 'Skipped: Contact username already messaged', sent_at = %s
                     FROM leads l_sub
-                    WHERE cl_sub.lead_id = l_sub.id AND LOWER(l_sub.contact_username) = LOWER(%s) AND cl_sub.status = 'pending'
+                    WHERE cl_sub.lead_id = l_sub.id AND LOWER(l_sub.contact_username) = LOWER(%s) AND cl_sub.status IN ('pending', 'pending_review', 'approved')
                 """, (datetime.now(), target_username))
                 conn.commit()
                 cur.close()
@@ -260,6 +280,25 @@ async def main():
                 conn.close()
                 continue
 
+            # ── Safety Gate Check ─────────────────────────────────────
+            gate_ok, gate_reason = check_outreach_safety_gate(
+                redis_conn=redis_conn,
+                session_name='user_session',
+                target_username=target_username,
+                log_status='approved',
+                campaign_mode=os.getenv("CAMPAIGN_MODE", "dry_run")
+            )
+            if not gate_ok:
+                logging.warning(f"Campaign Worker: Safety gate blocked outreach to @{target_username}: {gate_reason}")
+                cur.execute(
+                    "UPDATE campaign_logs SET status = 'skipped', error_message = %s, sent_at = %s WHERE id = %s",
+                    (f"Safety Gate: {gate_reason}", datetime.now(), log_id)
+                )
+                conn.commit()
+                cur.close()
+                conn.close()
+                continue
+
             logging.info(f"Attempting outreach message delivery to @{target_username} (associated with channel @{channel_username})...")
 
             success = False
@@ -277,10 +316,18 @@ async def main():
                 )
                 success = True
             except errors.FloodWaitError as flood_err:
-                error_message = f"Telegram rate limit: FloodWaitError ({flood_err.seconds}s)"
-                logging.warning(f"Rate limit triggered for @{target_username}: {error_message}")
+                emergency_stop(redis_conn)
+                error_message = f"Telegram rate limit: FloodWaitError ({flood_err.seconds}s). Emergency stop tripped."
+                logging.error(f"🚨 Campaign Worker: {error_message}")
+            except errors.PeerFloodError as peer_flood:
+                emergency_stop(redis_conn)
+                error_message = "Telegram PeerFloodError: Spam cooldown. Emergency stop tripped."
+                logging.error(f"🚨🚨 Campaign Worker: {error_message}")
             except Exception as dispatch_err:
                 error_message = str(dispatch_err)
+                err_lower = error_message.lower()
+                if "flood" in err_lower or "wait" in err_lower or "too many" in err_lower:
+                    emergency_stop(redis_conn)
                 logging.error(f"Failed dispatch attempt to @{target_username}: {error_message}")
 
             if success:
@@ -300,7 +347,7 @@ async def main():
                     UPDATE campaign_logs cl_sub
                     SET status = 'skipped', error_message = 'Skipped: Contact username already messaged', sent_at = %s
                     FROM leads l_sub
-                    WHERE cl_sub.lead_id = l_sub.id AND LOWER(l_sub.contact_username) = LOWER(%s) AND cl_sub.status = 'pending'
+                    WHERE cl_sub.lead_id = l_sub.id AND LOWER(l_sub.contact_username) = LOWER(%s) AND cl_sub.status IN ('pending', 'pending_review', 'approved')
                 """, (datetime.now(), target_username))
             else:
                 logging.error(f"Outreach message delivery failed for @{target_username}: {error_message}")
