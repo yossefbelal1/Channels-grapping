@@ -248,8 +248,8 @@ class SimilarChannelsCrawler:
                 # 5. Update leads record in PostgreSQL
                 self._update_channel_record(clean_user, title, members, about, contacts, forex_score, tier, lead_score)
 
-                # 6. Auto-enroll into campaign if qualified with contact
-                if self.active_campaign_id and contact_user and forex_score >= 50:
+                # 6. Auto-enroll into campaign if qualified with contact and strong forex relevance
+                if self.active_campaign_id and contact_user and forex_score >= 60:
                     enrolled = self._auto_enroll_channel(clean_user, title, members, contact_user, forex_score)
                     result["enrolled"] = enrolled
 
@@ -425,12 +425,12 @@ class SimilarChannelsCrawler:
                 lead_id = row['id']
                 score = max(forex_score, row['lead_score'] or 80)
 
-                # Priority: P0 (VIP / high member count), P1 (Active Forex), P2 (Normal)
-                priority = 'P1'
-                if members >= 15000 or score >= 90:
+                # Priority: P0 (Only if strong verified Forex >= 80 + 15k+ members), P1 (Active Forex >= 60), P2 (Normal Forex)
+                priority = 'P2'
+                if forex_score >= 80 and members >= 15000:
                     priority = 'P0'
-                elif members < 2000:
-                    priority = 'P2'
+                elif forex_score >= 60 and members >= 2500:
+                    priority = 'P1'
 
                 # Enroll lead if not already enrolled
                 cur.execute("""

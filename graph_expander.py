@@ -159,8 +159,29 @@ class GraphExpander:
         except Exception as ge:
             logging.debug(f"[GRAPH] Could not fetch gold admin seeds: {ge}")
 
+        # 1.5. Priority: Exchange Network Seeds & Hubs
+        exchange_seeds = []
+        try:
+            ex_query = """
+            SELECT id, channel_username, COALESCE(lead_score, 80) as lead_score,
+                   COALESCE(depth, 0) as depth, COALESCE(is_group, false) as is_group,
+                   COALESCE(tier, 'Tier_B') as tier
+            FROM leads
+            WHERE (is_exchange_seed = TRUE OR is_exchange_hub = TRUE OR exchange_affinity_score >= 40)
+              AND status != 'rejected'
+              AND (last_graph_scan IS NULL OR last_graph_scan < NOW() - INTERVAL '2 days')
+            ORDER BY exchange_affinity_score DESC, last_graph_scan ASC NULLS FIRST
+            LIMIT 5;
+            """
+            with self.db_helper.conn.cursor() as cur:
+                cur.execute(ex_query)
+                exchange_seeds = cur.fetchall() or []
+        except Exception as ee:
+            logging.debug(f"[GRAPH] Could not fetch exchange seeds: {ee}")
+
         # 2. Main traversal query
-        remaining_slots = max(1, batch_size - len(gold_seeds))
+        combined_priority = list(gold_seeds) + [e for e in exchange_seeds if e['channel_username'] not in {g['channel_username'] for g in gold_seeds}]
+        remaining_slots = max(1, batch_size - len(combined_priority))
         query = """
         SELECT id, channel_username, lead_score, depth, is_group, tier
         FROM leads
@@ -188,8 +209,8 @@ class GraphExpander:
                 cur.execute(query, (self.max_depth, remaining_slots))
                 regular_rows = cur.fetchall() or []
 
-                seen_usernames = {g['channel_username'] for g in gold_seeds}
-                combined = list(gold_seeds)
+                seen_usernames = {g['channel_username'] for g in combined_priority}
+                combined = list(combined_priority)
                 for r in regular_rows:
                     if r['channel_username'] not in seen_usernames:
                         combined.append(r)

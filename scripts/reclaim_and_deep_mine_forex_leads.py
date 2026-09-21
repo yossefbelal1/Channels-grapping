@@ -136,9 +136,14 @@ async def inspect_and_reclaim_channel(client: TelegramClient, conn, channel_user
         
         logging.info(f"[@{clean_ch}] Title='{title[:30]}' Members={members} Forex={is_forex} Contact=@{verified_user} WhatsApp={whatsapp}")
         
-        # Determine priority and tier
+        # Hard Gate: If channel is NOT forex, DO NOT rescue or enroll for outreach!
+        if not is_forex:
+            logging.info(f"[@{clean_ch}] Skipped: No verifiable forex/trading intent found.")
+            return
+
+        # Determine priority and tier strictly for confirmed forex channels
         tier = 'Tier_A' if members >= 10000 else 'Tier_B'
-        priority = 'P0' if (members >= 15000 or (tier == 'Tier_A' and is_forex)) else 'P1'
+        priority = 'P0' if (members >= 15000 and is_forex) else 'P1'
         priority_score = 99 if priority == 'P0' else 95
         
         if verified_user:

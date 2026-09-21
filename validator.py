@@ -995,13 +995,15 @@ class DatabaseHelper:
             channel_username, member_count, description, language, arabic_ratio,
             website, email, whatsapp, contact_username, owner_username, admin_username,
             is_group, lead_score, tier, status, last_scan, discovery_source, discovery_method,
-            forex_score, trading_score, signal_score, gold_score, activity_score, growth_score,
+            forex_score, forex_intent_score, trading_score, signal_score, gold_score, activity_score, growth_score,
             commercial_score, contact_score, legitimacy_score, discovery_score, freshness_score,
             confidence_score, new_channel_score, classification, scoring_evidence,
             activity_class, posts_24h, posts_7d, posts_30d, avg_posts_per_day, next_crawl_at,
             outreach_priority, outreach_priority_score, outreach_priority_reason,
             commercial_fit_score, business_model_score, operational_complexity_score,
-            likely_services, commercial_evidence, commercial_last_seen
+            likely_services, commercial_evidence, commercial_last_seen,
+            exchange_affinity_score, network_value_score, growth_openness_score,
+            is_exchange_seed, is_exchange_hub, exchange_evidence
         ) VALUES (
             %s, %s, %s, 'Arabic', %s,
             %s, %s, %s, %s, %s, %s,
@@ -1010,7 +1012,8 @@ class DatabaseHelper:
             %s, %s, %s, %s, %s,
             %s, %s, %s, %s::jsonb,
             %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
+            %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s,
+            %s, %s, %s, %s, %s, %s::jsonb
         )
         ON CONFLICT (channel_username) DO UPDATE SET
             member_count = EXCLUDED.member_count,
@@ -1027,6 +1030,7 @@ class DatabaseHelper:
             status = EXCLUDED.status,
             last_scan = NOW(),
             forex_score = EXCLUDED.forex_score,
+            forex_intent_score = EXCLUDED.forex_intent_score,
             trading_score = EXCLUDED.trading_score,
             signal_score = EXCLUDED.signal_score,
             gold_score = EXCLUDED.gold_score,
@@ -1056,10 +1060,17 @@ class DatabaseHelper:
             operational_complexity_score = EXCLUDED.operational_complexity_score,
             likely_services = EXCLUDED.likely_services,
             commercial_evidence = EXCLUDED.commercial_evidence,
-            commercial_last_seen = COALESCE(EXCLUDED.commercial_last_seen, leads.commercial_last_seen)
+            commercial_last_seen = COALESCE(EXCLUDED.commercial_last_seen, leads.commercial_last_seen),
+            exchange_affinity_score = EXCLUDED.exchange_affinity_score,
+            network_value_score = EXCLUDED.network_value_score,
+            growth_openness_score = EXCLUDED.growth_openness_score,
+            is_exchange_seed = EXCLUDED.is_exchange_seed,
+            is_exchange_hub = EXCLUDED.is_exchange_hub,
+            exchange_evidence = EXCLUDED.exchange_evidence
         RETURNING id;
         """
         evidence_json = json.dumps(scores.evidence or {})
+        exchange_ev_json = json.dumps(getattr(scores, 'evidence', {}).get('exchange_network_analysis', {}))
         try:
             with self.conn.cursor() as cur:
                 cur.execute(query, (
@@ -1074,7 +1085,13 @@ class DatabaseHelper:
                     activity_class, posts_24h, posts_7d, posts_30d, avg_posts_per_day, next_crawl_at,
                     outreach_priority, outreach_priority_score, outreach_priority_reason,
                     commercial_fit_score, business_model_score, operational_complexity_score,
-                    likely_services, comm_evidence_json, commercial_last_seen
+                    likely_services, comm_evidence_json, commercial_last_seen,
+                    getattr(scores, 'exchange_affinity_score', 0),
+                    getattr(scores, 'network_value_score', 0),
+                    getattr(scores, 'growth_openness_score', 0),
+                    getattr(scores, 'is_exchange_seed', False),
+                    getattr(scores, 'is_exchange_hub', False),
+                    exchange_ev_json
                 ))
                 res = cur.fetchone()
                 self.conn.commit()

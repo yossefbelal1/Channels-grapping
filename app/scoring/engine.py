@@ -113,6 +113,7 @@ class LeadScoringEngine:
                     SET lead_score = %s,
                         tier = %s::tier_level,
                         forex_score = %s,
+                        forex_intent_score = %s,
                         arabic_ratio = %s,
                         trading_score = %s,
                         signal_score = %s,
@@ -126,12 +127,18 @@ class LeadScoringEngine:
                         freshness_score = %s,
                         confidence_score = %s,
                         new_channel_score = %s,
+                        exchange_affinity_score = %s,
+                        network_value_score = %s,
+                        growth_openness_score = %s,
+                        is_exchange_seed = %s,
+                        is_exchange_hub = %s,
                         classification = %s,
                         scoring_evidence = %s::jsonb
                     WHERE id = %s;
                 """, (
                     scores.final_score,
                     scores.tier,
+                    scores.forex_score,
                     scores.forex_score,
                     scores.arabic_score,
                     scores.trading_score,
@@ -146,6 +153,11 @@ class LeadScoringEngine:
                     scores.freshness_score,
                     scores.confidence_score,
                     scores.new_channel_score,
+                    getattr(scores, 'exchange_affinity_score', 0),
+                    getattr(scores, 'network_value_score', 0),
+                    getattr(scores, 'growth_openness_score', 0),
+                    getattr(scores, 'is_exchange_seed', False),
+                    getattr(scores, 'is_exchange_hub', False),
                     scores.classification,
                     evidence_json,
                     channel_id

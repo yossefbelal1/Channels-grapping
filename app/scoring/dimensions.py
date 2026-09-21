@@ -45,6 +45,11 @@ class ScoringDimensions:
     confidence_score: int = 0
     legitimacy_score: int = 100
     new_channel_score: int = 0
+    exchange_affinity_score: int = 0
+    network_value_score: int = 0
+    growth_openness_score: int = 0
+    is_exchange_seed: bool = False
+    is_exchange_hub: bool = False
     member_count: int = 0
     classification: str = "POSSIBLE_FOREX"
     final_score: int = 0
@@ -361,19 +366,37 @@ def calculate_all_dimensions(
     # Core rule: Forex relevance is primary (80% of score across trading dimensions).
     # Subscriber count = 0% direct weight (pure neutrality across 400 to 2,000,000 members).
     # Activity = 5% weight (ranking context only, never a gate).
+    # ──────────────────────────────────────────────────────────────────────────
+    # 15b. Exchange & Cross-Promotion Affinity Intelligence
+    # ──────────────────────────────────────────────────────────────────────────
+    from app.discovery.exchange_analyzer import ExchangeAffinityAnalyzer
+    exchange_eval = ExchangeAffinityAnalyzer.analyze_exchange_affinity(
+        title=title,
+        description=description,
+        recent_messages=recent_posts,
+        member_count=member_count,
+        has_verified_contact=has_contact,
+        forex_relevance_score=forex_score
+    )
+    exchange_affinity_score = exchange_eval["exchange_affinity_score"]
+    growth_openness_score = exchange_eval["growth_openness_score"]
+    network_value_score = exchange_eval["network_value_score"]
+    is_exchange_seed = exchange_eval["is_exchange_seed"]
+    is_exchange_hub = exchange_eval["is_exchange_hub"]
+
     weighted_sum = (
-        (forex_score * 0.28) +
-        (gold_score * 0.14) +
-        (signal_score * 0.14) +
-        (trading_score * 0.10) +
-        (arabic_score * 0.10) +
-        (activity_score * 0.05) +
-        (freshness_score * 0.05) +
-        (growth_score * 0.05) +
-        (discovery_score * 0.04) +
-        (commercial_score * 0.03) +
-        (contact_score * 0.02) +
-        (new_channel_score * 0.08)
+        (forex_score * 0.25) +
+        (exchange_affinity_score * 0.15) +
+        (gold_score * 0.12) +
+        (signal_score * 0.12) +
+        (trading_score * 0.08) +
+        (arabic_score * 0.08) +
+        (growth_openness_score * 0.08) +
+        (activity_score * 0.04) +
+        (freshness_score * 0.03) +
+        (growth_score * 0.02) +
+        (discovery_score * 0.02) +
+        (contact_score * 0.01)
     )
 
     # Apply anti-spam multiplier
@@ -457,6 +480,11 @@ def calculate_all_dimensions(
         confidence_score=confidence_score,
         legitimacy_score=legitimacy_score,
         new_channel_score=new_channel_score,
+        exchange_affinity_score=exchange_affinity_score,
+        network_value_score=network_value_score,
+        growth_openness_score=growth_openness_score,
+        is_exchange_seed=is_exchange_seed,
+        is_exchange_hub=is_exchange_hub,
         member_count=member_count,
         classification=classification,
         final_score=final_score,
