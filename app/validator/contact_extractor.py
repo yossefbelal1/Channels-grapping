@@ -116,10 +116,32 @@ CONTACT_TRIGGERS = [
     r'vip',
 ]
 
+# 4. Analyst & Trader triggers (market analysts, mentors, coaches)
+ANALYST_TRIGGERS = [
+    r'المحلل\s*(?:الفني|المالي)?',
+    r'محلل\s*(?:الفني|المالي|القناة|القناه)?',
+    r'المهندس',
+    r'مهندس',
+    r'الكابتن',
+    r'كابتن',
+    r'الخبير',
+    r'خبير\s*(?:التداول|الفوركس|الذهب)?',
+    r'trader',
+    r'analyst',
+    r'mentor',
+    r'coach',
+    r'فريق\s*العمل',
+    r'حساب\s*(?:التواصل|المتابعة|الردود)',
+    r'للمزيد\s*والتواصل',
+    r'لأي\s*استفسار',
+]
+
 # Combined trigger regexes
 OWNER_RE = re.compile(r'(?:' + '|'.join(OWNER_TRIGGERS) + r')', re.IGNORECASE)
 ADMIN_RE = re.compile(r'(?:' + '|'.join(ADMIN_TRIGGERS) + r')', re.IGNORECASE)
 CONTACT_RE = re.compile(r'(?:' + '|'.join(CONTACT_TRIGGERS) + r')', re.IGNORECASE)
+ANALYST_RE = re.compile(r'(?:' + '|'.join(ANALYST_TRIGGERS) + r')', re.IGNORECASE)
+ALL_CONTACT_TRIGGERS_RE = re.compile(r'(?:' + '|'.join(OWNER_TRIGGERS + ADMIN_TRIGGERS + CONTACT_TRIGGERS + ANALYST_TRIGGERS) + r')', re.IGNORECASE)
 
 # Regex pattern matching any Telegram handle or URL enclosed in a single non-capturing group:
 TG_HANDLE_OR_URL_PATTERN = re.compile(
@@ -178,6 +200,8 @@ def extract_contacts(text: str, description: str, channel_username: str) -> Dict
         'contact_username': None,
         'admin_username': None,
         'owner_username': None,
+        'analyst_username': None,
+        'contact_name': None,
         'bot_username': None,
         'social_links': [],
         'structured_contacts': [],
@@ -277,9 +301,10 @@ def extract_contacts(text: str, description: str, channel_username: str) -> Dict
             if not handles_in_line:
                 continue
 
-            # Classify line by priority: Owner > Admin > Contact
+            # Classify line by priority: Owner > Admin > Analyst > Contact
             is_owner_line = bool(OWNER_RE.search(line_str))
             is_admin_line = bool(ADMIN_RE.search(line_str))
+            is_analyst_line = bool(ANALYST_RE.search(line_str))
             is_contact_line = bool(CONTACT_RE.search(line_str))
 
             for h in handles_in_line:
@@ -301,6 +326,11 @@ def extract_contacts(text: str, description: str, channel_username: str) -> Dict
                     contacts['structured_contacts'].append({"type": "admin", "value": h, "confidence": 90})
                     if contacts['source'] == 'unknown':
                         contacts['source'] = f"{source_type}_admin"
+                elif is_analyst_line and not contacts.get('analyst_username'):
+                    contacts['analyst_username'] = h
+                    contacts['structured_contacts'].append({"type": "analyst", "value": h, "confidence": 90})
+                    if contacts['source'] == 'unknown':
+                        contacts['source'] = f"{source_type}_analyst"
                 elif is_contact_line and not contacts['contact_username']:
                     contacts['contact_username'] = h
                     contacts['structured_contacts'].append({"type": "contact", "value": h, "confidence": 85})
@@ -311,7 +341,7 @@ def extract_contacts(text: str, description: str, channel_username: str) -> Dict
                         all_unattributed_handles.append(h)
 
     # Fallback to unattributed handles if contact_username is still empty
-    if not (contacts['owner_username'] or contacts['admin_username'] or contacts['contact_username']):
+    if not (contacts['owner_username'] or contacts['admin_username'] or contacts.get('analyst_username') or contacts['contact_username']):
         for h in all_unattributed_handles:
             if is_valid_cand(h) and not _is_bot(h):
                 contacts['contact_username'] = h
@@ -320,11 +350,41 @@ def extract_contacts(text: str, description: str, channel_username: str) -> Dict
                 break
 
     # Consolidate primary contact_username:
-    # If contact_username is not explicitly filled, use owner_username, then admin_username
+    # Priority: owner_username > admin_username > analyst_username > contact_username
     if not contacts['contact_username']:
         if contacts['owner_username']:
             contacts['contact_username'] = contacts['owner_username']
         elif contacts['admin_username']:
             contacts['contact_username'] = contacts['admin_username']
+        elif contacts.get('analyst_username'):
+            contacts['contact_username'] = contacts['analyst_username']
 
     return contacts
+
+
+def is_contact_mention(text: str, mention: str) -> bool:
+    """
+    Determines if an @mention in a post occurs within a contact, support, admin, or analyst context
+    (e.g., 'للتواصل @handle', 'المحلل @handle', 'الدعم @handle', 'حسابي @handle').
+    If True, the mention represents a contact person for the channel, NOT an independent channel!
+    """
+    if not text or not mention:
+        return False
+        
+    m_clean = re.escape(mention.lstrip('@'))
+    
+    # 1. Search line by line for precise context
+    for line in text.split('\n'):
+        if re.search(r'@?' + m_clean + r'\b', line, re.IGNORECASE):
+            if ALL_CONTACT_TRIGGERS_RE.search(line):
+                return True
+
+    # 2. Window-based check: check 80 chars before and 40 chars after the mention
+    for m in re.finditer(r'@?' + m_clean + r'\b', text, re.IGNORECASE):
+        start = max(0, m.start() - 80)
+        end = min(len(text), m.end() + 40)
+        window = text[start:end]
+        if ALL_CONTACT_TRIGGERS_RE.search(window):
+            return True
+            
+    return False

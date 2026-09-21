@@ -281,9 +281,10 @@ def get_discovered_24h(
             # 1. 24h Summary KPI Metrics
             cur.execute("""
                 SELECT 
-                    COUNT(*) as total_discovered,
+                    COUNT(*) FILTER (WHERE status != 'user_account' AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as total_discovered,
                     COUNT(*) FILTER (WHERE status = 'new' AND (lead_score >= 10 OR tier IS NOT NULL)) as qualified_count,
-                    COUNT(*) FILTER (WHERE status = 'new' AND lead_score IS NULL AND tier IS NULL) as pending_scan_count,
+                    COUNT(*) FILTER (WHERE (member_count > 0 OR lead_score >= 10 OR (description IS NOT NULL AND description != '')) AND status != 'user_account' AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as verified_count,
+                    COUNT(*) FILTER (WHERE status = 'new' AND lead_score IS NULL AND tier IS NULL AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as pending_scan_count,
                     COUNT(*) FILTER (WHERE status = 'rejected') as rejected_count,
                     COUNT(*) FILTER (WHERE (contact_username IS NOT NULL AND contact_username != '') OR (whatsapp IS NOT NULL AND whatsapp != '')) as with_contact_count,
                     COUNT(*) FILTER (WHERE status = 'new' AND (lead_score >= 10 OR tier IS NOT NULL) AND ((contact_username IS NOT NULL AND contact_username != '') OR (whatsapp IS NOT NULL AND whatsapp != ''))) as qualified_with_contact_count,
@@ -345,10 +346,16 @@ def get_discovered_24h(
             top_sources = cur.fetchall()
 
             # 5. Query Channels list with filters and campaign approval state
-            where_clauses = ["l.discovered_at >= NOW() - INTERVAL '24 HOURS'"]
+            where_clauses = [
+                "l.discovered_at >= NOW() - INTERVAL '24 HOURS'",
+                "l.status != 'user_account'",
+                "l.channel_username ~ '^[a-zA-Z0-9_]{4,32}$'"
+            ]
             params = []
 
-            if status:
+            if not status or status.lower() in ('verified', 'scanned'):
+                where_clauses.append("(l.member_count > 0 OR l.lead_score >= 10 OR (l.description IS NOT NULL AND l.description != ''))")
+            elif status:
                 st = status.lower()
                 if st in ('new', 'qualified'):
                     where_clauses.append("l.status = 'new' AND (l.lead_score >= 10 OR l.tier IS NOT NULL)")
@@ -358,6 +365,8 @@ def get_discovered_24h(
                     where_clauses.append("(l.contact_username IS NOT NULL AND l.contact_username != '') OR (l.whatsapp IS NOT NULL AND l.whatsapp != '')")
                 elif st == 'pending_scan':
                     where_clauses.append("l.status = 'new' AND l.lead_score IS NULL AND l.tier IS NULL")
+                elif st == 'all':
+                    pass
 
             if tier and tier.lower() != 'all':
                 where_clauses.append("l.tier = %s")
@@ -377,7 +386,7 @@ def get_discovered_24h(
 
             channel_query = f"""
                 SELECT 
-                    l.id, l.channel_username, l.member_count, l.description,
+                    l.id, l.channel_username, l.title, l.member_count, l.description,
                     l.language, l.arabic_ratio, l.contact_username, l.whatsapp, l.website,
                     l.lead_score, l.tier, l.status, l.discovered_at, l.last_activity,
                     COALESCE(l.forex_intent_score, 0) as forex_score,
@@ -391,7 +400,9 @@ def get_discovered_24h(
                 FROM leads l
                 LEFT JOIN campaign_logs cl ON cl.lead_id = l.id
                 WHERE {where_sql}
-                ORDER BY l.discovered_at DESC
+                ORDER BY 
+                    CASE WHEN l.member_count > 0 OR l.lead_score >= 10 THEN 0 ELSE 1 END,
+                    l.discovered_at DESC
                 LIMIT %s OFFSET %s;
             """
             params.extend([limit, offset])
@@ -2121,10 +2132,12 @@ DASHBOARD_PAGE_HTML = """
                         <!-- Left: Status Filter Pills -->
                         <div class="flex flex-wrap items-center gap-2">
                             <span class="text-xs font-semibold uppercase tracking-wider text-slate-400 mr-1">Status:</span>
-                            <button onclick="setDiscoveredFilter('all')" id="disc-flt-all" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-500 text-white transition">All Discovered</button>
+                            <button onclick="setDiscoveredFilter('verified')" id="disc-flt-verified" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-500 text-white transition">⚡ Verified Channels</button>
                             <button onclick="setDiscoveredFilter('qualified')" id="disc-flt-qualified" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">🎯 Qualified Only</button>
                             <button onclick="setDiscoveredFilter('with_contact')" id="disc-flt-contact" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">👤 With Direct Contact</button>
+                            <button onclick="setDiscoveredFilter('pending_scan')" id="disc-flt-pending" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">⏳ Pending Scan</button>
                             <button onclick="setDiscoveredFilter('rejected')" id="disc-flt-rejected" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">🚫 Filtered / Rejected</button>
+                            <button onclick="setDiscoveredFilter('all')" id="disc-flt-all" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">All Candidates</button>
                         </div>
 
                         <!-- Right: Tier & Search Inputs -->
@@ -3416,7 +3429,7 @@ DASHBOARD_PAGE_HTML = """
             };
 
             // ── Discovered 24h State & Handlers ────────────────────────────────
-            let discFilterStatus = 'all';
+            let discFilterStatus = 'verified';
             let discFilterTier = 'all';
             let discSearchQuery = '';
             let discSelectedLeads = new Set();
@@ -3425,10 +3438,12 @@ DASHBOARD_PAGE_HTML = """
             function setDiscoveredFilter(status) {
                 discFilterStatus = status;
                 const buttons = {
-                    'all': document.getElementById('disc-flt-all'),
+                    'verified': document.getElementById('disc-flt-verified'),
                     'qualified': document.getElementById('disc-flt-qualified'),
                     'with_contact': document.getElementById('disc-flt-contact'),
-                    'rejected': document.getElementById('disc-flt-rejected')
+                    'pending_scan': document.getElementById('disc-flt-pending'),
+                    'rejected': document.getElementById('disc-flt-rejected'),
+                    'all': document.getElementById('disc-flt-all')
                 };
                 const activeClass = "px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-500 text-white transition";
                 const inactiveClass = "px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition";
@@ -3665,9 +3680,10 @@ DASHBOARD_PAGE_HTML = """
                             </td>
                             <td class="px-4 py-3">
                                 <div class="flex items-center space-x-1.5">
-                                    <a href="${tmeLink}" target="_blank" class="font-semibold text-slate-100 hover:text-indigo-300 truncate max-w-[180px]">${username}</a>
+                                    <a href="${tmeLink}" target="_blank" class="font-semibold text-slate-100 hover:text-indigo-300 truncate max-w-[220px]">${ch.title ? ch.title : '@' + username}</a>
                                 </div>
-                                <div class="text-[11px] text-slate-500 truncate max-w-[200px]" title="${(ch.description || '').replace(/"/g, '&quot;')}">${ch.description || 'No description'}</div>
+                                ${ch.title ? `<div class="text-[10px] text-indigo-400 font-mono">@${username}</div>` : ''}
+                                <div class="text-[11px] text-slate-500 truncate max-w-[220px]" title="${(ch.description || '').replace(/"/g, '&quot;')}">${ch.description || 'No description'}</div>
                             </td>
                             <td class="px-4 py-3 text-center">
                                 <span class="px-1.5 py-0.5 rounded text-[10px] font-medium ${isGroup ? 'bg-purple-950/60 text-purple-300 border border-purple-800/40' : 'bg-blue-950/60 text-blue-300 border border-blue-800/40'}">

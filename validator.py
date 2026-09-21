@@ -2181,8 +2181,28 @@ class LeadValidator:
                 is_channel = isinstance(entity, Channel) and getattr(entity, 'broadcast', False)
 
             if not is_group and not is_channel:
-                logging.info(f"Target {actual_link} is neither a Group nor a broadcast Channel (resolved as {type(entity).__name__}). Blacklisting...")
+                resolved_type = type(entity).__name__
+                logging.info(f"Target {actual_link} is neither a Group nor a broadcast Channel (resolved as {resolved_type}).")
                 self.db_helper.add_to_blacklist(actual_link, 'invalid_entity_type')
+
+                # Update lead record to 'user_account' so it does not clutter channels list
+                clean_ident = identifier.lstrip('@') if identifier else username
+                try:
+                    with self.db_helper.conn.cursor() as cur:
+                        cur.execute("UPDATE leads SET status = 'user_account', last_scan = NOW() WHERE channel_username = %s;", (clean_ident,))
+                        
+                        # If this user account was discovered from a parent channel, link it as contact!
+                        if discovery_source and discovery_source != 'unknown':
+                            cur.execute("""
+                                UPDATE leads 
+                                SET contact_username = COALESCE(NULLIF(contact_username, ''), %s),
+                                    admin_username = COALESCE(NULLIF(admin_username, ''), %s)
+                                WHERE channel_username = %s;
+                            """, (clean_ident, clean_ident, discovery_source.lstrip('@')))
+                    self.db_helper.conn.commit()
+                    logging.info(f"Updated lead @{clean_ident} to 'user_account' and linked as contact to parent @{discovery_source}")
+                except Exception as e:
+                    logging.warning(f"Failed to update user_account status for @{clean_ident}: {e}")
                 return
 
             full_chat_info = None

@@ -28,6 +28,7 @@ from app.graph.graph_importance import GraphImportanceCalculator
 from app.scheduler.watermark_manager import WatermarkManager
 from app.discovery.provenance import ProvenanceManager
 from app.discovery.relevance_evaluator import RelevanceEvaluator
+from app.validator.contact_extractor import is_contact_mention, extract_contacts
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -206,8 +207,33 @@ class GraphExpander:
         except Exception as e:
             logging.warning(f"[GRAPH] Failed to update last_graph_scan for @{username}: {e}")
 
+    def attach_channel_contact(self, source_username: str, contact_user: str, role: str = 'contact'):
+        """Attaches an extracted contact mention directly to the source channel in leads table."""
+        self.db_helper.check_connection()
+        try:
+            clean_contact = (contact_user or '').strip().lstrip('@')
+            if not re.match(r'^[a-zA-Z0-9_]{3,35}$', clean_contact) or clean_contact.lower() in JUNK_USERNAMES:
+                return
+            query = """
+            UPDATE leads 
+            SET contact_username = COALESCE(NULLIF(contact_username, ''), %s),
+                admin_username = COALESCE(NULLIF(admin_username, ''), %s)
+            WHERE channel_username = %s;
+            """
+            with self.db_helper.conn.cursor() as cur:
+                cur.execute(query, (clean_contact, clean_contact, source_username))
+            self.db_helper.conn.commit()
+            logging.info(f"[GRAPH] Linked direct contact @{clean_contact} ({role}) to parent channel @{source_username}")
+        except Exception as e:
+            logging.warning(f"[GRAPH] Failed to link contact @{contact_user} to @{source_username}: {e}")
+
     def insert_or_get_target_lead(self, username: str, depth: int, source_username: str) -> str:
-        """Upserts stub lead for newly discovered target."""
+        """Upserts stub lead for newly discovered target only if strictly valid channel username."""
+        clean_user = (username or '').strip().lstrip('@')
+        # Only accept standard alphanumeric Telegram channel usernames
+        if not re.match(r'^[a-zA-Z0-9_]{4,32}$', clean_user) or clean_user.lower() in JUNK_USERNAMES:
+            return ''
+
         self.db_helper.check_connection()
         try:
             query = """
@@ -218,12 +244,12 @@ class GraphExpander:
             RETURNING id;
             """
             with self.db_helper.conn.cursor() as cur:
-                cur.execute(query, (username, depth, source_username))
+                cur.execute(query, (clean_user, depth, source_username))
                 res = cur.fetchone()
-                return str(res['id']) if res else str(self.db_helper.get_lead_id_by_username(username))
+                return str(res['id']) if res else str(self.db_helper.get_lead_id_by_username(clean_user))
         except Exception as e:
-            logging.warning(f"Failed to upsert lead @{username}: {e}")
-            return str(self.db_helper.get_lead_id_by_username(username) or '')
+            logging.warning(f"Failed to upsert lead @{clean_user}: {e}")
+            return str(self.db_helper.get_lead_id_by_username(clean_user) or '')
 
     async def fetch_posts(self, entity, limit: int = 300) -> list:
         raw_username = getattr(entity, 'username', None) or str(getattr(entity, 'id', 'unknown'))
@@ -299,7 +325,10 @@ class GraphExpander:
                     if fwd_name and not (fwd_name.lower().endswith("bot") or fwd_name.lower().endswith("_bot")):
                         clean_fwd = normalize_telegram_link(fwd_name)
                         link_type, fwd_user = parse_telegram_link(clean_fwd)
-                        target_ident = fwd_user or fwd_name
+                        cand = fwd_user or fwd_name
+                        # Strictly require a valid alphanumeric Telegram channel username (never names with spaces or Arabic)
+                        if re.match(r'^[a-zA-Z0-9_]{4,32}$', cand):
+                            target_ident = cand
                 elif fwd.get("channel_id"):
                     target_ident = fwd["channel_id"]
                 elif fwd.get("peer_id"):
@@ -341,6 +370,11 @@ class GraphExpander:
                 if m_lower not in JUNK_USERNAMES and not (m_lower.endswith("bot") or m_lower.endswith("_bot")):
                     is_disq, _ = RelevanceEvaluator.is_hard_disqualified(mention)
                     if not is_disq:
+                        # Check if mention is a contact/support/analyst of the current channel
+                        if is_contact_mention(msg_text, mention):
+                            self.attach_channel_contact(username, mention, role='post_mention_contact')
+                            continue
+
                         discovered_edges.append({
                             "target_username": mention,
                             "relation": EdgeRelation.MENTION,
@@ -450,6 +484,16 @@ class GraphExpander:
                 target_q = decision.target_queue
                 self.redis_conn.rpush(target_q, payload)
                 new_queued += 1
+
+        # Deep contact extraction for the channel itself across all messages and about text
+        try:
+            posts_blob = "\n".join([getattr(m, 'message', '') or '' for m in messages[:50] if getattr(m, 'message', None)])
+            about_text = getattr(entity, 'about', '') or ''
+            extracted_info = extract_contacts(text=posts_blob, description=about_text, channel_username=username)
+            if extracted_info.get('contact_username'):
+                self.attach_channel_contact(username, extracted_info['contact_username'], role=extracted_info.get('source', 'deep_scan'))
+        except Exception as e:
+            logging.debug(f"[GRAPH] Deep contact extraction error for @{username}: {e}")
 
         logging.info(f"[GRAPH] @{username} crawl complete: {len(messages)} posts -> {len(discovered_edges)} edges -> {new_queued} new candidates queued.")
         self.update_last_graph_scan(username)
