@@ -304,9 +304,17 @@ async def main():
             success = False
             error_message = None
 
+            clean_target = re.sub(r'https?://[^\s]+', '', target_username)
+            clean_target = re.sub(r'https?$', '', clean_target)
+            clean_target = clean_target.strip().lstrip('@').rstrip('._-')
+
             try:
                 async def resolve_and_send(client):
-                    peer = await client.get_input_entity(target_username)
+                    from telethon.tl.types import User
+                    entity = await client.get_entity(clean_target)
+                    if not isinstance(entity, User):
+                        raise ValueError(f"Target @{clean_target} is a {type(entity).__name__}, not a user account. Cannot send direct message.")
+                    peer = await client.get_input_entity(entity)
                     return await send_telegram_message(client, peer, message_text, media_path)
 
                 await tg_manager.execute_request(

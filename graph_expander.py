@@ -689,7 +689,13 @@ class GraphExpander:
             if self.shutdown_event.is_set():
                 break
 
-            await self.expand_entity(row)
+            ok = await self.expand_entity(row)
+            if not ok and self.tg_manager:
+                non_user_sessions = [s for s in self.tg_manager.clients.keys() if s != 'user_session']
+                if non_user_sessions and all(self.tg_manager.is_rate_limited(s) for s in non_user_sessions):
+                    logging.warning("[GRAPH] All discovery sessions are currently quarantined in cooldown. Pausing expansion cycle.")
+                    break
+
             await asyncio.sleep(3)
 
     async def start(self):

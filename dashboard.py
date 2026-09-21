@@ -291,6 +291,10 @@ def get_discovered_24h(
                     COUNT(*) FILTER (WHERE whatsapp IS NOT NULL AND whatsapp != '') as with_whatsapp_count,
                     COUNT(*) FILTER (WHERE is_group = TRUE) as groups_count,
                     COUNT(*) FILTER (WHERE is_group = FALSE AND (entity_type IS NULL OR entity_type != 'user')) as channels_count,
+                    COUNT(*) FILTER (WHERE is_exchange_hub = TRUE) as exchange_hubs_count,
+                    COUNT(*) FILTER (WHERE is_exchange_seed = TRUE) as exchange_seeds_count,
+                    COUNT(*) FILTER (WHERE member_count BETWEEN 1000 AND 35000) as sweet_spot_count,
+                    COUNT(*) FILTER (WHERE COALESCE(exchange_affinity_score, 0) >= 35) as high_affinity_count,
                     ROUND(AVG(COALESCE(lead_score, 0)) FILTER (WHERE lead_score IS NOT NULL), 1) as avg_score,
                     ROUND(AVG(COALESCE(forex_intent_score, 0)) FILTER (WHERE forex_intent_score IS NOT NULL), 1) as avg_forex_score
                 FROM leads
@@ -366,6 +370,14 @@ def get_discovered_24h(
                     where_clauses.append("(l.contact_username IS NOT NULL AND l.contact_username != '') OR (l.whatsapp IS NOT NULL AND l.whatsapp != '')")
                 elif st == 'pending_scan':
                     where_clauses.append("l.status = 'new' AND l.lead_score IS NULL AND l.tier IS NULL")
+                elif st in ('exchange_hubs', 'hubs'):
+                    where_clauses.append("l.is_exchange_hub = TRUE")
+                elif st in ('exchange_seeds', 'seeds'):
+                    where_clauses.append("l.is_exchange_seed = TRUE")
+                elif st in ('sweet_spot', 'sweetspot'):
+                    where_clauses.append("l.member_count BETWEEN 1000 AND 35000")
+                elif st in ('high_affinity', 'affinity', 'exchange'):
+                    where_clauses.append("COALESCE(l.exchange_affinity_score, 0) >= 35")
                 elif st == 'all':
                     pass
 
@@ -390,12 +402,19 @@ def get_discovered_24h(
                     l.id, l.channel_username, l.title, l.member_count, l.description,
                     l.language, l.arabic_ratio, l.contact_username, l.whatsapp, l.website,
                     l.lead_score, l.tier, l.status, l.discovered_at, l.last_activity,
-                    COALESCE(l.forex_intent_score, 0) as forex_score,
+                    COALESCE(l.forex_intent_score, l.forex_score, 0) as forex_score,
                     COALESCE(l.commercial_fit_score, 0) as commercial_fit_score,
                     COALESCE(l.relevance_score, 0) as relevance_score,
                     COALESCE(l.outreach_priority, 'P3') as outreach_priority,
                     COALESCE(l.outreach_priority_score, 25) as outreach_priority_score,
                     l.outreach_priority_reason,
+                    COALESCE(l.is_exchange_hub, FALSE) as is_exchange_hub,
+                    COALESCE(l.is_exchange_seed, FALSE) as is_exchange_seed,
+                    COALESCE(l.exchange_affinity_score, 0) as exchange_affinity_score,
+                    COALESCE(l.network_value_score, 0) as network_value_score,
+                    COALESCE(l.growth_openness_score, 0) as growth_openness_score,
+                    l.exchange_evidence,
+                    l.cluster_id,
                     l.discovery_source, l.discovery_method, l.is_group,
                     cl.status as campaign_status, cl.id as campaign_log_id
                 FROM leads l
@@ -403,6 +422,7 @@ def get_discovered_24h(
                 WHERE {where_sql}
                 ORDER BY 
                     CASE WHEN l.member_count > 0 OR l.lead_score >= 10 THEN 0 ELSE 1 END,
+                    COALESCE(l.exchange_affinity_score, 0) DESC,
                     l.discovered_at DESC
                 LIMIT %s OFFSET %s;
             """
@@ -1049,6 +1069,50 @@ def get_graph_network():
         }
     except Exception as e:
         logging.error(f"Error fetching network structure: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/network/overview", dependencies=[Depends(verify_dashboard_auth)])
+def get_network_overview():
+    """
+    Exposes high-level Exchange Network topology: Hubs, Seeds, Sweet-Spot nodes, and Top Exchange Clusters.
+    """
+    try:
+        with get_db_cursor(commit_on_success=False) as cur:
+            cur.execute("""
+                SELECT 
+                    COUNT(*) as total_leads,
+                    COUNT(*) FILTER (WHERE status != 'rejected') as active_leads,
+                    COUNT(*) FILTER (WHERE is_exchange_hub = TRUE) as exchange_hubs_count,
+                    COUNT(*) FILTER (WHERE is_exchange_seed = TRUE) as exchange_seeds_count,
+                    COUNT(*) FILTER (WHERE member_count BETWEEN 1000 AND 35000) as sweet_spot_count,
+                    COUNT(*) FILTER (WHERE COALESCE(exchange_affinity_score, 0) >= 35) as high_affinity_count,
+                    COUNT(DISTINCT cluster_id) as clusters_count,
+                    ROUND(AVG(COALESCE(exchange_affinity_score, 0)) FILTER (WHERE exchange_affinity_score IS NOT NULL), 1) as avg_affinity
+                FROM leads;
+            """)
+            stats = cur.fetchone() or {}
+
+            # Top 15 Exchange Hubs
+            cur.execute("""
+                SELECT id, channel_username, title, member_count, lead_score, tier,
+                       exchange_affinity_score, network_value_score, is_exchange_hub, is_exchange_seed,
+                       cluster_id, contact_username, exchange_evidence
+                FROM leads
+                WHERE (is_exchange_hub = TRUE OR is_exchange_seed = TRUE OR COALESCE(exchange_affinity_score, 0) >= 35)
+                  AND status != 'rejected'
+                ORDER BY COALESCE(exchange_affinity_score, 0) DESC, member_count DESC
+                LIMIT 15;
+            """)
+            top_hubs = cur.fetchall()
+
+        return {
+            "success": True,
+            "stats": stats,
+            "top_hubs": top_hubs
+        }
+    except Exception as e:
+        logging.error(f"Error fetching network overview: {e}")
         return {"success": False, "error": str(e)}
 
 
@@ -2135,6 +2199,10 @@ DASHBOARD_PAGE_HTML = """
                             <span class="text-xs font-semibold uppercase tracking-wider text-slate-400 mr-1">Status:</span>
                             <button onclick="setDiscoveredFilter('verified')" id="disc-flt-verified" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-500 text-white transition">⚡ Verified Channels</button>
                             <button onclick="setDiscoveredFilter('qualified')" id="disc-flt-qualified" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">🎯 Qualified Only</button>
+                            <button onclick="setDiscoveredFilter('exchange_hubs')" id="disc-flt-hubs" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">🔄 Exchange Hubs</button>
+                            <button onclick="setDiscoveredFilter('exchange_seeds')" id="disc-flt-seeds" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">🌱 Exchange Seeds</button>
+                            <button onclick="setDiscoveredFilter('sweet_spot')" id="disc-flt-sweetspot" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">🎯 Sweet Spot (1k-35k)</button>
+                            <button onclick="setDiscoveredFilter('high_affinity')" id="disc-flt-affinity" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">🤝 Cross-Promo</button>
                             <button onclick="setDiscoveredFilter('with_contact')" id="disc-flt-contact" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">👤 With Direct Contact</button>
                             <button onclick="setDiscoveredFilter('pending_scan')" id="disc-flt-pending" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">⏳ Pending Scan</button>
                             <button onclick="setDiscoveredFilter('rejected')" id="disc-flt-rejected" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">🚫 Filtered / Rejected</button>
@@ -3394,6 +3462,13 @@ DASHBOARD_PAGE_HTML = """
                                                 ${prioBadge}
                                                 <a href="https://t.me/${l.channel_username}" target="_blank" class="hover:underline">@${l.channel_username}</a>
                                             </div>
+                                            <div class="mt-1 flex flex-wrap items-center gap-1">
+                                                ${l.is_exchange_hub ? '<span class="text-[9px] text-amber-300 font-bold bg-amber-500/20 px-1.5 py-0.5 rounded border border-amber-500/30">🔄 Hub</span>' : ''}
+                                                ${l.is_exchange_seed ? '<span class="text-[9px] text-emerald-300 font-bold bg-emerald-500/20 px-1.5 py-0.5 rounded border border-emerald-500/30">🌱 Seed</span>' : ''}
+                                                ${(l.member_count >= 1000 && l.member_count <= 35000) ? '<span class="text-[9px] text-cyan-300 font-bold bg-cyan-500/20 px-1.5 py-0.5 rounded border border-cyan-500/30">🎯 1k-35k</span>' : ''}
+                                                ${(l.exchange_affinity_score >= 35) ? `<span class="text-[9px] text-purple-300 font-bold bg-purple-500/20 px-1.5 py-0.5 rounded border border-purple-500/30">🤝 ${l.exchange_affinity_score}%</span>` : ''}
+                                            </div>
+                                            ${l.priority_reason ? `<div class="text-[10px] text-slate-400 font-normal mt-1">${l.priority_reason}</div>` : ''}
                                         </td>
                                         <td class="px-6 py-4 font-medium text-slate-400">
                                             ${l.contact_username ? `<a href="https://t.me/${l.contact_username}" target="_blank" class="text-indigo-400 hover:underline">@${l.contact_username}</a>` : '<span class="text-slate-600">No Outward Contact</span>'}
@@ -3441,6 +3516,10 @@ DASHBOARD_PAGE_HTML = """
                 const buttons = {
                     'verified': document.getElementById('disc-flt-verified'),
                     'qualified': document.getElementById('disc-flt-qualified'),
+                    'exchange_hubs': document.getElementById('disc-flt-hubs'),
+                    'exchange_seeds': document.getElementById('disc-flt-seeds'),
+                    'sweet_spot': document.getElementById('disc-flt-sweetspot'),
+                    'high_affinity': document.getElementById('disc-flt-affinity'),
                     'with_contact': document.getElementById('disc-flt-contact'),
                     'pending_scan': document.getElementById('disc-flt-pending'),
                     'rejected': document.getElementById('disc-flt-rejected'),
@@ -3674,6 +3753,22 @@ DASHBOARD_PAGE_HTML = """
                         : `<button onclick="approveDiscoveredLead('${ch.id}')" class="px-2 py-1 text-[11px] font-semibold bg-emerald-600/30 hover:bg-emerald-600/50 text-emerald-300 border border-emerald-500/30 rounded-lg transition cursor-pointer">✓ Approve</button>`;
                     const rejectBtn = `<button onclick="rejectDiscoveredLead('${ch.id}', '${(ch.channel_username || '').replace(/'/g, "\\'")}')" class="px-2 py-1 text-[11px] font-semibold bg-rose-600/20 hover:bg-rose-600/40 text-rose-300 border border-rose-500/30 rounded-lg transition cursor-pointer" title="استبعاد وتعلم من القناة لمنع تكرارها">🚫 Reject</button>`;
 
+                    // Exchange Badges
+                    let exchangeBadges = '';
+                    if (ch.is_exchange_hub) {
+                        exchangeBadges += `<span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30 mr-1" title="Exchange Hub: Connected to multiple channels">🔄 Hub</span>`;
+                    }
+                    if (ch.is_exchange_seed) {
+                        exchangeBadges += `<span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 mr-1" title="Exchange Seed: High-expansion node">🌱 Seed</span>`;
+                    }
+                    const numMembers = ch.member_count || 0;
+                    if (numMembers >= 1000 && numMembers <= 35000) {
+                        exchangeBadges += `<span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 mr-1" title="Sweet Spot: 1k–35k members (optimal for mutual shoutouts)">🎯 Sweet Spot</span>`;
+                    }
+                    if ((ch.exchange_affinity_score || 0) >= 35) {
+                        exchangeBadges += `<span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-purple-500/20 text-purple-300 border border-purple-500/30 mr-1" title="Exchange Affinity: ${ch.exchange_affinity_score}% evidence of cross-promotions">🤝 Affinity: ${ch.exchange_affinity_score}%</span>`;
+                    }
+
                     return `
                         <tr class="hover:bg-slate-900/40 transition">
                             <td class="px-4 py-3 text-center">
@@ -3684,7 +3779,8 @@ DASHBOARD_PAGE_HTML = """
                                     <a href="${tmeLink}" target="_blank" class="font-semibold text-slate-100 hover:text-indigo-300 truncate max-w-[220px]">${ch.title ? ch.title : '@' + username}</a>
                                 </div>
                                 ${ch.title ? `<div class="text-[10px] text-indigo-400 font-mono">@${username}</div>` : ''}
-                                <div class="text-[11px] text-slate-500 truncate max-w-[220px]" title="${(ch.description || '').replace(/"/g, '&quot;')}">${ch.description || 'No description'}</div>
+                                ${exchangeBadges ? `<div class="mt-1 flex flex-wrap items-center gap-1">${exchangeBadges}</div>` : ''}
+                                <div class="text-[11px] text-slate-500 truncate max-w-[220px] mt-0.5" title="${(ch.description || '').replace(/"/g, '&quot;')}">${ch.description || 'No description'}</div>
                             </td>
                             <td class="px-4 py-3 text-center">
                                 <span class="px-1.5 py-0.5 rounded text-[10px] font-medium ${isGroup ? 'bg-purple-950/60 text-purple-300 border border-purple-800/40' : 'bg-blue-950/60 text-blue-300 border border-blue-800/40'}">
@@ -3694,7 +3790,7 @@ DASHBOARD_PAGE_HTML = """
                             <td class="px-4 py-3 text-right font-medium text-slate-300">${members}</td>
                             <td class="px-4 py-3 text-center">
                                 <span class="font-bold ${score >= 50 ? 'text-emerald-400' : 'text-slate-300'}">${score}</span>
-                                <span class="text-[10px] text-slate-500 block">FX: ${forexScore}</span>
+                                <span class="text-[10px] text-slate-500 block">FX: ${forexScore} | Exch: ${ch.exchange_affinity_score || 0}%</span>
                             </td>
                             <td class="px-4 py-3 text-center">${tierBadge}</td>
                             <td class="px-4 py-3 text-center font-medium text-slate-400">${arabicRatio}</td>

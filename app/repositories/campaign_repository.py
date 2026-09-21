@@ -134,7 +134,12 @@ class CampaignRepository:
                        COALESCE(l.outreach_priority_reason, cl.priority_reason) as priority_reason,
                        COALESCE(l.likely_services, cl.likely_services) as likely_services,
                        COALESCE(l.commercial_evidence, cl.intent_evidence) as intent_evidence,
-                       l.channel_username, l.contact_username, c.message_text
+                       l.channel_username, l.contact_username, c.message_text,
+                       COALESCE(l.member_count, 0) as member_count,
+                       COALESCE(l.is_exchange_hub, FALSE) as is_exchange_hub,
+                       COALESCE(l.is_exchange_seed, FALSE) as is_exchange_seed,
+                       COALESCE(l.exchange_affinity_score, 0) as exchange_affinity_score,
+                       l.exchange_evidence
                 FROM campaign_logs cl
                 JOIN campaigns c ON cl.campaign_id = c.id
                 JOIN leads l ON cl.lead_id = l.id

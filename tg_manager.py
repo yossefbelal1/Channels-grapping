@@ -237,6 +237,10 @@ class TelegramManager:
                         primary_account = acc
                     elif acc.get("role") in backup_roles:
                         backup_accounts.append(acc)
+                    elif w_type != 'campaign' and session_to_load != 'user_session' and acc.get("role") != 'user_joiner' and acc.get("session_name") != 'user_session':
+                        # Allow general research / backup accounts as secondary failovers
+                        if acc not in backup_accounts:
+                            backup_accounts.append(acc)
             except Exception as e:
                 logging.error(f"Error reading accounts.json: {e}")
 
@@ -479,19 +483,20 @@ class TelegramManager:
             logging.error(f"Rate limiter Redis/Lua error for '{session_name}': {e}. Failing CLOSED to prevent Telegram account bans.")
             return False
 
+    def is_rate_limited(self, name: str) -> bool:
+        """Returns True if the given session is currently in a cooldown or FloodWait window."""
+        until_ts = self.redis_conn.get(f"health:{name}:rate_limited_until")
+        if until_ts:
+            try:
+                return time.time() < float(until_ts)
+            except ValueError:
+                pass
+        return False
+
     def get_healthiest_session(self, preferred_session: str = None) -> str:
         """Finds the healthiest available session name not currently rate-limited."""
-        def is_rate_limited(name: str) -> bool:
-            until_ts = self.redis_conn.get(f"health:{name}:rate_limited_until")
-            if until_ts:
-                try:
-                    return time.time() < float(until_ts)
-                except ValueError:
-                    pass
-            return False
-
         if preferred_session and preferred_session in self.clients:
-            if self.get_health_score(preferred_session) >= 30 and not is_rate_limited(preferred_session):
+            if self.get_health_score(preferred_session) >= 30 and not self.is_rate_limited(preferred_session):
                 return preferred_session
 
         best_session = None
@@ -563,9 +568,23 @@ class TelegramManager:
             # 1. Select healthiest, least-loaded available candidate (v7 Account Pool)
             eligible_candidates = [
                 name for name in total_candidates
-                if name not in attempted_sessions and not self.is_account_banned(name)
+                if name not in attempted_sessions and not self.is_account_banned(name) and not self.is_rate_limited(name)
             ]
             if not eligible_candidates:
+                quarantined = [name for name in total_candidates if self.is_rate_limited(name)]
+                if quarantined:
+                    wait_times = []
+                    for q_name in quarantined:
+                        u_ts = self.redis_conn.get(f"health:{q_name}:rate_limited_until")
+                        if u_ts:
+                            try:
+                                rem = float(u_ts) - time.time()
+                                if rem > 0:
+                                    wait_times.append(rem)
+                            except ValueError:
+                                pass
+                    min_wait = min(wait_times) if wait_times else 60
+                    logging.warning(f"All candidate sessions {total_candidates} are rate-limited or in cooldown. Earliest expiry in {int(min_wait)}s.")
                 break # All candidates exhausted
 
             if preferred_session and preferred_session in eligible_candidates:
