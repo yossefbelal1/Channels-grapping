@@ -79,3 +79,21 @@ def test_ignore_self_username():
     assert contacts["contact_username"] is None
     assert contacts["owner_username"] is None
     assert contacts["admin_username"] is None
+
+
+def test_ignore_youtube_and_email_handles():
+    desc = "تابعنا على يوتيوب: https://youtube.com/@hendawi2026 أو راسلنا على admin@forexsite.com\nللتواصل تيليجرام: @abu_shaqran"
+    contacts = extract_contacts(text="", description=desc, channel_username="abo_shaqran")
+    
+    assert contacts["contact_username"] == "abu_shaqran"
+    assert "hendawi2026" not in [c["value"] for c in contacts["structured_contacts"] if c["type"] in ("owner", "admin", "contact")]
+
+
+def test_pinned_message_contact_priority():
+    pinned = "عرض خاص للأعضاء: تواصل مع الدعم للاشتراك @VIP_Support_Now"
+    desc = "قناة التوصيات العامة\nللمتابعة العامة: @General_Info"
+    contacts = extract_contacts(text="", description=desc, channel_username="SignalsRoom", pinned_text=pinned)
+    
+    assert contacts["contact_username"] == "VIP_Support_Now"
+    assert contacts["source"] in ("pinned_admin", "pinned_contact")
+

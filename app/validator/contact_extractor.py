@@ -151,10 +151,11 @@ ANALYST_RE = re.compile(r'(?:' + '|'.join(ANALYST_TRIGGERS) + r')', re.IGNORECAS
 ALL_CONTACT_TRIGGERS_RE = re.compile(r'(?:' + '|'.join(OWNER_TRIGGERS + ADMIN_TRIGGERS + CONTACT_TRIGGERS + ANALYST_TRIGGERS) + r')', re.IGNORECASE)
 
 # Regex pattern matching any Telegram handle or URL enclosed in a single non-capturing group:
+# Uses negative lookbehind (?<![a-zA-Z0-9._/-]) to avoid capturing YouTube/TikTok handles or email addresses
 TG_HANDLE_OR_URL_PATTERN = re.compile(
     r'(?:(?:https?://)?(?:t\.me|telegram\.(?:me|dog))/([a-zA-Z0-9_]{3,35})|'
     r'tg://resolve\?domain=([a-zA-Z0-9_]{3,35})|'
-    r'@([a-zA-Z0-9_]{3,35}))',
+    r'(?<![a-zA-Z0-9._/-])@([a-zA-Z0-9_]{3,35}))',
     re.IGNORECASE
 )
 
