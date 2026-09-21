@@ -230,12 +230,12 @@ def apply_natural_greeting_variation(text: str) -> str:
 
 from app.validator.contact_extractor import extract_contacts as _smart_extract_contacts
 
-def extract_contacts(text: str, description: str, channel_username: str) -> dict:
+def extract_contacts(text: str, description: str, channel_username: str, pinned_text: Optional[str] = None) -> dict:
     """
     Extracts contact info (website, email, whatsapp, support usernames) using the
     advanced multi-surface, emoji-aware contact extraction engine.
     """
-    return _smart_extract_contacts(text, description, channel_username)
+    return _smart_extract_contacts(text, description, channel_username, pinned_text=pinned_text)
 
 
 
@@ -2473,7 +2473,7 @@ class LeadValidator:
                 sample_text_list.append(pinned_text)
             sample_text = " \n ".join(sample_text_list)
             
-            contacts = extract_contacts(sample_text, description, username)
+            contacts = extract_contacts(sample_text, description, username, pinned_text=pinned_text)
             
             # Pre-register lead to get its UUID and count incoming mentions
             source_id = self.db_helper.insert_stub_lead(username)

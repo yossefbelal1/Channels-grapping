@@ -254,7 +254,19 @@ class TelegramManager:
                         "api_hash": api_hash
                     }
                 ]
-                logging.info(f"Loaded assigned account configuration '{session_to_load}' from .env parameters.")
+                # If worker is for research/graph/radar/validation, register available auxiliary sessions for failover
+                if w_type != 'campaign' and session_to_load != 'user_session':
+                    research_pool = ["acc_12723433281", "acc_14809564829", "radar_session", "scavenger_session"]
+                    for r_sess in research_pool:
+                        if r_sess != session_to_load and not any(a["session_name"] == r_sess for a in self.accounts):
+                            self.accounts.append({
+                                "session_name": r_sess,
+                                "api_id": int(api_id),
+                                "api_hash": api_hash
+                            })
+                    logging.info(f"Registered {len(self.accounts)} research account(s) for worker '{w_type}' (active + failover pool).")
+                else:
+                    logging.info(f"Loaded assigned account configuration '{session_to_load}' from .env parameters.")
             else:
                 logging.error(f"No Telegram account configuration found for session: {session_to_load}")
 

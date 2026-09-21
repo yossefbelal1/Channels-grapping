@@ -57,6 +57,12 @@ ADMIN_TRIGGERS = [
     r'(?:لل|ل)?خدم[ةه]\s*(?:العملاء|المشتركين)',
     r'(?:لل|ل)?(?:ال)?[إا]دار[ةه]\s*(?:العامة|الرسمية)?',
     r'معرف\s*(?:الادارة|الإدارة|الدعم)',
+    r'راسل\s*(?:الادارة|الإدارة|الدعم|المدير|المشرف)',
+    r'تراسل\s*(?:الادارة|الإدارة|الدعم|المدير|المشرف)',
+    r'مراسلة\s*(?:الادارة|الإدارة|الدعم)',
+    r'حساب\s*(?:الادارة|الإدارة|الدعم|الوكالة)',
+    r'شروط\s*الوكالة',
+    r'تحت\s*الوكالة',
     r'(?:لل|ل)?(?:ال)?مدير\s*(?:العام|التنفيذي|المسؤول|المسئول)?',
     r'(?:لل|ل)?(?:ال)?مشرف\s*(?:العام|المسؤول|المسئول)?',
     r'(?:لل|ل)?(?:ال)?مس[ؤئ]ول\s*(?:العام)?',
@@ -91,7 +97,8 @@ CONTACT_TRIGGERS = [
     r'تواصل\s*خاص',
     r'راسلني\s*خاص',
     r'كلمني\s*خاص',
-    r'للاشتراك\s*(?:بالـ\s*vip|في\s*الـ\s*vip|بالقناة\s*الخاصة|بالقناه\s*الخاصه)?',
+    r'للاشتراك\s*(?:بالـ\s*vip|في\s*الـ\s*vip|بالقناة\s*الخاصة|بالقناه\s*الخاصه|أو\s*معرفة\s*شروط\s*الوكالة|او\s*معرفة\s*شروط\s*الوكالة)?',
+    r'القناة\s*الخاص[ةه]',
     r'اشتراك\s*(?:vip)?',
     r'للانضمام',
     r'انضمام',
@@ -188,10 +195,16 @@ def _extract_handles_from_line(line: str) -> List[str]:
     return handles
 
 
-def extract_contacts(text: str, description: str, channel_username: str) -> Dict[str, Any]:
+def extract_contacts(
+    text: str,
+    description: str,
+    channel_username: str,
+    pinned_text: Optional[str] = None
+) -> Dict[str, Any]:
     """
     Extracts structured contact info (owner, admin, general contact, bot, whatsapp,
-    website, Linktree, social links) from text and description.
+    website, Linktree, social links) from text, description, and pinned message.
+    Pinned message has top priority for admin/subscription contacts.
     """
     contacts: Dict[str, Any] = {
         'website': None,
@@ -210,7 +223,8 @@ def extract_contacts(text: str, description: str, channel_username: str) -> Dict
 
     desc_clean = description or ''
     text_clean = text or ''
-    combined = f"{desc_clean}\n{text_clean}".strip()
+    pinned_clean = pinned_text or ''
+    combined = f"{pinned_clean}\n{desc_clean}\n{text_clean}".strip()
     if not combined:
         return contacts
 
@@ -285,14 +299,22 @@ def extract_contacts(text: str, description: str, channel_username: str) -> Dict
             return False
         return True
 
-    # Scan lines in description first (official channel bio), then in messages text
+    # Scan lines in pinned message first, then description (official bio), then messages text
     all_unattributed_handles: List[str] = []
 
-    for source_type, content in [('bio', desc_clean), ('text', text_clean)]:
+    sources = []
+    if pinned_clean:
+        sources.append(('pinned', pinned_clean))
+    if desc_clean:
+        sources.append(('bio', desc_clean))
+    if text_clean:
+        sources.append(('text', text_clean))
+
+    for source_type, content in sources:
         if not content:
             continue
         lines = content.split('\n')
-        for line in lines:
+        for i, line in enumerate(lines):
             line_str = line.strip()
             if not line_str:
                 continue
@@ -301,11 +323,20 @@ def extract_contacts(text: str, description: str, channel_username: str) -> Dict
             if not handles_in_line:
                 continue
 
+            # Check previous non-empty line to catch multi-line triggers: e.g. "راسل الإدارة 📩\n@G0ld_c"
+            prev_line = ""
+            for j in range(i - 1, -1, -1):
+                if lines[j].strip():
+                    prev_line = lines[j].strip()
+                    break
+
+            eval_text = f"{prev_line} {line_str}" if prev_line else line_str
+
             # Classify line by priority: Owner > Admin > Analyst > Contact
-            is_owner_line = bool(OWNER_RE.search(line_str))
-            is_admin_line = bool(ADMIN_RE.search(line_str))
-            is_analyst_line = bool(ANALYST_RE.search(line_str))
-            is_contact_line = bool(CONTACT_RE.search(line_str))
+            is_owner_line = bool(OWNER_RE.search(eval_text))
+            is_admin_line = bool(ADMIN_RE.search(eval_text))
+            is_analyst_line = bool(ANALYST_RE.search(eval_text))
+            is_contact_line = bool(CONTACT_RE.search(eval_text))
 
             for h in handles_in_line:
                 if not is_valid_cand(h):
