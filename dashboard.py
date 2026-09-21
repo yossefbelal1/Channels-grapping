@@ -286,6 +286,7 @@ def get_discovered_24h(
                     COUNT(*) FILTER (WHERE status = 'new' AND lead_score IS NULL AND tier IS NULL) as pending_scan_count,
                     COUNT(*) FILTER (WHERE status = 'rejected') as rejected_count,
                     COUNT(*) FILTER (WHERE (contact_username IS NOT NULL AND contact_username != '') OR (whatsapp IS NOT NULL AND whatsapp != '')) as with_contact_count,
+                    COUNT(*) FILTER (WHERE status = 'new' AND (lead_score >= 10 OR tier IS NOT NULL) AND ((contact_username IS NOT NULL AND contact_username != '') OR (whatsapp IS NOT NULL AND whatsapp != ''))) as qualified_with_contact_count,
                     COUNT(*) FILTER (WHERE whatsapp IS NOT NULL AND whatsapp != '') as with_whatsapp_count,
                     COUNT(*) FILTER (WHERE is_group = TRUE) as groups_count,
                     COUNT(*) FILTER (WHERE is_group = FALSE) as channels_count,
@@ -423,10 +424,13 @@ def get_discovered_24h(
 
         total_disc = summary_row.get('total_discovered') or 0
         qual_cnt = summary_row.get('qualified_count') or 0
+        qual_contact_cnt = summary_row.get('qualified_with_contact_count')
+        if qual_contact_cnt is None:
+            qual_contact_cnt = summary_row.get('with_contact_count') or 0
         contact_cnt = summary_row.get('with_contact_count') or 0
         pending_cnt = summary_row.get('pending_scan_count') or 0
 
-        contact_pct = round((contact_cnt * 100.0 / max(1, qual_cnt)), 1) if qual_cnt > 0 else 0
+        contact_pct = round((qual_contact_cnt * 100.0 / max(1, qual_cnt)), 1) if qual_cnt > 0 else 0
 
         return {
             "success": True,
@@ -3519,7 +3523,7 @@ DASHBOARD_PAGE_HTML = """
                 const contactElem = document.getElementById('disc24-contacts');
                 const contactPct = document.getElementById('disc24-contact-pct');
                 if (contactElem) contactElem.innerText = (s.with_contact_count || 0).toLocaleString();
-                if (contactPct) contactPct.innerText = `(${s.contact_extraction_rate || 0}%)`;
+                if (contactPct) contactPct.innerText = `(${s.contact_extraction_rate || 0}% of Qualified)`;
 
                 // System Health Badges
                 const healthBadge = document.getElementById('disc24-health-status');
