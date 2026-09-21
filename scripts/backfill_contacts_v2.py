@@ -46,7 +46,7 @@ def backfill_all():
                        status, tier, lead_score, commercial_fit_score, outreach_priority, outreach_priority_score
                 FROM leads
                 WHERE (description IS NOT NULL AND description != '')
-                   OR id IN (SELECT DISTINCT lead_id FROM channel_posts WHERE lead_id IS NOT NULL);
+                   OR channel_username IN (SELECT DISTINCT channel_username FROM channel_posts);
             """)
             leads = cur.fetchall()
             logger.info(f"Found {len(leads)} channels with stored descriptions/posts to evaluate.")
@@ -67,7 +67,7 @@ def backfill_all():
                     SELECT message_text
                     FROM channel_posts
                     WHERE channel_username = %s
-                    ORDER BY id DESC
+                    ORDER BY timestamp DESC
                     LIMIT 20;
                 """, (ch_user,))
                 post_rows = cur.fetchall()
