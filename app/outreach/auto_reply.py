@@ -225,8 +225,13 @@ class AutoReplyEngine:
         logging.info("Auto-Reply fallback dispatcher task started.")
         while not self.shutdown_event.is_set():
             try:
-                await asyncio.sleep(60)
+                await asyncio.sleep(30)
                 if not self.user_client or not self.user_client.is_connected():
+                    continue
+
+                # Multi-Tier Safety Guard Check
+                is_killed, kill_reason = is_kill_switch_active(self.redis_conn)
+                if is_killed or not is_outreach_enabled(self.redis_conn) or is_dry_run(self.redis_conn):
                     continue
 
                 self.db_helper.check_connection()
@@ -250,7 +255,7 @@ class AutoReplyEngine:
                         WHERE cl.status = 'sent'
                           AND cl.user_replied = TRUE
                           AND cl.auto_reply_sent = FALSE
-                          AND cl.sent_at >= NOW() - INTERVAL '24 hours'
+                          AND cl.sent_at >= NOW() - INTERVAL '30 days'
                         ORDER BY cl.sent_at ASC
                         LIMIT 5;
                     """)
@@ -258,17 +263,35 @@ class AutoReplyEngine:
 
                     for row in unreplied_leads:
                         log_id = row['log_id']
-                        target = row['telegram_user_id'] or row['contact_username']
-                        if not target:
+                        contact_username = row.get('contact_username')
+                        telegram_user_id = row.get('telegram_user_id')
+
+                        if not contact_username and not telegram_user_id:
                             continue
 
-                        lock_key = f"autoreply_lock:{target}"
-                        if not self.redis_conn.set(lock_key, "1", nx=True, ex=30):
+                        lock_key = f"autoreply_lock:{log_id}"
+                        if not self.redis_conn.set(lock_key, "1", nx=True, ex=60):
                             continue
 
                         try:
-                            peer = await self.user_client.get_input_entity(target)
-                            logging.info(f"Auto-Reply Fallback: Sending 2nd message to {target} (log {log_id})...")
+                            peer = None
+                            if contact_username and contact_username.strip():
+                                try:
+                                    peer = await self.user_client.get_input_entity(contact_username.strip().lstrip('@'))
+                                except Exception as u_err:
+                                    logging.debug(f"Auto-Reply Fallback: Resolve by username @{contact_username} failed: {u_err}")
+
+                            if not peer and telegram_user_id:
+                                try:
+                                    peer = await self.user_client.get_input_entity(int(telegram_user_id))
+                                except Exception as id_err:
+                                    logging.debug(f"Auto-Reply Fallback: Resolve by user_id {telegram_user_id} failed: {id_err}")
+
+                            if not peer:
+                                logging.warning(f"Auto-Reply Fallback: Could not resolve peer for log {log_id} (@{contact_username}, ID:{telegram_user_id})")
+                                continue
+
+                            logging.info(f"Auto-Reply Fallback: Sending 2nd message (with media) to @{contact_username} / {telegram_user_id} (log {log_id})...")
                             media_files = self._resolve_media(auto_media)
                             if media_files:
                                 if len(media_files) == 1:
@@ -284,8 +307,11 @@ class AutoReplyEngine:
                                 WHERE id = %s;
                             """, (log_id,))
                             conn.commit()
-                            self.redis_conn.set(f"autoreply_done:{target}", "1", ex=86400 * 30)
-                            logging.info(f"Auto-Reply Fallback: Successfully sent 2nd message to {target}!")
+                            if contact_username:
+                                self.redis_conn.set(f"autoreply_done:{contact_username.strip().lower().lstrip('@')}", "1", ex=86400 * 30)
+                            if telegram_user_id:
+                                self.redis_conn.set(f"autoreply_done:{telegram_user_id}", "1", ex=86400 * 30)
+                            logging.info(f"Auto-Reply Fallback: Successfully sent 2nd message to @{contact_username} / {telegram_user_id}!")
                             await asyncio.sleep(random.randint(5, 10))
 
                         except errors.FloodWaitError as fw:
@@ -293,7 +319,7 @@ class AutoReplyEngine:
                             await asyncio.sleep(fw.seconds)
                             break
                         except Exception as send_err:
-                            logging.error(f"Auto-Reply Fallback error sending to {target}: {send_err}")
+                            logging.error(f"Auto-Reply Fallback error sending to @{contact_username} / {telegram_user_id}: {send_err}")
                             cur.execute("UPDATE campaign_logs SET auto_reply_error = %s WHERE id = %s", (str(send_err), log_id))
                             conn.commit()
 

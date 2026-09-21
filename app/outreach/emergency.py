@@ -162,6 +162,7 @@ def emergency_stop(redis_conn: Any) -> None:
     """
     try:
         redis_conn.set("outreach:global:enabled", "0")
+        redis_conn.set("outreach:emergency_stop", "1")
         logger.warning("EMERGENCY STOP triggered globally.")
     except Exception as e:
         logger.error(f"Failed to trigger global emergency stop: {e}")
@@ -174,7 +175,8 @@ def emergency_resume(redis_conn: Any) -> None:
         redis_conn: Redis connection object
     """
     try:
-        redis_conn.delete("outreach:global:enabled")
+        redis_conn.delete("outreach:emergency_stop")
+        redis_conn.set("outreach:global:enabled", "1")
         logger.warning("Global emergency stop lifted.")
     except Exception as e:
         logger.error(f"Failed to lift global emergency stop: {e}")
