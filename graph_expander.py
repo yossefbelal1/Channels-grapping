@@ -29,6 +29,7 @@ from app.scheduler.watermark_manager import WatermarkManager
 from app.discovery.provenance import ProvenanceManager
 from app.discovery.relevance_evaluator import RelevanceEvaluator
 from app.validator.contact_extractor import is_contact_mention, extract_contacts
+from app.graph.exchange_graph_engine import ExchangeGraphEngine
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -132,6 +133,8 @@ class GraphExpander:
         self.tg_manager = None
         self.edge_mgr = None
         self.provenance_mgr = None
+        self.exchange_engine = None
+        self.cycle_count = 0
         self.shutdown_event = asyncio.Event()
 
     def get_channels_for_expansion(self, batch_size: int = 20) -> list:
@@ -672,6 +675,22 @@ class GraphExpander:
         return processed
 
     async def run_expansion_cycle(self):
+        self.cycle_count += 1
+
+        # Periodic Exchange Network Mining & Harvest (Cycle 1, then every 3 cycles)
+        if self.exchange_engine and (self.cycle_count == 1 or self.cycle_count % 3 == 0):
+            try:
+                tagged_hubs = self.exchange_engine.detect_and_tag_exchange_hubs(min_degree=3)
+                clusters_res = self.exchange_engine.detect_cross_promotion_clusters()
+                harvested_cnt = self.exchange_engine.harvest_unvalidated_graph_targets(limit=100)
+                logging.info(
+                    f"[GRAPH] Exchange Network Sync (Cycle {self.cycle_count}): "
+                    f"{len(tagged_hubs)} hubs tagged, {clusters_res.get('clusters_count', 0)} clusters active, "
+                    f"{harvested_cnt} unvalidated targets queued into seed_channels."
+                )
+            except Exception as sync_err:
+                logging.warning(f"[GRAPH] Periodic exchange network sync error: {sync_err}")
+
         # 1. First drain and process any freshly validated channels waiting for recommendations
         try:
             await self.process_recommendations_queue(max_items=25)
@@ -722,6 +741,7 @@ class GraphExpander:
         self.provenance_mgr = ProvenanceManager(redis_conn=self.redis_conn, db_conn=self.db_helper.conn)
         self.watermark_mgr = WatermarkManager(redis_conn=self.redis_conn, db_conn=self.db_helper.conn)
         self.importance_calc = GraphImportanceCalculator(db_conn=self.db_helper.conn)
+        self.exchange_engine = ExchangeGraphEngine(db_conn=self.db_helper.conn)
 
         logging.info(f"Initializing Telegram Manager for session '{self.session_name}'...")
         self.tg_manager = TelegramManager(self.redis_conn, session_name=self.session_name, worker_type="graph_expander")

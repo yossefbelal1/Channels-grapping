@@ -1116,6 +1116,34 @@ def get_network_overview():
         return {"success": False, "error": str(e)}
 
 
+@app.post("/api/network/recalculate", dependencies=[Depends(verify_dashboard_auth)])
+def recalculate_network():
+    """
+    On-demand exchange network mining:
+    1. Detects and tags exchange hubs in leads table
+    2. Groups reciprocal cross-promotions into clusters
+    3. Harvests unvalidated targets with high inbound promotion degree into seed_channels
+    """
+    try:
+        from app.graph.exchange_graph_engine import ExchangeGraphEngine
+        with get_db_cursor() as cur:
+            conn = cur.connection
+            engine = ExchangeGraphEngine(db_conn=conn)
+            hubs = engine.detect_and_tag_exchange_hubs(min_degree=3)
+            clusters_res = engine.detect_cross_promotion_clusters()
+            harvested = engine.harvest_unvalidated_graph_targets(limit=100)
+
+        return {
+            "success": True,
+            "hubs_tagged": len(hubs),
+            "clusters_count": clusters_res.get("clusters_count", 0),
+            "harvested_targets": harvested
+        }
+    except Exception as e:
+        logging.error(f"Error recalculating network: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
 LOGIN_PAGE_HTML = """
 <!DOCTYPE html>
 <html lang="en" class="h-full bg-slate-950">
@@ -2225,6 +2253,9 @@ DASHBOARD_PAGE_HTML = """
                             <button onclick="fetchDiscovered24h()" class="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 transition text-xs font-medium rounded-xl text-slate-300 flex items-center gap-1.5 cursor-pointer">
                                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
                                 <span>Refresh</span>
+                            </button>
+                            <button onclick="triggerNetworkRecalculate()" id="btn-recalc-network" class="px-3.5 py-2 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 transition text-xs font-semibold rounded-xl text-white flex items-center gap-1.5 cursor-pointer shadow-lg shadow-purple-600/20" title="Detect exchange hubs, mutual clusters, and harvest graph targets">
+                                <span>⚡ Recalculate Network</span>
                             </button>
                         </div>
                     </div>
@@ -3502,6 +3533,32 @@ DASHBOARD_PAGE_HTML = """
                         }
                     })
                     .catch(e => showToast('Network error: ' + e, 'error'));
+            };
+
+            window.triggerNetworkRecalculate = function() {
+                const btn = document.getElementById('btn-recalc-network');
+                if (btn) {
+                    btn.disabled = true;
+                    btn.innerHTML = `<span>⏳ Mining Graph...</span>`;
+                }
+                showToast('Mining Exchange Network & Clustering...', 'info');
+                fetch('/api/network/recalculate', { method: 'POST' })
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.success) {
+                            showToast(`Network Updated: ${d.hubs_tagged} hubs, ${d.clusters_count} clusters, ${d.harvested_targets} new seeds queued!`, 'success');
+                            fetchDiscovered24h();
+                        } else {
+                            showToast('Error recalculating network: ' + d.error, 'error');
+                        }
+                    })
+                    .catch(e => showToast('Network error: ' + e, 'error'))
+                    .finally(() => {
+                        if (btn) {
+                            btn.disabled = false;
+                            btn.innerHTML = `<span>⚡ Recalculate Network</span>`;
+                        }
+                    });
             };
 
             // ── Discovered 24h State & Handlers ────────────────────────────────
