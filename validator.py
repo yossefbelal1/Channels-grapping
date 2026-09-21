@@ -1638,6 +1638,7 @@ class LeadValidator:
                 return True
 
             is_scam = False
+            is_medium_views_penalty = False
             signals_count = 0
             risk_mgmt_count = 0
             signal_keywords = ["buy", "sell", "شراء", "بيع", "entry", "tp", "target", "هدف", "أهداف", "xauusd", "توصية", "توصيات"]
@@ -4469,11 +4470,11 @@ class LeadValidator:
                         session_name='user_session',
                         target_username=target_username,
                         log_status='approved',
-                        campaign_mode=os.getenv("CAMPAIGN_MODE", "dry_run")
+                        campaign_mode=os.getenv("CAMPAIGN_MODE", "live" if not is_dry_run(self.redis_conn) else "dry_run")
                     )
                     if not gate_ok:
                         logging.warning(f"Campaign Dispatcher: Safety gate blocked outreach to @{target_username}: {gate_reason}")
-                        if "BLOCKED_BY_KILL_SWITCH" in gate_reason or "OUTREACH_DISABLED" in gate_reason:
+                        if "BLOCKED_BY_KILL_SWITCH" in gate_reason or "OUTREACH_DISABLED" in gate_reason or "DRY_RUN" in gate_reason:
                             cur.execute("UPDATE campaign_logs SET status = 'approved' WHERE id = %s", (log_id,))
                             conn.commit()
                             await asyncio.sleep(30)

@@ -286,10 +286,17 @@ async def main():
                 session_name='user_session',
                 target_username=target_username,
                 log_status='approved',
-                campaign_mode=os.getenv("CAMPAIGN_MODE", "dry_run")
+                campaign_mode=os.getenv("CAMPAIGN_MODE", "live" if not is_dry_run(redis_conn) else "dry_run")
             )
             if not gate_ok:
                 logging.warning(f"Campaign Worker: Safety gate blocked outreach to @{target_username}: {gate_reason}")
+                if "BLOCKED_BY_KILL_SWITCH" in gate_reason or "OUTREACH_DISABLED" in gate_reason or "DRY_RUN" in gate_reason:
+                    cur.execute("UPDATE campaign_logs SET status = 'approved' WHERE id = %s", (log_id,))
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    time.sleep(30)
+                    continue
                 cur.execute(
                     "UPDATE campaign_logs SET status = 'skipped', error_message = %s, sent_at = %s WHERE id = %s",
                     (f"Safety Gate: {gate_reason}", datetime.now(), log_id)

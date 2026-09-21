@@ -6,6 +6,7 @@ Fail-closed architecture with multi-tier kill switches.
 import os
 import logging
 from typing import Any, Tuple, Optional
+from app.outreach.dry_run import is_dry_run
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +117,15 @@ def check_outreach_safety_gate(
         return False, f"APPROVAL_REQUIRED: Lead status is '{log_status}', must be 'approved' by human review"
 
     # Layer 5: Dry Run Check
-    if campaign_mode.lower() == "dry_run" or os.environ.get("CAMPAIGN_MODE", "dry_run").lower() == "dry_run":
+    effective_mode = campaign_mode
+    if not effective_mode or effective_mode == "dry_run":
+        env_mode = os.environ.get("CAMPAIGN_MODE")
+        if env_mode:
+            effective_mode = env_mode
+        elif not is_dry_run(redis_conn):
+            effective_mode = "live"
+
+    if effective_mode.lower() == "dry_run" or is_dry_run(redis_conn):
         return False, "DRY_RUN: System is in dry_run mode (no outbound dispatch allowed)"
 
     # Layer 6: Target Legitimacy
