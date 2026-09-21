@@ -3,10 +3,11 @@ scripts/benchmark_exchange_network.py — Comprehensive Exchange Network Engine 
 
 Executes the complete Exchange Network Intelligence pipeline:
 1. Detects Exchange Hubs and Cross-Promotion Clusters in channel_edges
-2. Calculates Exchange Affinity, Sweet Spot Size, and Network Value across all leads
-3. Re-evaluates and synchronizes Outreach Priority (P0, P1, etc.) for mutual network growth
-4. Harvests unvalidated peer channel targets from graph edges into seed_channels
-5. Generates the comprehensive 10-Metric Before vs After Quantitative Benchmark Report
+2. Loads sampled posts from channel_posts to detect real historical promotion and exchange evidence
+3. Calculates Exchange Affinity, Sweet Spot Size, and Network Value across all leads
+4. Re-evaluates and synchronizes Outreach Priority (P0, P1, etc.) for mutual network growth
+5. Harvests unvalidated peer channel targets from graph edges into seed_channels
+6. Generates the comprehensive 10-Metric Before vs After Quantitative Benchmark Report
 """
 
 import os
@@ -14,6 +15,7 @@ import sys
 import json
 import logging
 from datetime import datetime
+from collections import defaultdict
 from typing import Dict, Any, List
 
 # Add parent dir to path
@@ -52,7 +54,8 @@ def run_benchmark():
             COUNT(CASE WHEN is_exchange_hub = TRUE THEN 1 END) as exchange_hubs,
             COUNT(CASE WHEN is_exchange_seed = TRUE THEN 1 END) as exchange_seeds,
             COUNT(CASE WHEN exchange_affinity_score >= 30 THEN 1 END) as with_exchange_affinity,
-            COUNT(CASE WHEN cluster_id IS NOT NULL THEN 1 END) as in_clusters
+            COUNT(CASE WHEN cluster_id IS NOT NULL THEN 1 END) as in_clusters,
+            COUNT(CASE WHEN discovery_method = 'graph' OR discovery_source = 'graph' THEN 1 END) as graph_yield
         FROM leads;
     """)
     before_leads = cur.fetchone()
@@ -77,9 +80,33 @@ def run_benchmark():
     logger.info("Running Graph Engine: Detecting Exchange Hubs & Cross-Promotion Clusters...")
     graph_engine = ExchangeGraphEngine(db_conn=conn)
     hubs = graph_engine.detect_and_tag_exchange_hubs(min_degree=3)
+    hub_ids = {h["channel_id"] for h in hubs}
     clusters = graph_engine.detect_cross_promotion_clusters()
-    harvested = graph_engine.harvest_unvalidated_graph_targets(limit=150)
+    harvested = graph_engine.harvest_unvalidated_graph_targets(limit=200)
     logger.info(f"Detected {len(hubs)} Exchange Hubs, {clusters['clusters_count']} Mutual Clusters, Harvested {harvested} targets.")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Step 2.5: Load Sampled Messages from channel_posts for Post Analysis
+    # ──────────────────────────────────────────────────────────────────────────
+    logger.info("Loading sampled posts from channel_posts for post analysis...")
+    cur.execute("""
+        SELECT channel_username, message_text
+        FROM (
+            SELECT channel_username, message_text,
+                   ROW_NUMBER() OVER (PARTITION BY channel_username ORDER BY timestamp DESC) as rn
+            FROM channel_posts
+            WHERE message_text IS NOT NULL AND LENGTH(message_text) > 10
+        ) sub
+        WHERE rn <= 20;
+    """)
+    post_rows = cur.fetchall() or []
+    channel_posts_map = defaultdict(list)
+    for pr in post_rows:
+        u = (pr["channel_username"] or "").lower().strip()
+        txt = pr["message_text"] or ""
+        if u and txt:
+            channel_posts_map[u].append(txt)
+    logger.info(f"Loaded posts for {len(channel_posts_map)} distinct channels.")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Step 3: Run Exchange Affinity & Prioritization across all active leads
@@ -116,8 +143,8 @@ def run_benchmark():
     seeds_count = 0
 
     for row in leads_to_process:
-        lid = row["id"]
-        uname = row["channel_username"]
+        lid = str(row["id"])
+        uname = (row["channel_username"] or "").lower().strip()
         title = row["title"] or ""
         desc = row["description"] or ""
         mcount = row["member_count"] or 0
@@ -129,11 +156,14 @@ def run_benchmark():
         out_deg = row["out_degree"] or 0
         rels = set(row["rel_types"] or [])
 
+        # Get sampled posts if available
+        msgs = channel_posts_map.get(uname, [])
+
         # Evaluate Exchange Network Priority
         eval_res = OutreachPriorityEngine.evaluate_priority(
             title=title,
             description=desc,
-            recent_messages=[],
+            recent_messages=msgs,
             contacts_dict={"contact_username": cuser, "source": "bio_admin"} if cuser else {},
             forex_relevance_score=fscore,
             member_count=mcount,
@@ -151,7 +181,7 @@ def run_benchmark():
         net_val = eval_res["network_value_score"]
         grow_op = eval_res["growth_openness_score"]
         is_seed = eval_res["is_exchange_seed"]
-        is_hub = eval_res["is_exchange_hub"]
+        is_hub = eval_res["is_exchange_hub"] or (lid in hub_ids)
         ex_ev = json.dumps(eval_res["exchange_evidence"])
 
         if p_tier == "P0":
@@ -220,7 +250,8 @@ def run_benchmark():
             COUNT(CASE WHEN is_exchange_hub = TRUE THEN 1 END) as exchange_hubs,
             COUNT(CASE WHEN is_exchange_seed = TRUE THEN 1 END) as exchange_seeds,
             COUNT(CASE WHEN exchange_affinity_score >= 30 THEN 1 END) as with_exchange_affinity,
-            COUNT(CASE WHEN cluster_id IS NOT NULL THEN 1 END) as in_clusters
+            COUNT(CASE WHEN cluster_id IS NOT NULL THEN 1 END) as in_clusters,
+            COUNT(CASE WHEN discovery_method = 'graph' OR discovery_source = 'graph' THEN 1 END) as graph_yield
         FROM leads;
     """)
     after_leads = cur.fetchone()
@@ -253,10 +284,11 @@ def run_benchmark():
         ("4. Channels with Verified Exchange Evidence", before_leads["with_exchange_affinity"], after_leads["with_exchange_affinity"]),
         ("5. Channels in Promotion/Mutual Clusters", before_leads["in_clusters"], after_leads["in_clusters"]),
         ("6. Active Exchange Hubs Discovered", before_leads["exchange_hubs"], after_leads["exchange_hubs"]),
-        ("7. Exchange Network Seeds (is_exchange_seed)", before_leads["exchange_seeds"], after_leads["exchange_seeds"]),
-        ("8. Channels with Verified Human Contact", before_leads["with_contact"], after_leads["with_contact"]),
-        ("9. Campaign P0 Leads (Prime Exchange Partners)", before_campaign["p0_count"], after_campaign["p0_count"]),
-        ("10. Campaign P1 Leads (High-Value Exchange Nodes)", before_campaign["p1_count"], after_campaign["p1_count"]),
+        ("7. Unique Graph Expansion Yield (Channels)", before_leads["graph_yield"], after_leads["graph_yield"]),
+        ("8. Exchange Network Seeds (is_exchange_seed)", before_leads["exchange_seeds"], after_leads["exchange_seeds"]),
+        ("9. Channels with Verified Human Contact", before_leads["with_contact"], after_leads["with_contact"]),
+        ("10. Campaign P0 Leads (Prime Exchange Partners)", before_campaign["p0_count"], after_campaign["p0_count"]),
+        ("11. Campaign P1 Leads (High-Value Exchange Nodes)", before_campaign["p1_count"], after_campaign["p1_count"]),
     ]
 
     print(f"{'Metric':<48} | {'Before':<15} | {'After':<15}")
