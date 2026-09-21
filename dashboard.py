@@ -289,7 +289,7 @@ def get_discovered_24h(
                     COUNT(*) FILTER (WHERE is_group = TRUE) as groups_count,
                     COUNT(*) FILTER (WHERE is_group = FALSE) as channels_count,
                     ROUND(AVG(COALESCE(lead_score, 0)), 1) as avg_score,
-                    ROUND(AVG(COALESCE(forex_score, 0)), 1) as avg_forex_score
+                    ROUND(AVG(COALESCE(forex_intent_score, 0)), 1) as avg_forex_score
                 FROM leads
                 WHERE discovered_at >= NOW() - INTERVAL '24 HOURS';
             """)
@@ -376,18 +376,16 @@ def get_discovered_24h(
                     l.id, l.channel_username, l.member_count, l.description,
                     l.language, l.arabic_ratio, l.contact_username, l.whatsapp, l.website,
                     l.lead_score, l.tier, l.status, l.discovered_at, l.last_activity,
-                    l.forex_score, l.gold_score, l.signal_score,
+                    COALESCE(l.forex_intent_score, 0) as forex_score,
+                    COALESCE(l.commercial_fit_score, 0) as commercial_fit_score,
+                    COALESCE(l.relevance_score, 0) as relevance_score,
                     COALESCE(l.outreach_priority, 'P3') as outreach_priority,
                     COALESCE(l.outreach_priority_score, 25) as outreach_priority_score,
-                    l.outreach_priority_reason, l.commercial_fit_score,
+                    l.outreach_priority_reason,
                     l.discovery_source, l.discovery_method, l.is_group,
                     cl.status as campaign_status, cl.id as campaign_log_id
                 FROM leads l
-                LEFT JOIN (
-                    SELECT DISTINCT ON (lead_id) lead_id, status, id
-                    FROM campaign_logs
-                    ORDER BY lead_id, created_at DESC
-                ) cl ON cl.lead_id = l.id
+                LEFT JOIN campaign_logs cl ON cl.lead_id = l.id
                 WHERE {where_sql}
                 ORDER BY l.discovered_at DESC
                 LIMIT %s OFFSET %s;
