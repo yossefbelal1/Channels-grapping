@@ -122,112 +122,118 @@ class SimilarChannelsCrawler:
             "error": None
         }
 
-        # Try sessions with round-robin failover
-        client = None
+        # Try sessions with round-robin failover on FloodWait
         for _ in range(len(self.sessions)):
             sname = self._get_next_session()
             client = await self.get_client(sname)
-            if client:
+            if not client:
+                continue
+
+            try:
+                # 1. Resolve entity
+                entity = await client.get_entity(clean_user)
+                title = getattr(entity, 'title', clean_user) or clean_user
+                result["title"] = title
+
+                # 2. Fetch Full Channel info (for pinned_msg_id and participants_count)
+                full = await client(GetFullChannelRequest(entity))
+                full_chat = getattr(full, 'full_chat', None)
+                members = getattr(full_chat, 'participants_count', 0) or getattr(entity, 'participants_count', 0) or 0
+                about = getattr(full_chat, 'about', '') or ''
+                pinned_msg_id = getattr(full_chat, 'pinned_msg_id', None)
+                result["members"] = members
+
+                # 3. Pinned Message Extraction
+                pinned_text = ""
+                if pinned_msg_id:
+                    try:
+                        pinned_msg = await client.get_messages(entity, ids=pinned_msg_id)
+                        if pinned_msg and pinned_msg.message:
+                            pinned_text = pinned_msg.message
+                            result["pinned_text"] = pinned_text
+                            logger.info(f"[@{clean_user}] Fetched Pinned Message (ID: {pinned_msg_id}, {len(pinned_text)} chars)")
+                    except Exception as p_err:
+                        logger.warning(f"Could not fetch pinned message for @{clean_user}: {p_err}")
+
+                # 4. Extract Structured Contacts (prioritizing pinned text)
+                contacts = extract_contacts(text="", description=about, channel_username=clean_user, pinned_text=pinned_text)
+                result["contacts"] = contacts
+                contact_user = contacts.get('contact_username')
+                admin_user = contacts.get('admin_username')
+                owner_user = contacts.get('owner_username')
+                wa = contacts.get('whatsapp')
+
+                logger.info(f"[@{clean_user}] Contacts Extracted: Contact=@{contact_user} | Admin=@{admin_user} | WhatsApp={wa}")
+
+                # 5. Update leads record in PostgreSQL
+                self._update_channel_record(clean_user, title, members, about, contacts)
+
+                # 6. Auto-enroll into campaign if qualified with contact
+                if self.active_campaign_id and contact_user:
+                    enrolled = self._auto_enroll_channel(clean_user, title, members, contact_user)
+                    result["enrolled"] = enrolled
+
+                # 7. Fetch Telegram Similar Channels (Recommendations)
+                logger.info(f"[@{clean_user}] Querying Telegram Similar Channels using session '{sname}'...")
+                try:
+                    recs = await client(GetChannelRecommendationsRequest(channel=entity))
+                    chats = getattr(recs, 'chats', [])
+                    logger.info(f"[@{clean_user}] Received {len(chats)} similar channel recommendations.")
+
+                    r_client = get_redis_client()
+                    rec_candidates = []
+
+                    for chat in chats[:max_recs]:
+                        r_username = getattr(chat, 'username', None)
+                        r_title = getattr(chat, 'title', '')
+                        r_members = getattr(chat, 'participants_count', 0) or 0
+
+                        if not r_username or not USERNAME_CLEAN_RE.match(r_username):
+                            continue
+
+                        # Ingest candidate into leads table & Redis queue:high
+                        self._ingest_recommended_channel(
+                            channel_username=r_username,
+                            title=r_title,
+                            member_count=r_members,
+                            source_username=clean_user,
+                            depth=depth + 1,
+                            r_client=r_client
+                        )
+                        rec_candidates.append({
+                            "username": r_username,
+                            "title": r_title,
+                            "members": r_members
+                        })
+
+                    result["recommendations"] = rec_candidates
+
+                except errors.FloodWaitError as fwe:
+                    logger.warning(f"FloodWait on session '{sname}' when fetching recommendations for @{clean_user}: {fwe.seconds}s")
+                except Exception as r_err:
+                    logger.warning(f"Could not fetch recommendations for @{clean_user}: {r_err}")
+
+                # Successfully completed for this channel, exit session retry loop
                 break
 
-        if not client:
-            result["error"] = "No authorized research session available"
-            logger.error(result["error"])
-            return result
-
-        try:
-            # 1. Resolve entity
-            entity = await client.get_entity(clean_user)
-            title = getattr(entity, 'title', clean_user) or clean_user
-            result["title"] = title
-
-            # 2. Fetch Full Channel info (for pinned_msg_id and participants_count)
-            full = await client(GetFullChannelRequest(entity))
-            full_chat = getattr(full, 'full_chat', None)
-            members = getattr(full_chat, 'participants_count', 0) or getattr(entity, 'participants_count', 0) or 0
-            about = getattr(full_chat, 'about', '') or ''
-            pinned_msg_id = getattr(full_chat, 'pinned_msg_id', None)
-            result["members"] = members
-
-            # 3. Pinned Message Extraction
-            pinned_text = ""
-            if pinned_msg_id:
-                try:
-                    pinned_msg = await client.get_messages(entity, ids=pinned_msg_id)
-                    if pinned_msg and pinned_msg.message:
-                        pinned_text = pinned_msg.message
-                        result["pinned_text"] = pinned_text
-                        logger.info(f"[@{clean_user}] Fetched Pinned Message (ID: {pinned_msg_id}, {len(pinned_text)} chars)")
-                except Exception as p_err:
-                    logger.warning(f"Could not fetch pinned message for @{clean_user}: {p_err}")
-
-            # 4. Extract Structured Contacts (prioritizing pinned text)
-            contacts = extract_contacts(text="", description=about, channel_username=clean_user, pinned_text=pinned_text)
-            result["contacts"] = contacts
-            contact_user = contacts.get('contact_username')
-            admin_user = contacts.get('admin_username')
-            owner_user = contacts.get('owner_username')
-            wa = contacts.get('whatsapp')
-
-            logger.info(f"[@{clean_user}] Contacts Extracted: Contact=@{contact_user} | Admin=@{admin_user} | WhatsApp={wa}")
-
-            # 5. Update leads record in PostgreSQL
-            self._update_channel_record(clean_user, title, members, about, contacts)
-
-            # 6. Auto-enroll into campaign if qualified with contact
-            if self.active_campaign_id and contact_user:
-                enrolled = self._auto_enroll_channel(clean_user, title, members, contact_user)
-                result["enrolled"] = enrolled
-
-            # 7. Fetch Telegram Similar Channels (Recommendations)
-            logger.info(f"[@{clean_user}] Querying Telegram Similar Channels...")
-            try:
-                recs = await client(GetChannelRecommendationsRequest(channel=entity))
-                chats = getattr(recs, 'chats', [])
-                logger.info(f"[@{clean_user}] Received {len(chats)} similar channel recommendations.")
-
-                r_client = get_redis_client()
-                rec_candidates = []
-
-                for chat in chats[:max_recs]:
-                    r_username = getattr(chat, 'username', None)
-                    r_title = getattr(chat, 'title', '')
-                    r_members = getattr(chat, 'participants_count', 0) or 0
-
-                    if not r_username or not USERNAME_CLEAN_RE.match(r_username):
-                        continue
-
-                    # Ingest candidate into leads table & Redis queue:high
-                    self._ingest_recommended_channel(
-                        channel_username=r_username,
-                        title=r_title,
-                        member_count=r_members,
-                        source_username=clean_user,
-                        depth=depth + 1,
-                        r_client=r_client
-                    )
-                    rec_candidates.append({
-                        "username": r_username,
-                        "title": r_title,
-                        "members": r_members
-                    })
-
-                result["recommendations"] = rec_candidates
-
             except errors.FloodWaitError as fwe:
-                logger.warning(f"FloodWait on session when fetching recommendations for @{clean_user}: {fwe.seconds}s")
-            except Exception as r_err:
-                logger.warning(f"Could not fetch recommendations for @{clean_user}: {r_err}")
+                logger.warning(f"FloodWait ({fwe.seconds}s) on session '{sname}' for @{clean_user}. Failing over to next session...")
+                continue
+            except errors.UsernameNotOccupiedError:
+                logger.warning(f"Channel @{clean_user} does not exist.")
+                result["error"] = "not_found"
+                break
+            except errors.ChannelPrivateError:
+                logger.warning(f"Channel @{clean_user} is private.")
+                result["error"] = "private"
+                break
+            except Exception as e:
+                logger.error(f"Error inspecting @{clean_user} with session '{sname}': {e}")
+                result["error"] = str(e)
+                continue
 
-        except errors.UsernameNotOccupiedError:
-            logger.warning(f"Channel @{clean_user} does not exist.")
-            result["error"] = "not_found"
-        except errors.ChannelPrivateError:
-            logger.warning(f"Channel @{clean_user} is private.")
-            result["error"] = "private"
-        except Exception as e:
-            logger.error(f"Error inspecting @{clean_user}: {e}", exc_info=True)
-            result["error"] = str(e)
+        if not result["title"] and not result["error"]:
+            result["error"] = "All research sessions failed or in FloodWait"
 
         return result
 
