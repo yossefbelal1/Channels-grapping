@@ -268,6 +268,238 @@ def approve_campaign_leads(campaign_id: str, payload: dict = Body(default={})):
         logging.error(f"Error approving campaign leads: {e}")
         return {"success": False, "error": str(e)}
 
+@app.get("/api/discovered-24h", dependencies=[Depends(verify_dashboard_auth)])
+def get_discovered_24h(
+    status: Optional[str] = Query(None, description="Filter by status: 'all', 'new', 'rejected', 'with_contact'"),
+    tier: Optional[str] = Query(None, description="Filter by tier: 'Tier_A', 'Tier_B', 'Tier_C', 'Tier_D'"),
+    search: Optional[str] = Query(None, description="Search keyword in username or description"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0)
+):
+    try:
+        with get_db_cursor(commit_on_success=False) as cur:
+            # 1. 24h Summary KPI Metrics
+            cur.execute("""
+                SELECT 
+                    COUNT(*) as total_discovered,
+                    COUNT(*) FILTER (WHERE status = 'new') as qualified_count,
+                    COUNT(*) FILTER (WHERE status = 'rejected') as rejected_count,
+                    COUNT(*) FILTER (WHERE contact_username IS NOT NULL AND contact_username != '') as with_contact_count,
+                    COUNT(*) FILTER (WHERE whatsapp IS NOT NULL AND whatsapp != '') as with_whatsapp_count,
+                    COUNT(*) FILTER (WHERE is_group = TRUE) as groups_count,
+                    COUNT(*) FILTER (WHERE is_group = FALSE) as channels_count,
+                    ROUND(AVG(COALESCE(lead_score, 0)), 1) as avg_score,
+                    ROUND(AVG(COALESCE(forex_score, 0)), 1) as avg_forex_score
+                FROM leads
+                WHERE discovered_at >= NOW() - INTERVAL '24 HOURS';
+            """)
+            summary_row = cur.fetchone() or {}
+
+            # 2. Hourly Discovery Throughput (velocity per hour slot)
+            cur.execute("""
+                SELECT 
+                    to_char(date_trunc('hour', discovered_at), 'HH24:00') as hour_label,
+                    date_trunc('hour', discovered_at) as hour_slot,
+                    COUNT(*) as total_count,
+                    COUNT(*) FILTER (WHERE status = 'new') as qualified_count,
+                    COUNT(*) FILTER (WHERE status = 'rejected') as rejected_count
+                FROM leads
+                WHERE discovered_at >= NOW() - INTERVAL '24 HOURS'
+                GROUP BY date_trunc('hour', discovered_at)
+                ORDER BY date_trunc('hour', discovered_at) ASC;
+            """)
+            hourly_raw = cur.fetchall()
+            hourly_throughput = []
+            for h in hourly_raw:
+                hourly_throughput.append({
+                    "hour": h["hour_label"],
+                    "total": h["total_count"],
+                    "qualified": h["qualified_count"],
+                    "rejected": h["rejected_count"]
+                })
+
+            # 3. Tier breakdown in last 24h
+            cur.execute("""
+                SELECT COALESCE(tier::text, 'Unassigned') as tier, COUNT(*) as count
+                FROM leads
+                WHERE discovered_at >= NOW() - INTERVAL '24 HOURS' AND status = 'new'
+                GROUP BY tier
+                ORDER BY count DESC;
+            """)
+            tier_rows = cur.fetchall()
+            tier_distribution = {r['tier']: r['count'] for r in tier_rows}
+
+            # 4. Top discovery sources in last 24h
+            cur.execute("""
+                SELECT COALESCE(discovery_source, 'unknown') as source, 
+                       COALESCE(discovery_method, 'unknown') as method,
+                       COUNT(*) as count
+                FROM leads
+                WHERE discovered_at >= NOW() - INTERVAL '24 HOURS'
+                GROUP BY discovery_source, discovery_method
+                ORDER BY count DESC
+                LIMIT 8;
+            """)
+            top_sources = cur.fetchall()
+
+            # 5. Query Channels list with filters and campaign approval state
+            where_clauses = ["l.discovered_at >= NOW() - INTERVAL '24 HOURS'"]
+            params = []
+
+            if status:
+                st = status.lower()
+                if st in ('new', 'qualified'):
+                    where_clauses.append("l.status = 'new'")
+                elif st == 'rejected':
+                    where_clauses.append("l.status = 'rejected'")
+                elif st == 'with_contact':
+                    where_clauses.append("l.contact_username IS NOT NULL AND l.contact_username != ''")
+
+            if tier and tier.lower() != 'all':
+                where_clauses.append("l.tier = %s")
+                params.append(tier)
+
+            if search and search.strip():
+                where_clauses.append("(l.channel_username ILIKE %s OR l.description ILIKE %s OR l.contact_username ILIKE %s)")
+                term = f"%{search.strip()}%"
+                params.extend([term, term, term])
+
+            where_sql = " AND ".join(where_clauses)
+            
+            # Count total matching query for pagination
+            count_query = f"SELECT COUNT(*) as total_matched FROM leads l WHERE {where_sql}"
+            cur.execute(count_query, tuple(params))
+            total_matched = (cur.fetchone() or {}).get('total_matched', 0)
+
+            channel_query = f"""
+                SELECT 
+                    l.id, l.channel_username, l.member_count, l.description,
+                    l.language, l.arabic_ratio, l.contact_username, l.whatsapp, l.website,
+                    l.lead_score, l.tier, l.status, l.discovered_at, l.last_activity,
+                    l.forex_score, l.gold_score, l.signal_score,
+                    COALESCE(l.outreach_priority, 'P3') as outreach_priority,
+                    COALESCE(l.outreach_priority_score, 25) as outreach_priority_score,
+                    l.outreach_priority_reason, l.commercial_fit_score,
+                    l.discovery_source, l.discovery_method, l.is_group,
+                    cl.status as campaign_status, cl.id as campaign_log_id
+                FROM leads l
+                LEFT JOIN (
+                    SELECT DISTINCT ON (lead_id) lead_id, status, id
+                    FROM campaign_logs
+                    ORDER BY lead_id, created_at DESC
+                ) cl ON cl.lead_id = l.id
+                WHERE {where_sql}
+                ORDER BY l.discovered_at DESC
+                LIMIT %s OFFSET %s;
+            """
+            params.extend([limit, offset])
+            cur.execute(channel_query, tuple(params))
+            channels = cur.fetchall()
+
+            for ch in channels:
+                if hasattr(ch.get('discovered_at'), 'isoformat'):
+                    ch['discovered_at'] = ch['discovered_at'].isoformat()
+                elif ch.get('discovered_at'):
+                    ch['discovered_at'] = str(ch['discovered_at'])
+
+                if hasattr(ch.get('last_activity'), 'isoformat'):
+                    ch['last_activity'] = ch['last_activity'].isoformat()
+                elif ch.get('last_activity'):
+                    ch['last_activity'] = str(ch['last_activity'])
+
+        # Redis System Health
+        is_killed = False
+        outreach_on = False
+        queues = {}
+        try:
+            r = get_redis_client()
+            is_killed = bool(r.get("outreach:emergency_stop"))
+            outreach_on = bool(r.get("outreach:global:enabled") == "1")
+            for q in ['queue:critical', 'queue:high', 'queue:normal', 'queue:low', 'queue:dead_letter']:
+                queues[q] = r.llen(q) or 0
+        except Exception:
+            pass
+
+        total_disc = summary_row.get('total_discovered') or 0
+        qual_cnt = summary_row.get('qualified_count') or 0
+        contact_cnt = summary_row.get('with_contact_count') or 0
+
+        return {
+            "success": True,
+            "timestamp": datetime.utcnow().isoformat(),
+            "summary": {
+                **summary_row,
+                "total_matched": total_matched,
+                "qualification_rate": round((qual_cnt * 100.0 / total_disc), 1) if total_disc > 0 else 0,
+                "contact_extraction_rate": round((contact_cnt * 100.0 / total_disc), 1) if total_disc > 0 else 0,
+                "tier_distribution": tier_distribution,
+                "top_sources": top_sources,
+                "hourly_throughput": hourly_throughput
+            },
+            "system_health": {
+                "kill_switch_active": is_killed,
+                "outreach_globally_enabled": outreach_on,
+                "queues": queues
+            },
+            "channels": channels,
+            "count": len(channels),
+            "total_matched": total_matched,
+            "limit": limit,
+            "offset": offset
+        }
+    except Exception as e:
+        logging.error(f"Error in get_discovered_24h: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/discovered-24h/approve", dependencies=[Depends(verify_dashboard_auth)])
+def approve_discovered_leads(payload: dict = Body(default={})):
+    """Approves selected discovered leads and enrolls them into the active outreach campaign."""
+    try:
+        lead_ids = payload.get("lead_ids", [])
+        if not lead_ids:
+            return {"success": False, "error": "No lead_ids provided"}
+
+        active_camp = CampaignRepository.get_active_campaign()
+        if not active_camp:
+            return {"success": False, "error": "No active campaign found. Please create or activate a campaign first."}
+
+        camp_id = active_camp['id']
+        with get_db_cursor() as cur:
+            # 1. Update existing campaign_logs for these leads to 'approved'
+            cur.execute("""
+                UPDATE campaign_logs
+                SET status = 'approved'
+                WHERE lead_id = ANY(%s) AND status IN ('pending', 'pending_review');
+            """, (lead_ids,))
+            updated_count = cur.rowcount
+
+            # 2. Insert any leads that aren't enqueued yet as 'approved'
+            cur.execute("""
+                INSERT INTO campaign_logs (id, campaign_id, lead_id, status, priority, priority_score, priority_reason, commercial_fit_score)
+                SELECT gen_random_uuid(), %s, l.id, 'approved',
+                       COALESCE(l.outreach_priority, 'P2'),
+                       COALESCE(l.outreach_priority_score, 50),
+                       'Approved via 24h Review Page',
+                       COALESCE(l.commercial_fit_score, 0)
+                FROM leads l
+                WHERE l.id = ANY(%s)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM campaign_logs cl WHERE cl.lead_id = l.id
+                  );
+            """, (camp_id, lead_ids))
+            inserted_count = cur.rowcount
+
+        total_approved = updated_count + inserted_count
+        logging.info(f"Discovered 24h Review: Approved {total_approved} leads for campaign {camp_id}.")
+        return {
+            "success": True,
+            "approved_count": total_approved,
+            "campaign_id": camp_id
+        }
+    except Exception as e:
+        logging.error(f"Error approving discovered leads: {e}")
+        return {"success": False, "error": str(e)}
+
 @app.get("/api/leads", dependencies=[Depends(verify_dashboard_auth)])
 def get_leads(
     min_score: int = Query(None, alias="minScore"),
@@ -851,17 +1083,7 @@ LOGIN_PAGE_HTML = """
 """
 
 
-@app.get("/", response_class=HTMLResponse)
-def serve_dashboard(request: Request):
-    required_key = os.getenv("DASHBOARD_API_KEY", "").strip()
-    is_production = os.getenv("ENVIRONMENT", "").lower() == "production"
-
-    if is_production and required_key:
-        cookie = request.cookies.get("dashboard_session")
-        if not cookie or cookie != _get_session_token(required_key):
-            return HTMLResponse(content=LOGIN_PAGE_HTML, status_code=200)
-
-    html_content = """
+DASHBOARD_PAGE_HTML = """
     <!DOCTYPE html>
     <html lang="en" class="h-full bg-slate-950">
     <head>
@@ -931,6 +1153,10 @@ def serve_dashboard(request: Request):
                     <button onclick="switchTab('group-metrics')" id="tab-group-metrics-btn" class="px-4 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 transition">Group Metrics</button>
                     <button onclick="switchTab('discovery')" id="tab-discovery-btn" class="px-4 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 transition">Discovery Analytics</button>
                     <button onclick="switchTab('quality')" id="tab-quality-btn" class="px-4 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 transition">&#127919; Lead Quality</button>
+                    <button onclick="switchTab('discovered-24h')" id="tab-discovered-24h-btn" class="px-4 py-1.5 rounded-lg text-xs font-semibold text-emerald-400 hover:text-emerald-300 border border-emerald-500/30 bg-emerald-950/30 transition flex items-center gap-1.5">
+                        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse inline-block"></span>
+                        <span>⚡ 24h Discovery</span>
+                    </button>
                 </nav>
                 <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                     <span class="h-2 w-2 rounded-full bg-emerald-400 mr-2 animate-pulse"></span>
@@ -1720,6 +1946,232 @@ def serve_dashboard(request: Request):
                         </div>
                     </div>
                 </div>
+            <!-- 24h Discovered Channels & System Health Section -->
+            <div id="tab-discovered-24h" class="space-y-8 hidden">
+                <!-- Top KPI / Health Bar -->
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+                    <!-- KPI 1: 24h Discovery Velocity -->
+                    <div class="glassmorphism p-6 rounded-2xl flex items-center space-x-4 shadow-xl border-l-4 border-emerald-500">
+                        <div class="h-12 w-12 rounded-lg bg-emerald-500/10 text-emerald-400 flex items-center justify-center border border-emerald-500/20 text-xl font-bold">
+                            ⚡
+                        </div>
+                        <div>
+                            <p class="text-xs text-slate-400 font-medium uppercase tracking-wider">24h Discovered Channels</p>
+                            <div class="flex items-baseline space-x-2">
+                                <h3 id="disc24-total" class="text-2xl font-bold mt-1 text-emerald-400">-</h3>
+                                <span id="disc24-rate" class="text-xs text-slate-400">rolling 24h</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- KPI 2: Qualified Leads (Forex/Arabic) -->
+                    <div class="glassmorphism p-6 rounded-2xl flex items-center space-x-4 shadow-xl border-l-4 border-indigo-500">
+                        <div class="h-12 w-12 rounded-lg bg-indigo-500/10 text-indigo-400 flex items-center justify-center border border-indigo-500/20 text-xl font-bold">
+                            🎯
+                        </div>
+                        <div>
+                            <p class="text-xs text-slate-400 font-medium uppercase tracking-wider">Qualified Leads</p>
+                            <div class="flex items-baseline space-x-2">
+                                <h3 id="disc24-qualified" class="text-2xl font-bold mt-1 text-indigo-400">-</h3>
+                                <span id="disc24-qual-pct" class="text-xs text-indigo-300/80">(-%)</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- KPI 3: Contact Extraction Rate -->
+                    <div class="glassmorphism p-6 rounded-2xl flex items-center space-x-4 shadow-xl border-l-4 border-cyan-500">
+                        <div class="h-12 w-12 rounded-lg bg-cyan-500/10 text-cyan-400 flex items-center justify-center border border-cyan-500/20 text-xl font-bold">
+                            👤
+                        </div>
+                        <div>
+                            <p class="text-xs text-slate-400 font-medium uppercase tracking-wider">Direct Contacts Found</p>
+                            <div class="flex items-baseline space-x-2">
+                                <h3 id="disc24-contacts" class="text-2xl font-bold mt-1 text-cyan-400">-</h3>
+                                <span id="disc24-contact-pct" class="text-xs text-cyan-300/80">(-%)</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- KPI 4: System Outreach & Pipeline Health -->
+                    <div class="glassmorphism p-6 rounded-2xl flex items-center space-x-4 shadow-xl border-l-4 border-purple-500">
+                        <div class="h-12 w-12 rounded-lg bg-purple-500/10 text-purple-400 flex items-center justify-center border border-purple-500/20 text-xl font-bold">
+                            🛡️
+                        </div>
+                        <div>
+                            <p class="text-xs text-slate-400 font-medium uppercase tracking-wider">Pipeline & Safety Status</p>
+                            <div class="mt-1 flex items-center gap-2">
+                                <span id="disc24-health-status" class="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">Normal</span>
+                                <span id="disc24-kill-badge" class="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30">KillSwitch: Ready</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Velocity Timeline & Source Distribution Cards -->
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    <!-- Hourly Discovery Velocity Chart -->
+                    <div class="lg:col-span-2 glassmorphism p-6 rounded-2xl shadow-xl space-y-4">
+                        <div class="flex justify-between items-center">
+                            <div>
+                                <h4 class="text-sm font-semibold uppercase tracking-wider text-slate-300 flex items-center gap-2">
+                                    <span>📈 Hourly Discovery Velocity</span>
+                                    <span class="text-xs font-normal text-slate-500">(Last 24 Hours)</span>
+                                </h4>
+                                <p class="text-xs text-slate-400 mt-0.5">Rolling throughput showing new channels ingested per hour</p>
+                            </div>
+                            <div class="flex items-center space-x-4 text-xs">
+                                <span class="flex items-center gap-1 text-emerald-400"><span class="w-2.5 h-2.5 rounded-sm bg-emerald-500 inline-block"></span> Qualified</span>
+                                <span class="flex items-center gap-1 text-slate-400"><span class="w-2.5 h-2.5 rounded-sm bg-slate-700 inline-block"></span> Filtered/Other</span>
+                            </div>
+                        </div>
+                        <div id="disc24-hourly-chart" class="h-44 w-full flex items-end gap-1.5 pt-4 pb-2 border-b border-slate-800/80 overflow-x-auto">
+                            <!-- Populated dynamically via JS -->
+                            <div class="text-xs text-slate-500 w-full text-center py-12">Loading velocity metrics...</div>
+                        </div>
+                        <div class="flex justify-between items-center text-xs text-slate-500 pt-1">
+                            <span>-24 Hours Ago</span>
+                            <span id="disc24-hourly-summary" class="font-medium text-slate-400">Peak: - channels/hr</span>
+                            <span>Right Now</span>
+                        </div>
+                    </div>
+
+                    <!-- Tier Breakdown & Discovery Sources -->
+                    <div class="glassmorphism p-6 rounded-2xl shadow-xl space-y-5 flex flex-col justify-between">
+                        <div>
+                            <h4 class="text-sm font-semibold uppercase tracking-wider text-slate-300 mb-3">🏷️ 24h Tier Breakdown</h4>
+                            <div class="space-y-2.5" id="disc24-tier-container">
+                                <div class="flex justify-between items-center text-xs">
+                                    <span class="text-amber-400 font-semibold">Tier A (Elite VIP)</span>
+                                    <span id="disc24-tier-a" class="font-bold text-slate-200">0</span>
+                                </div>
+                                <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                                    <div id="disc24-tier-a-bar" class="bg-amber-400 h-1.5 rounded-full" style="width: 0%"></div>
+                                </div>
+
+                                <div class="flex justify-between items-center text-xs mt-2">
+                                    <span class="text-indigo-400 font-semibold">Tier B (Commercial Signals)</span>
+                                    <span id="disc24-tier-b" class="font-bold text-slate-200">0</span>
+                                </div>
+                                <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                                    <div id="disc24-tier-b-bar" class="bg-indigo-500 h-1.5 rounded-full" style="width: 0%"></div>
+                                </div>
+
+                                <div class="flex justify-between items-center text-xs mt-2">
+                                    <span class="text-cyan-400 font-semibold">Tier C (Standard Trading)</span>
+                                    <span id="disc24-tier-c" class="font-bold text-slate-200">0</span>
+                                </div>
+                                <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                                    <div id="disc24-tier-c-bar" class="bg-cyan-500 h-1.5 rounded-full" style="width: 0%"></div>
+                                </div>
+
+                                <div class="flex justify-between items-center text-xs mt-2">
+                                    <span class="text-slate-400 font-semibold">Tier D / Unclassified</span>
+                                    <span id="disc24-tier-d" class="font-bold text-slate-200">0</span>
+                                </div>
+                                <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                                    <div id="disc24-tier-d-bar" class="bg-slate-600 h-1.5 rounded-full" style="width: 0%"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="pt-4 border-t border-slate-800">
+                            <h4 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">🔍 Top Ingestion Sources (24h)</h4>
+                            <div id="disc24-top-sources" class="space-y-1.5 text-xs">
+                                <span class="text-slate-500">Loading sources...</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Review Filter & Action Controls -->
+                <div class="glassmorphism p-6 rounded-2xl shadow-xl space-y-4">
+                    <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                        <!-- Left: Status Filter Pills -->
+                        <div class="flex flex-wrap items-center gap-2">
+                            <span class="text-xs font-semibold uppercase tracking-wider text-slate-400 mr-1">Status:</span>
+                            <button onclick="setDiscoveredFilter('all')" id="disc-flt-all" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-500 text-white transition">All Discovered</button>
+                            <button onclick="setDiscoveredFilter('qualified')" id="disc-flt-qualified" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">🎯 Qualified Only</button>
+                            <button onclick="setDiscoveredFilter('with_contact')" id="disc-flt-contact" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">👤 With Direct Contact</button>
+                            <button onclick="setDiscoveredFilter('rejected')" id="disc-flt-rejected" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">🚫 Filtered / Rejected</button>
+                        </div>
+
+                        <!-- Right: Tier & Search Inputs -->
+                        <div class="flex flex-wrap items-center gap-3">
+                            <select id="disc-filter-tier" onchange="setDiscoveredTier(this.value)" class="p-2 rounded-xl glassmorphism-input text-slate-200 text-xs bg-slate-900">
+                                <option value="all">All Tiers</option>
+                                <option value="Tier_A">Tier A (VIP)</option>
+                                <option value="Tier_B">Tier B (Signals)</option>
+                                <option value="Tier_C">Tier C (Standard)</option>
+                                <option value="Tier_D">Tier D</option>
+                            </select>
+                            <div class="relative">
+                                <input type="text" id="disc-search-input" onkeyup="onDiscoveredSearch(event)" placeholder="Search @channel or keyword..." class="p-2 pl-8 rounded-xl glassmorphism-input text-slate-200 text-xs w-48 md:w-64">
+                                <svg class="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                            </div>
+                            <button onclick="fetchDiscovered24h()" class="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 transition text-xs font-medium rounded-xl text-slate-300 flex items-center gap-1.5 cursor-pointer">
+                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                <span>Refresh</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Batch Actions Toolbar -->
+                    <div class="pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3 bg-slate-950/40 p-3 rounded-xl">
+                        <div class="flex items-center space-x-3 text-xs">
+                            <span class="text-slate-400 font-medium">Selected for Outreach:</span>
+                            <span id="disc-selected-count" class="font-bold text-indigo-400">0 channels</span>
+                            <span class="text-slate-600">|</span>
+                            <span id="disc-total-matched" class="text-slate-400">Showing 0 channels</span>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                            <button onclick="batchApproveDiscovered()" id="disc-batch-approve-btn" class="px-4 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 transition text-xs font-semibold rounded-xl text-white shadow-lg shadow-emerald-600/20 flex items-center space-x-1.5 disabled:opacity-50 cursor-pointer">
+                                <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
+                                <span>Approve Selected Leads for Outreach</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 24h Channels Table -->
+                <div class="glassmorphism rounded-2xl shadow-xl overflow-hidden flex flex-col">
+                    <div class="px-6 py-4 border-b border-slate-900 flex justify-between items-center bg-slate-950/40">
+                        <div>
+                            <h3 class="text-sm font-semibold uppercase tracking-wider text-slate-300">Channels Discovered in Last 24 Hours</h3>
+                            <p class="text-xs text-slate-500 mt-0.5">Real-time rolling ledger. Check channels to approve them into Tamer's safe outreach campaign.</p>
+                        </div>
+                        <span id="disc24-auto-refresh-label" class="text-[11px] text-emerald-400/80 bg-emerald-950/40 border border-emerald-500/20 px-2.5 py-1 rounded-full flex items-center gap-1.5">
+                            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                            <span>Auto-refresh: 60s</span>
+                        </span>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left border-collapse text-xs">
+                            <thead>
+                                <tr class="bg-slate-900/80 border-b border-slate-900 text-slate-400 font-medium">
+                                    <th class="px-4 py-3 text-center w-[45px]">
+                                        <input type="checkbox" id="disc-select-all" onclick="toggleSelectAllDiscovered(this)" class="h-4 w-4 bg-slate-900 border-slate-700 rounded text-indigo-600 accent-indigo-500 cursor-pointer">
+                                    </th>
+                                    <th class="px-4 py-3">Channel / Handle</th>
+                                    <th class="px-4 py-3 text-center">Type</th>
+                                    <th class="px-4 py-3 text-right">Members</th>
+                                    <th class="px-4 py-3 text-center">Score</th>
+                                    <th class="px-4 py-3 text-center">Tier</th>
+                                    <th class="px-4 py-3 text-center">Arabic Ratio</th>
+                                    <th class="px-4 py-3">Direct Contact</th>
+                                    <th class="px-4 py-3">Discovery Source</th>
+                                    <th class="px-4 py-3">Discovered</th>
+                                    <th class="px-4 py-3 text-center">Campaign State</th>
+                                    <th class="px-4 py-3 text-center">Action</th>
+                                </tr>
+                            </thead>
+                            <tbody id="discovered-24h-body" class="divide-y divide-slate-900/40 text-slate-300">
+                                <tr>
+                                    <td colspan="12" class="px-6 py-12 text-center text-slate-500">Loading 24-hour discovery ledger...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
             </div>
 
         </main>
@@ -1738,6 +2190,7 @@ def serve_dashboard(request: Request):
                 const groupMetricsTab = document.getElementById('tab-group-metrics');
                 const discoveryTab = document.getElementById('tab-discovery');
                 const qualityTab = document.getElementById('tab-quality');
+                const discoveredTab = document.getElementById('tab-discovered-24h');
                 const leadsBtn = document.getElementById('tab-leads-btn');
                 const campaignsBtn = document.getElementById('tab-campaigns-btn');
                 const graphBtn = document.getElementById('tab-graph-btn');
@@ -1745,11 +2198,12 @@ def serve_dashboard(request: Request):
                 const groupMetricsBtn = document.getElementById('tab-group-metrics-btn');
                 const discoveryBtn = document.getElementById('tab-discovery-btn');
                 const qualityBtn = document.getElementById('tab-quality-btn');
+                const discoveredBtn = document.getElementById('tab-discovered-24h-btn');
 
-                [leadsTab, campaignsTab, graphTab, leaderboardsTab, groupMetricsTab, discoveryTab, qualityTab].forEach(t => t && t.classList.add('hidden'));
+                [leadsTab, campaignsTab, graphTab, leaderboardsTab, groupMetricsTab, discoveryTab, qualityTab, discoveredTab].forEach(t => t && t.classList.add('hidden'));
                 const inactiveClass = "px-4 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 transition";
                 const activeClass = "px-4 py-1.5 rounded-lg text-xs font-semibold bg-indigo-500 text-white transition";
-                [leadsBtn, campaignsBtn, graphBtn, leaderboardsBtn, groupMetricsBtn, discoveryBtn, qualityBtn].forEach(b => b && (b.className = inactiveClass));
+                [leadsBtn, campaignsBtn, graphBtn, leaderboardsBtn, groupMetricsBtn, discoveryBtn, qualityBtn, discoveredBtn].forEach(b => b && (b.className = inactiveClass));
 
                 if (tabId === 'leads') {
                     leadsTab.classList.remove('hidden');
@@ -1780,6 +2234,12 @@ def serve_dashboard(request: Request):
                     qualityTab.classList.remove('hidden');
                     qualityBtn.className = activeClass;
                     fetchQualityStats();
+                } else if (tabId === 'discovered-24h') {
+                    if (discoveredTab) discoveredTab.classList.remove('hidden');
+                    if (discoveredBtn) discoveredBtn.className = "px-4 py-1.5 rounded-lg text-xs font-semibold bg-emerald-500 text-white shadow-lg shadow-emerald-500/20 transition flex items-center gap-1.5";
+                    fetchDiscovered24h();
+                    clearInterval(discAutoRefreshTimer);
+                    discAutoRefreshTimer = setInterval(fetchDiscovered24h, 60000);
                 }
             }
 
@@ -2923,17 +3383,423 @@ def serve_dashboard(request: Request):
                     .catch(e => showToast('Network error: ' + e, 'error'));
             };
 
+            // ── Discovered 24h State & Handlers ────────────────────────────────
+            let discFilterStatus = 'all';
+            let discFilterTier = 'all';
+            let discSearchQuery = '';
+            let discSelectedLeads = new Set();
+            let discAutoRefreshTimer = null;
+
+            function setDiscoveredFilter(status) {
+                discFilterStatus = status;
+                const buttons = {
+                    'all': document.getElementById('disc-flt-all'),
+                    'qualified': document.getElementById('disc-flt-qualified'),
+                    'with_contact': document.getElementById('disc-flt-contact'),
+                    'rejected': document.getElementById('disc-flt-rejected')
+                };
+                const activeClass = "px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-500 text-white transition";
+                const inactiveClass = "px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition";
+                
+                Object.keys(buttons).forEach(k => {
+                    if (buttons[k]) buttons[k].className = (k === status ? activeClass : inactiveClass);
+                });
+                fetchDiscovered24h();
+            }
+
+            function setDiscoveredTier(tier) {
+                discFilterTier = tier;
+                fetchDiscovered24h();
+            }
+
+            let discSearchTimeout = null;
+            function onDiscoveredSearch(event) {
+                clearTimeout(discSearchTimeout);
+                discSearchTimeout = setTimeout(() => {
+                    discSearchQuery = document.getElementById('disc-search-input').value.trim();
+                    fetchDiscovered24h();
+                }, 300);
+            }
+
+            function toggleDiscoveredLead(leadId) {
+                if (discSelectedLeads.has(leadId)) {
+                    discSelectedLeads.delete(leadId);
+                } else {
+                    discSelectedLeads.add(leadId);
+                }
+                updateDiscoveredSelectionUI();
+            }
+
+            function toggleSelectAllDiscovered(masterCb) {
+                const checkboxes = document.querySelectorAll('.disc-row-cb');
+                checkboxes.forEach(cb => {
+                    cb.checked = masterCb.checked;
+                    const id = cb.dataset.id;
+                    if (masterCb.checked) {
+                        discSelectedLeads.add(id);
+                    } else {
+                        discSelectedLeads.delete(id);
+                    }
+                });
+                updateDiscoveredSelectionUI();
+            }
+
+            function updateDiscoveredSelectionUI() {
+                const count = discSelectedLeads.size;
+                const counter = document.getElementById('disc-selected-count');
+                const batchBtn = document.getElementById('disc-batch-approve-btn');
+                if (counter) counter.innerText = `${count} channel${count === 1 ? '' : 's'}`;
+                if (batchBtn) {
+                    batchBtn.disabled = count === 0;
+                    batchBtn.style.opacity = count === 0 ? '0.5' : '1';
+                }
+            }
+
+            function fetchDiscovered24h() {
+                const url = `/api/discovered-24h?status=${discFilterStatus}&tier=${discFilterTier}&search=${encodeURIComponent(discSearchQuery)}&limit=250`;
+                const tbody = document.getElementById('discovered-24h-body');
+                
+                fetch(url)
+                    .then(res => res.json())
+                    .then(data => {
+                        if (!data.success) {
+                            if (tbody) tbody.innerHTML = `<tr><td colspan="12" class="px-6 py-8 text-center text-rose-500">Error loading 24h ledger: ${data.error || 'Unknown'}</td></tr>`;
+                            return;
+                        }
+                        renderDiscovered24h(data);
+                    })
+                    .catch(err => {
+                        console.error('24h discovery fetch error:', err);
+                        if (tbody) tbody.innerHTML = `<tr><td colspan="12" class="px-6 py-8 text-center text-rose-500">Failed to connect to server API</td></tr>`;
+                    });
+            }
+
+            function renderDiscovered24h(data) {
+                const s = data.summary || {};
+                const h = data.system_health || {};
+                const channels = data.channels || [];
+
+                // 1. Update KPIs
+                const totalElem = document.getElementById('disc24-total');
+                if (totalElem) totalElem.innerText = (s.total_discovered || 0).toLocaleString();
+
+                const qualElem = document.getElementById('disc24-qualified');
+                const qualPct = document.getElementById('disc24-qual-pct');
+                if (qualElem) qualElem.innerText = (s.qualified_count || 0).toLocaleString();
+                if (qualPct) qualPct.innerText = `(${s.qualification_rate || 0}%)`;
+
+                const contactElem = document.getElementById('disc24-contacts');
+                const contactPct = document.getElementById('disc24-contact-pct');
+                if (contactElem) contactElem.innerText = (s.with_contact_count || 0).toLocaleString();
+                if (contactPct) contactPct.innerText = `(${s.contact_extraction_rate || 0}%)`;
+
+                // System Health Badges
+                const healthBadge = document.getElementById('disc24-health-status');
+                const killBadge = document.getElementById('disc24-kill-badge');
+                if (healthBadge) {
+                    if (h.kill_switch_active) {
+                        healthBadge.className = "px-2.5 py-0.5 rounded-full text-xs font-semibold bg-rose-500/20 text-rose-300 border border-rose-500/30";
+                        healthBadge.innerText = "Kill Switch Stopped";
+                    } else if (h.outreach_globally_enabled) {
+                        healthBadge.className = "px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30";
+                        healthBadge.innerText = "Active Safe Outreach";
+                    } else {
+                        healthBadge.className = "px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30";
+                        healthBadge.innerText = "Awaiting Activation";
+                    }
+                }
+                if (killBadge) {
+                    killBadge.innerText = h.kill_switch_active ? "KillSwitch: TRIGGERED" : "KillSwitch: STANDBY";
+                    killBadge.className = h.kill_switch_active
+                        ? "px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-500/30 text-rose-300 border border-rose-500/40"
+                        : "px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30";
+                }
+
+                // Total matched indicator
+                const matchedElem = document.getElementById('disc-total-matched');
+                if (matchedElem) matchedElem.innerText = `Showing ${channels.length} of ${(s.total_matched || channels.length).toLocaleString()} channels`;
+
+                // 2. Render Hourly Velocity Chart
+                renderHourlyVelocityChart(s.hourly_throughput || []);
+
+                // 3. Render Tier Breakdown
+                const tierDist = s.tier_distribution || {};
+                const totalDisc = s.total_discovered || 1;
+                const tierA = tierDist['Tier_A'] || 0;
+                const tierB = tierDist['Tier_B'] || 0;
+                const tierC = tierDist['Tier_C'] || 0;
+                const tierD = (tierDist['Tier_D'] || 0) + (tierDist[null] || 0) + (tierDist['None'] || 0);
+
+                const elA = document.getElementById('disc24-tier-a');
+                const elAbar = document.getElementById('disc24-tier-a-bar');
+                if (elA) elA.innerText = tierA.toLocaleString();
+                if (elAbar) elAbar.style.width = `${Math.round((tierA / totalDisc) * 100)}%`;
+
+                const elB = document.getElementById('disc24-tier-b');
+                const elBbar = document.getElementById('disc24-tier-b-bar');
+                if (elB) elB.innerText = tierB.toLocaleString();
+                if (elBbar) elBbar.style.width = `${Math.round((tierB / totalDisc) * 100)}%`;
+
+                const elC = document.getElementById('disc24-tier-c');
+                const elCbar = document.getElementById('disc24-tier-c-bar');
+                if (elC) elC.innerText = tierC.toLocaleString();
+                if (elCbar) elCbar.style.width = `${Math.round((tierC / totalDisc) * 100)}%`;
+
+                const elD = document.getElementById('disc24-tier-d');
+                const elDbar = document.getElementById('disc24-tier-d-bar');
+                if (elD) elD.innerText = tierD.toLocaleString();
+                if (elDbar) elDbar.style.width = `${Math.round((tierD / totalDisc) * 100)}%`;
+
+                // 4. Render Top Sources
+                const sourcesContainer = document.getElementById('disc24-top-sources');
+                if (sourcesContainer) {
+                    const topSources = s.top_sources || [];
+                    if (topSources.length === 0) {
+                        sourcesContainer.innerHTML = `<span class="text-slate-500">No sources logged</span>`;
+                    } else {
+                        sourcesContainer.innerHTML = topSources.slice(0, 5).map(src => `
+                            <div class="flex justify-between items-center text-slate-300">
+                                <span class="font-medium text-slate-400 truncate max-w-[170px]" title="${src.source} (${src.method})">${src.source}</span>
+                                <span class="font-bold text-slate-200">${src.count.toLocaleString()}</span>
+                            </div>
+                        `).join('');
+                    }
+                }
+
+                // 5. Render Channels Rows
+                const tbody = document.getElementById('discovered-24h-body');
+                if (!tbody) return;
+
+                if (channels.length === 0) {
+                    tbody.innerHTML = `<tr><td colspan="12" class="px-6 py-12 text-center text-slate-500">No channels found matching the selected filters in the last 24 hours.</td></tr>`;
+                    return;
+                }
+
+                tbody.innerHTML = channels.map(ch => {
+                    const isChecked = discSelectedLeads.has(ch.id);
+                    const username = ch.channel_username ? `@${ch.channel_username}` : '(Private)';
+                    const tmeLink = ch.channel_username ? `https://t.me/${ch.channel_username}` : '#';
+                    const isGroup = ch.is_group;
+                    const members = (ch.member_count || 0).toLocaleString();
+                    const score = ch.lead_score || 0;
+                    const forexScore = ch.forex_score || 0;
+                    const arabicRatio = ch.arabic_ratio ? `${Math.round(ch.arabic_ratio * 100)}%` : '0%';
+                    
+                    // Tier badge
+                    let tierBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-400">Tier D</span>`;
+                    if (ch.tier === 'Tier_A') tierBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30">Tier A</span>`;
+                    else if (ch.tier === 'Tier_B') tierBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">Tier B</span>`;
+                    else if (ch.tier === 'Tier_C') tierBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">Tier C</span>`;
+
+                    // Contact cell
+                    let contactHtml = `<span class="text-slate-600">—</span>`;
+                    if (ch.contact_username) {
+                        contactHtml = `<a href="https://t.me/${ch.contact_username.replace('@','')}" target="_blank" class="text-cyan-400 hover:text-cyan-300 font-medium">@${ch.contact_username.replace('@','')}</a>`;
+                    } else if (ch.whatsapp) {
+                        contactHtml = `<a href="https://wa.me/${ch.whatsapp.replace(/[^0-9]/g,'')}" target="_blank" class="text-emerald-400 hover:text-emerald-300 font-medium">WA: ${ch.whatsapp}</a>`;
+                    }
+
+                    // Relative discovery time
+                    let discTimeStr = 'recently';
+                    if (ch.discovered_at) {
+                        const discDate = new Date(ch.discovered_at);
+                        const diffMins = Math.round((new Date() - discDate) / 60000);
+                        if (diffMins < 60) discTimeStr = `${diffMins}m ago`;
+                        else {
+                            const hours = Math.floor(diffMins / 60);
+                            discTimeStr = `${hours}h ${diffMins % 60}m ago`;
+                        }
+                    }
+
+                    // Campaign status badge
+                    let campStatusBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-400">Not Enrolled</span>`;
+                    const cs = ch.campaign_status;
+                    if (cs === 'approved') campStatusBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">Approved</span>`;
+                    else if (cs === 'sent') campStatusBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">Sent</span>`;
+                    else if (cs === 'pending_review' || cs === 'pending') campStatusBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30">Pending</span>`;
+                    else if (cs === 'failed') campStatusBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-500/20 text-rose-300 border border-rose-500/30">Failed</span>`;
+
+                    // Single action button
+                    const isApproved = cs === 'approved' || cs === 'sent';
+                    const actionBtn = isApproved
+                        ? `<button disabled class="px-2.5 py-1 text-[11px] font-semibold bg-slate-800/80 text-emerald-400 rounded-lg cursor-not-allowed">✓ Enrolled</button>`
+                        : `<button onclick="approveDiscoveredLead('${ch.id}')" class="px-2.5 py-1 text-[11px] font-semibold bg-emerald-600/30 hover:bg-emerald-600/50 text-emerald-300 border border-emerald-500/30 rounded-lg transition cursor-pointer">✓ Approve</button>`;
+
+                    return `
+                        <tr class="hover:bg-slate-900/40 transition">
+                            <td class="px-4 py-3 text-center">
+                                <input type="checkbox" data-id="${ch.id}" ${isChecked ? 'checked' : ''} onchange="toggleDiscoveredLead('${ch.id}')" class="disc-row-cb h-4 w-4 bg-slate-900 border-slate-700 rounded text-indigo-600 accent-indigo-500 cursor-pointer">
+                            </td>
+                            <td class="px-4 py-3">
+                                <div class="flex items-center space-x-1.5">
+                                    <a href="${tmeLink}" target="_blank" class="font-semibold text-slate-100 hover:text-indigo-300 truncate max-w-[180px]">${username}</a>
+                                </div>
+                                <div class="text-[11px] text-slate-500 truncate max-w-[200px]" title="${(ch.description || '').replace(/"/g, '&quot;')}">${ch.description || 'No description'}</div>
+                            </td>
+                            <td class="px-4 py-3 text-center">
+                                <span class="px-1.5 py-0.5 rounded text-[10px] font-medium ${isGroup ? 'bg-purple-950/60 text-purple-300 border border-purple-800/40' : 'bg-blue-950/60 text-blue-300 border border-blue-800/40'}">
+                                    ${isGroup ? 'Group' : 'Channel'}
+                                </span>
+                            </td>
+                            <td class="px-4 py-3 text-right font-medium text-slate-300">${members}</td>
+                            <td class="px-4 py-3 text-center">
+                                <span class="font-bold ${score >= 50 ? 'text-emerald-400' : 'text-slate-300'}">${score}</span>
+                                <span class="text-[10px] text-slate-500 block">FX: ${forexScore}</span>
+                            </td>
+                            <td class="px-4 py-3 text-center">${tierBadge}</td>
+                            <td class="px-4 py-3 text-center font-medium text-slate-400">${arabicRatio}</td>
+                            <td class="px-4 py-3">${contactHtml}</td>
+                            <td class="px-4 py-3">
+                                <span class="text-[11px] text-slate-400 block truncate max-w-[120px]">${ch.discovery_source || 'system'}</span>
+                                <span class="text-[10px] text-slate-500">${ch.discovery_method || ''}</span>
+                            </td>
+                            <td class="px-4 py-3 text-slate-400 whitespace-nowrap">${discTimeStr}</td>
+                            <td class="px-4 py-3 text-center">${campStatusBadge}</td>
+                            <td class="px-4 py-3 text-center">${actionBtn}</td>
+                        </tr>
+                    `;
+                }).join('');
+
+                updateDiscoveredSelectionUI();
+            }
+
+            function renderHourlyVelocityChart(hourlyList) {
+                const chartElem = document.getElementById('disc24-hourly-chart');
+                const peakSummaryElem = document.getElementById('disc24-hourly-summary');
+                if (!chartElem) return;
+
+                if (!hourlyList || hourlyList.length === 0) {
+                    chartElem.innerHTML = `<div class="text-xs text-slate-500 w-full text-center py-12">No discovery events recorded in the last 24 hours.</div>`;
+                    return;
+                }
+
+                let maxTotal = 1;
+                let peakHour = '';
+                hourlyList.forEach(h => {
+                    if (h.total > maxTotal) {
+                        maxTotal = h.total;
+                        peakHour = h.hour;
+                    }
+                });
+
+                if (peakSummaryElem) {
+                    peakSummaryElem.innerText = `Peak: ${maxTotal.toLocaleString()} channels/hr at ${peakHour || 'N/A'}`;
+                }
+
+                chartElem.innerHTML = hourlyList.map(h => {
+                    const totalHeightPct = Math.max(8, Math.round((h.total / maxTotal) * 100));
+                    const qualHeightPct = h.total > 0 ? Math.round((h.qualified / h.total) * 100) : 0;
+                    return `
+                        <div class="flex-1 flex flex-col items-center group relative min-w-[28px] h-full justify-end" title="${h.hour}: ${h.total} total (${h.qualified} qualified, ${h.rejected} rejected)">
+                            <!-- Tooltip -->
+                            <div class="absolute -top-10 hidden group-hover:flex flex-col items-center z-20 pointer-events-none">
+                                <div class="bg-slate-900 border border-slate-700 px-2 py-1 rounded text-[10px] text-slate-200 whitespace-nowrap shadow-xl">
+                                    <span class="font-bold text-white">${h.hour}</span>: ${h.total} (${h.qualified} qual)
+                                </div>
+                                <div class="w-1.5 h-1.5 bg-slate-900 rotate-45 border-r border-b border-slate-700 -mt-1"></div>
+                            </div>
+                            <!-- Bar -->
+                            <div class="w-full bg-slate-800/80 rounded-t flex flex-col justify-end overflow-hidden transition-all duration-300 group-hover:brightness-125" style="height: ${totalHeightPct}%;">
+                                <div class="w-full bg-emerald-500/90" style="height: ${qualHeightPct}%;"></div>
+                            </div>
+                            <!-- X Label -->
+                            <span class="text-[9px] text-slate-500 mt-1 truncate w-full text-center">${h.hour.split(':')[0]}h</span>
+                        </div>
+                    `;
+                }).join('');
+            }
+
+            function approveDiscoveredLead(leadId) {
+                showToast('Enrolling lead into active campaign...', 'info');
+                fetch('/api/discovered-24h/approve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ lead_ids: [leadId] })
+                })
+                .then(r => r.json())
+                .then(d => {
+                    if (d.success) {
+                        showToast('Successfully enrolled lead! (Approved for outreach)', 'success');
+                        fetchDiscovered24h();
+                    } else {
+                        showToast(`Enrollment failed: ${d.error || 'Unknown error'}`, 'error');
+                    }
+                })
+                .catch(e => showToast(`Network error: ${e.message}`, 'error'));
+            }
+
+            function batchApproveDiscovered() {
+                if (discSelectedLeads.size === 0) {
+                    showToast('Please select at least one channel first.', 'error');
+                    return;
+                }
+                const ids = Array.from(discSelectedLeads);
+                showToast(`Enrolling ${ids.length} selected leads for outreach...`, 'info');
+                fetch('/api/discovered-24h/approve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ lead_ids: ids })
+                })
+                .then(r => r.json())
+                .then(d => {
+                    if (d.success) {
+                        showToast(`Successfully approved ${d.approved_count} channels for outreach!`, 'success');
+                        discSelectedLeads.clear();
+                        fetchDiscovered24h();
+                    } else {
+                        showToast(`Batch approval failed: ${d.error || 'Unknown error'}`, 'error');
+                    }
+                })
+                .catch(e => showToast(`Network error: ${e.message}`, 'error'));
+            }
+
             // Initial Load
             fetchLeads();
             fetchLeaderboards();
             fetchGroupMetrics();
             fetchDiscoveryStats();
             fetchCampaigns();
+
+            // Hash Router Listener
+            if (window.location.hash === '#discovered-24h') {
+                switchTab('discovered-24h');
+            }
         </script>
     </body>
     </html>
     """
-    return HTMLResponse(content=html_content, status_code=200)
+
+
+@app.get("/", response_class=HTMLResponse)
+def serve_dashboard(request: Request):
+    required_key = os.getenv("DASHBOARD_API_KEY", "").strip()
+    is_production = os.getenv("ENVIRONMENT", "").lower() == "production"
+
+    if is_production and required_key:
+        cookie = request.cookies.get("dashboard_session")
+        if not cookie or cookie != _get_session_token(required_key):
+            return HTMLResponse(content=LOGIN_PAGE_HTML, status_code=200)
+
+    return HTMLResponse(content=DASHBOARD_PAGE_HTML, status_code=200)
+
+
+@app.get("/discovered-24h", response_class=HTMLResponse)
+def serve_discovered_24h_page(request: Request):
+    """Dedicated route directly presenting the 24-Hour Discovered Channels & System Health page."""
+    required_key = os.getenv("DASHBOARD_API_KEY", "").strip()
+    is_production = os.getenv("ENVIRONMENT", "").lower() == "production"
+
+    if is_production and required_key:
+        cookie = request.cookies.get("dashboard_session")
+        if not cookie or cookie != _get_session_token(required_key):
+            return HTMLResponse(content=LOGIN_PAGE_HTML, status_code=200)
+
+    # Automatically activate the 24h discovery tab on load
+    modified_html = DASHBOARD_PAGE_HTML.replace(
+        "// Hash Router Listener",
+        "switchTab('discovered-24h');\n            // Hash Router Listener"
+    )
+    return HTMLResponse(content=modified_html, status_code=200)
 
 # ── Outreach Engine API Endpoints ─────────────────────────────────────────
 
