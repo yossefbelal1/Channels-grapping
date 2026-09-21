@@ -78,7 +78,7 @@ class TestDiscovered24hAPI(unittest.TestCase):
         self.assertEqual(res["summary"]["qualified_count"], 90)
         self.assertEqual(res["summary"]["rejected_count"], 60)
         self.assertEqual(res["summary"]["qualification_rate"], 60.0)
-        self.assertEqual(res["summary"]["contact_extraction_rate"], 10.0)
+        self.assertEqual(res["summary"]["contact_extraction_rate"], 16.7)
         self.assertIn("system_health", res)
         self.assertTrue(res["system_health"]["kill_switch_active"])
         self.assertEqual(len(res["channels"]), 1)
@@ -105,6 +105,29 @@ class TestDiscovered24hAPI(unittest.TestCase):
         self.assertFalse(res["success"])
         self.assertIn("No lead_ids provided", res["error"])
 
+    @patch("app.learning.rejection_learner.RejectionLearner.process_rejection")
+    @patch("dashboard.get_redis_client")
+    @patch("dashboard.get_db_cursor")
+    def test_reject_discovered_lead_success(self, mock_get_cursor, mock_redis, mock_process):
+        """Test reject_discovered_lead endpoint calls RejectionLearner."""
+        from dashboard import reject_discovered_lead
+        mock_process.return_value = {
+            "success": True,
+            "lead_id": "test-lead-uuid",
+            "learned_negative_tokens": ["spam", "betting"]
+        }
+        res = reject_discovered_lead(payload={"lead_id": "test-lead-uuid", "reason": "Non-forex spam"})
+        self.assertTrue(res["success"])
+        self.assertEqual(res["lead_id"], "test-lead-uuid")
+        self.assertIn("spam", res["learned_negative_tokens"])
+
+    def test_reject_discovered_lead_missing_id(self):
+        """Test rejecting without lead_id returns error."""
+        from dashboard import reject_discovered_lead
+        res = reject_discovered_lead(payload={})
+        self.assertFalse(res["success"])
+        self.assertIn("No lead_id provided", res["error"])
+
     def test_serve_discovered_24h_page(self):
         """Test serve_discovered_24h_page renders HTML with 24h discovery components."""
         from dashboard import serve_discovered_24h_page
@@ -121,9 +144,11 @@ class TestDiscovered24hAPI(unittest.TestCase):
             self.assertIn('Hourly Discovery Velocity', html)
             self.assertIn('disc24-total', html)
             self.assertIn('batchApproveDiscovered', html)
+            self.assertIn('rejectDiscoveredLead', html)
             self.assertIn("switchTab('discovered-24h');", html)
 
 
 if __name__ == "__main__":
     unittest.main()
+
 

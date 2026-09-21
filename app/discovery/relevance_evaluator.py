@@ -192,18 +192,24 @@ class RelevanceEvaluator:
         if in_degree >= 2:
             score += 10
 
-        # Dynamic Learned Knowledge Boost (up to 20 pts)
+        # Dynamic Learned Knowledge Boost (up to 20 pts) & Negative Rejection Penalty
         learned_boost = 0.0
         learned_signals = []
+        learned_penalty = 0.0
+        negative_signals = []
         if knowledge_model is not None:
             try:
                 learned_boost, learned_signals = knowledge_model.evaluate_text_boost(combined_text)
                 if learned_boost > 0:
                     score += int(round(learned_boost))
+                if hasattr(knowledge_model, 'evaluate_negative_penalty'):
+                    learned_penalty, negative_signals = knowledge_model.evaluate_negative_penalty(combined_text)
+                    if learned_penalty > 0:
+                        score = max(0, score - int(round(learned_penalty)))
             except Exception as e:
-                logger.debug(f"[RELEVANCE] Error evaluating learned knowledge boost: {e}")
+                logger.debug(f"[RELEVANCE] Error evaluating learned knowledge boost/penalty: {e}")
 
-        score = min(100, score)
+        score = min(100, max(0, score))
 
         # ── 7. Classification & Tiering ───────────────────────────────────────
         has_trading_evidence = (
@@ -216,17 +222,17 @@ class RelevanceEvaluator:
             len(learned_signals) > 0
         )
 
-        if score >= 65 and has_trading_evidence:
+        if score >= 65 and has_trading_evidence and learned_penalty < 30:
             classification = "HIGH_CONFIDENCE_FOREX"
             tier = "Tier_A"
             target_q = "queue:high"
             qualified = True
-        elif score >= 45 and has_trading_evidence:
+        elif score >= 45 and has_trading_evidence and learned_penalty < 30:
             classification = "LIKELY_FOREX"
             tier = "Tier_B"
             target_q = "queue:high"
             qualified = True
-        elif score >= 25 and (has_trading_evidence or referrer_is_tier_a):
+        elif score >= 25 and (has_trading_evidence or referrer_is_tier_a) and learned_penalty < 30:
             classification = "POSSIBLE_FOREX"
             tier = "Tier_C"
             target_q = "queue:normal"
@@ -236,6 +242,13 @@ class RelevanceEvaluator:
             tier = "Tier_D"
             target_q = "queue:normal"
             qualified = False
+
+        rejection_cause = None
+        if not qualified:
+            if learned_penalty >= 30:
+                rejection_cause = f"High similarity to user-rejected channels (matched {negative_signals[:3]})"
+            else:
+                rejection_cause = "Insufficient trading evidence across bio, posts, and graph context"
 
         evidence = {
             "score": score,
@@ -250,7 +263,9 @@ class RelevanceEvaluator:
             "referrer_is_tier_a": referrer_is_tier_a,
             "in_degree": in_degree,
             "learned_signals_boost": learned_boost,
-            "learned_signals_matched": learned_signals
+            "learned_signals_matched": learned_signals,
+            "learned_negative_penalty": learned_penalty,
+            "learned_negative_signals": negative_signals
         }
 
         return RelevanceDecision(
@@ -260,5 +275,6 @@ class RelevanceEvaluator:
             tier_estimate=tier,
             target_queue=target_q,
             evidence=evidence,
-            rejection_reason=None if qualified else "Insufficient trading evidence across bio, posts, and graph context"
+            rejection_reason=rejection_cause
         )
+

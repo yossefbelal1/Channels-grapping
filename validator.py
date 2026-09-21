@@ -228,175 +228,15 @@ def apply_natural_greeting_variation(text: str) -> str:
 
     return f"{chosen_greeting}،\n{text}"
 
+from app.validator.contact_extractor import extract_contacts as _smart_extract_contacts
+
 def extract_contacts(text: str, description: str, channel_username: str) -> dict:
     """
-    Extracts contact info (website, email, whatsapp, support usernames) from text & description.
+    Extracts contact info (website, email, whatsapp, support usernames) using the
+    advanced multi-surface, emoji-aware contact extraction engine.
     """
-    contacts = {
-        'website': None,
-        'email': None,
-        'whatsapp': None,
-        'contact_username': None
-    }
-    
-    combined_text = f"{text} {description}"
-    
-    # 1. Website: Matches HTTP/HTTPS URLs excluding telegram links
-    web_match = re.search(
-        r'https?://(?:www\.)?(?!(?:t\.me|telegram\.(?:me|dog|org|space)))([a-zA-Z0-9-]+\.[a-zA-Z]{2,6})[^\s]*',
-        combined_text,
-        re.IGNORECASE
-    )
-    if web_match:
-        contacts['website'] = web_match.group(0).rstrip('.,;)!}"\'')
-        
-    # 2. Email
-    email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', combined_text)
-    if email_match:
-        contacts['email'] = email_match.group(0)
-        
-    # 3. WhatsApp
-    # Match links like wa.me or standard phone patterns
-    wa_link_match = re.search(
-        r'(?:wa\.me/|api\.whatsapp\.com/send\?phone=|whatsapp:)\+?([0-9]{9,15})',
-        combined_text,
-        re.IGNORECASE
-    )
-    if wa_link_match:
-        contacts['whatsapp'] = f"+{wa_link_match.group(1)}"
-    else:
-        # Match standard phone formats with international codes
-        phone_match = re.search(
-            r'\+?(966|971|965|968|973|962|961|963|967|964|20|90|44|1)[0-9\s-]{7,15}',
-            combined_text
-        )
-        if phone_match:
-            num = re.sub(r'[\s-]', '', phone_match.group(0))
-            if not num.startswith('+'):
-                num = f"+{num}"
-            contacts['whatsapp'] = num
+    return _smart_extract_contacts(text, description, channel_username)
 
-    # 4. Telegram support/admin username
-    contact_username = None
-    
-    # Define contact keywords list (Arabic + English) - Massive list covering all possible variations
-    keywords_pattern = (
-        r'للتواصل|تواصل|تواصلوا|راسل|راسلونا|راسلني|راسلنا|مراسلة|للمراسلة|'
-        r'للاشتراك|اشتراك|للانضمام|انضمام|الادارة|الاداره|ادارة|اداره|'
-        r'المشرف|مشرف|المشرفين|الدعم|دعم|المسؤول|المسئول|مسؤول|مسئول|'
-        r'للاستفسار|استفسار|استفسارات|للاستفسارات|حسابي|خاص|الخاص|'
-        r'تواصل معي|تواصل معنا|للتواصل معي|للتواصل معنا|راسلني على|راسلنا على|'
-        r'ارسل لي|ارسل لنا|ارسل رسالة|كلمني|كلمني على|تواصل عبر|تواصلوا عبر|'
-        r'سجل|التسجيل|للتشراك|للتحدث|تحدث|مطور|المطور|مطورين|'
-        r'صاحب القناة|صاحب القناه|مالك القناة|مالك القناه|صاحب|مالك|المالك|الصاحب|'
-        r'admin|administrator|support|contact|help|owner|manager|ceo|founder|creator|'
-        r'inquiry|inquiries|subscribe|subscription|pm|dm|chat|personal|me|contactme|contactus|'
-        r'messageme|reachme|reachus|writeme|writeus|askme|tg|tele|telegram'
-    )
-    
-    # Usernames list to skip during fallback extraction (bots, channels, channels terms)
-    skip_usernames = {
-        'vip', 'premium', 'joinchat', 'channel', 'bot', 'ads', 'link', 'group', 'telegram', 
-        'robot', 'signals', 'crypto', 'forex', 'arabic', 'trade', 'trading', 'chart', 'charts', 
-        'alerts', 'alert', 'course', 'courses', 'education', 'academy', 'hub', 'capital', 'fund', 
-        'fx', 'gold', 'signal', 'goldfx', 'team', 'club', 'official', 'news', 'fxsignals', 'system',
-        'user', 'adminbot', 'helper', 'supportbot', 'channelbot', 'addstickers', 'share',
-        'addlist', 'setlanguage', 'proxy', 'socks', 'c', 's', 'm', 'i'
-    }
-
-    def _clean_cand(u_str):
-        if not u_str:
-            return ""
-        c = u_str.strip().lstrip('@').lstrip('/').rstrip('.,;:)!?*~`"\'')
-        for glued in ['whatsup', 'whatsapp', 'telegram', 'tele', 'vipsignal', 'channel', 'group']:
-            if c.lower().endswith(glued) and len(c) > len(glued) + 3:
-                c = c[:-len(glued)]
-                break
-        while c.endswith('_') and len(c) > 3:
-            c = c[:-1]
-        while c.startswith('_') and len(c) > 3:
-            c = c[1:]
-        return c.strip()
-    
-    contact_source = 'unknown'
-    # A. Search description first (official channel biography) - Check both @ and t.me/ formats
-    match_desc_fwd = re.search(r'(?:' + keywords_pattern + r')\s*[:\-\x20]{1,10}(?:https?://)?(?:t\.me/|@)([a-zA-Z0-9_]{3,35})', description or '', re.IGNORECASE)
-    if match_desc_fwd:
-        cand = _clean_cand(match_desc_fwd.group(1))
-        if cand.lower() != channel_username.lower() and cand.lower() not in skip_usernames:
-            contact_username = cand
-            contact_source = 'bio_official'
-            
-    if not contact_username:
-        match_desc_bwd = re.search(r'(?:https?://)?(?:t\.me/|@)([a-zA-Z0-9_]{3,35})\s*[:\-\x20]{1,10}(?:' + keywords_pattern + r')', description or '', re.IGNORECASE)
-        if match_desc_bwd:
-            cand = _clean_cand(match_desc_bwd.group(1))
-            if cand.lower() != channel_username.lower() and cand.lower() not in skip_usernames:
-                contact_username = cand
-                contact_source = 'bio_admin'
-                
-    if not contact_username and description:
-        # Fallback 1: any t.me link in description
-        all_desc_tme = re.findall(r'(?:https?://)?(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{3,35})', description, re.IGNORECASE)
-        for raw in all_desc_tme:
-            cand = _clean_cand(raw)
-            if cand.lower() != channel_username.lower() and cand.lower() not in skip_usernames and not cand.startswith('+'):
-                contact_username = cand
-                contact_source = 'bio_general'
-                break
-                
-    if not contact_username and description:
-        # Fallback 2: any username in description
-        all_desc = re.findall(r'@([a-zA-Z0-9_]{3,35})', description)
-        for raw in all_desc:
-            cand = _clean_cand(raw)
-            if cand.lower() != channel_username.lower() and cand.lower() not in skip_usernames:
-                contact_username = cand
-                contact_source = 'bio_general'
-                break
-                    
-    # B. If not found in description, search in the message logs text
-    if not contact_username:
-        match_txt_fwd = re.search(r'(?:' + keywords_pattern + r')\s*[:\-\x20]{1,10}(?:https?://)?(?:t\.me/|@)([a-zA-Z0-9_]{3,35})', text or '', re.IGNORECASE)
-        if match_txt_fwd:
-            cand = _clean_cand(match_txt_fwd.group(1))
-            if cand.lower() != channel_username.lower() and cand.lower() not in skip_usernames:
-                contact_username = cand
-                contact_source = 'intent_cta'
-                
-    if not contact_username:
-        match_txt_bwd = re.search(r'(?:https?://)?(?:t\.me/|@)([a-zA-Z0-9_]{3,35})\s*[:\-\x20]{1,10}(?:' + keywords_pattern + r')', text or '', re.IGNORECASE)
-        if match_txt_bwd:
-            cand = _clean_cand(match_txt_bwd.group(1))
-            if cand.lower() != channel_username.lower() and cand.lower() not in skip_usernames:
-                contact_username = cand
-                contact_source = 'intent_cta'
-
-    if not contact_username and text:
-        # Fallback: any t.me link in text
-        all_txt_tme = re.findall(r'(?:https?://)?(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{3,35})', text, re.IGNORECASE)
-        for raw in all_txt_tme:
-            cand = _clean_cand(raw)
-            if cand.lower() != channel_username.lower() and cand.lower() not in skip_usernames and not cand.startswith('+'):
-                contact_username = cand
-                contact_source = 'message_general'
-                break
-
-    if not contact_username and text:
-        # Fallback: any @username in text
-        all_text_usernames = re.findall(r'@([a-zA-Z0-9_]{3,35})', text)
-        for raw in all_text_usernames:
-            cand = _clean_cand(raw)
-            if cand.lower() != channel_username.lower() and cand.lower() not in skip_usernames:
-                contact_username = cand
-                contact_source = 'message_general'
-                break
-                        
-    if contact_username:
-        contacts['contact_username'] = contact_username
-        contacts['source'] = contact_source
-        
-    return contacts
 
 
 def calculate_arabic_metrics(text: str, messages: list) -> tuple:
@@ -3429,10 +3269,10 @@ class LeadValidator:
                                 cur_enqueue.execute("""
                                     INSERT INTO campaign_logs (id, campaign_id, lead_id, status, sent_at,
                                                                priority, priority_score, priority_reason, commercial_fit_score)
-                                    SELECT gen_random_uuid(), %s, l.id, 'pending_review', NULL,
-                                           COALESCE(l.outreach_priority, 'P3'),
-                                           COALESCE(l.outreach_priority_score, 25),
-                                           l.outreach_priority_reason,
+                                    SELECT gen_random_uuid(), %s, l.id, 'approved', NULL,
+                                           COALESCE(l.outreach_priority, 'P2'),
+                                           COALESCE(l.outreach_priority_score, 50),
+                                           'Auto-enrolled qualified discovery',
                                            COALESCE(l.commercial_fit_score, 0)
                                     FROM leads l
                                     WHERE l.id = %s
@@ -3444,9 +3284,9 @@ class LeadValidator:
                                 """, (active_camp_id, lead_db_row['id'], contact_user_str))
                                 conn.commit()
                                 if cur_enqueue.rowcount > 0:
-                                    logging.info(f"📋 Outreach Review Queue: Lead @{username} (contact @{contact_user_str}) queued for HUMAN REVIEW (status: pending_review). Automatic dispatch is strictly disabled.")
+                                    logging.info(f"🚀 Auto-Enrollment: Lead @{username} (contact @{contact_user_str}) auto-enrolled to active campaign {active_camp_id} as 'approved'.")
                 except Exception as enqueue_err:
-                    logging.warning(f"Outreach Review Queue note for @{username}: {enqueue_err}")
+                    logging.warning(f"Outreach auto-enrollment note for @{username}: {enqueue_err}")
 
             # Track discovery source analytics
             is_high_quality = (status_val == 'new' and score >= 70 and forex_intent_score >= 60)

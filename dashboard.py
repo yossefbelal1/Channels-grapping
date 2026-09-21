@@ -282,14 +282,15 @@ def get_discovered_24h(
             cur.execute("""
                 SELECT 
                     COUNT(*) as total_discovered,
-                    COUNT(*) FILTER (WHERE status = 'new') as qualified_count,
+                    COUNT(*) FILTER (WHERE status = 'new' AND (lead_score >= 10 OR tier IS NOT NULL)) as qualified_count,
+                    COUNT(*) FILTER (WHERE status = 'new' AND lead_score IS NULL AND tier IS NULL) as pending_scan_count,
                     COUNT(*) FILTER (WHERE status = 'rejected') as rejected_count,
-                    COUNT(*) FILTER (WHERE contact_username IS NOT NULL AND contact_username != '') as with_contact_count,
+                    COUNT(*) FILTER (WHERE (contact_username IS NOT NULL AND contact_username != '') OR (whatsapp IS NOT NULL AND whatsapp != '')) as with_contact_count,
                     COUNT(*) FILTER (WHERE whatsapp IS NOT NULL AND whatsapp != '') as with_whatsapp_count,
                     COUNT(*) FILTER (WHERE is_group = TRUE) as groups_count,
                     COUNT(*) FILTER (WHERE is_group = FALSE) as channels_count,
-                    ROUND(AVG(COALESCE(lead_score, 0)), 1) as avg_score,
-                    ROUND(AVG(COALESCE(forex_intent_score, 0)), 1) as avg_forex_score
+                    ROUND(AVG(COALESCE(lead_score, 0)) FILTER (WHERE lead_score IS NOT NULL), 1) as avg_score,
+                    ROUND(AVG(COALESCE(forex_intent_score, 0)) FILTER (WHERE forex_intent_score IS NOT NULL), 1) as avg_forex_score
                 FROM leads
                 WHERE discovered_at >= NOW() - INTERVAL '24 HOURS';
             """)
@@ -301,7 +302,7 @@ def get_discovered_24h(
                     to_char(date_trunc('hour', discovered_at), 'HH24:00') as hour_label,
                     date_trunc('hour', discovered_at) as hour_slot,
                     COUNT(*) as total_count,
-                    COUNT(*) FILTER (WHERE status = 'new') as qualified_count,
+                    COUNT(*) FILTER (WHERE status = 'new' AND (lead_score >= 10 OR tier IS NOT NULL)) as qualified_count,
                     COUNT(*) FILTER (WHERE status = 'rejected') as rejected_count
                 FROM leads
                 WHERE discovered_at >= NOW() - INTERVAL '24 HOURS'
@@ -349,11 +350,13 @@ def get_discovered_24h(
             if status:
                 st = status.lower()
                 if st in ('new', 'qualified'):
-                    where_clauses.append("l.status = 'new'")
+                    where_clauses.append("l.status = 'new' AND (l.lead_score >= 10 OR l.tier IS NOT NULL)")
                 elif st == 'rejected':
                     where_clauses.append("l.status = 'rejected'")
                 elif st == 'with_contact':
-                    where_clauses.append("l.contact_username IS NOT NULL AND l.contact_username != ''")
+                    where_clauses.append("(l.contact_username IS NOT NULL AND l.contact_username != '') OR (l.whatsapp IS NOT NULL AND l.whatsapp != '')")
+                elif st == 'pending_scan':
+                    where_clauses.append("l.status = 'new' AND l.lead_score IS NULL AND l.tier IS NULL")
 
             if tier and tier.lower() != 'all':
                 where_clauses.append("l.tier = %s")
@@ -421,6 +424,9 @@ def get_discovered_24h(
         total_disc = summary_row.get('total_discovered') or 0
         qual_cnt = summary_row.get('qualified_count') or 0
         contact_cnt = summary_row.get('with_contact_count') or 0
+        pending_cnt = summary_row.get('pending_scan_count') or 0
+
+        contact_pct = round((contact_cnt * 100.0 / max(1, qual_cnt)), 1) if qual_cnt > 0 else 0
 
         return {
             "success": True,
@@ -428,8 +434,8 @@ def get_discovered_24h(
             "summary": {
                 **summary_row,
                 "total_matched": total_matched,
-                "qualification_rate": round((qual_cnt * 100.0 / total_disc), 1) if total_disc > 0 else 0,
-                "contact_extraction_rate": round((contact_cnt * 100.0 / total_disc), 1) if total_disc > 0 else 0,
+                "qualification_rate": round((qual_cnt * 100.0 / max(1, total_disc)), 1) if total_disc > 0 else 0,
+                "contact_extraction_rate": contact_pct,
                 "tier_distribution": tier_distribution,
                 "top_sources": top_sources,
                 "hourly_throughput": hourly_throughput
@@ -447,6 +453,28 @@ def get_discovered_24h(
         }
     except Exception as e:
         logging.error(f"Error in get_discovered_24h: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/discovered-24h/reject", dependencies=[Depends(verify_dashboard_auth)])
+def reject_discovered_lead(payload: dict = Body(default={})):
+    """Rejects a discovered lead, cancels any campaign outreach, and extracts negative signals for adaptive learning."""
+    try:
+        from app.learning.rejection_learner import RejectionLearner
+        lead_id = payload.get("lead_id")
+        reason = payload.get("reason", "Rejected via 24h Review")
+        if not lead_id:
+            return {"success": False, "error": "No lead_id provided"}
+
+        with get_db_cursor() as cur:
+            res = RejectionLearner.process_rejection(
+                lead_id=str(lead_id),
+                reason=reason,
+                db_conn=cur.connection,
+                redis_conn=get_redis_client()
+            )
+            return res
+    except Exception as e:
+        logging.error(f"Error rejecting discovered lead: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
 
 @app.post("/api/discovered-24h/approve", dependencies=[Depends(verify_dashboard_auth)])
@@ -3619,11 +3647,12 @@ DASHBOARD_PAGE_HTML = """
                     else if (cs === 'pending_review' || cs === 'pending') campStatusBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30">Pending</span>`;
                     else if (cs === 'failed') campStatusBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-500/20 text-rose-300 border border-rose-500/30">Failed</span>`;
 
-                    // Single action button
+                    // Single action buttons
                     const isApproved = cs === 'approved' || cs === 'sent';
                     const actionBtn = isApproved
-                        ? `<button disabled class="px-2.5 py-1 text-[11px] font-semibold bg-slate-800/80 text-emerald-400 rounded-lg cursor-not-allowed">✓ Enrolled</button>`
-                        : `<button onclick="approveDiscoveredLead('${ch.id}')" class="px-2.5 py-1 text-[11px] font-semibold bg-emerald-600/30 hover:bg-emerald-600/50 text-emerald-300 border border-emerald-500/30 rounded-lg transition cursor-pointer">✓ Approve</button>`;
+                        ? `<button disabled class="px-2 py-1 text-[11px] font-semibold bg-slate-800/80 text-emerald-400 rounded-lg cursor-not-allowed">✓ Enrolled</button>`
+                        : `<button onclick="approveDiscoveredLead('${ch.id}')" class="px-2 py-1 text-[11px] font-semibold bg-emerald-600/30 hover:bg-emerald-600/50 text-emerald-300 border border-emerald-500/30 rounded-lg transition cursor-pointer">✓ Approve</button>`;
+                    const rejectBtn = `<button onclick="rejectDiscoveredLead('${ch.id}', '${(ch.channel_username || '').replace(/'/g, "\\'")}')" class="px-2 py-1 text-[11px] font-semibold bg-rose-600/20 hover:bg-rose-600/40 text-rose-300 border border-rose-500/30 rounded-lg transition cursor-pointer" title="استبعاد وتعلم من القناة لمنع تكرارها">🚫 Reject</button>`;
 
                     return `
                         <tr class="hover:bg-slate-900/40 transition">
@@ -3655,7 +3684,12 @@ DASHBOARD_PAGE_HTML = """
                             </td>
                             <td class="px-4 py-3 text-slate-400 whitespace-nowrap">${discTimeStr}</td>
                             <td class="px-4 py-3 text-center">${campStatusBadge}</td>
-                            <td class="px-4 py-3 text-center">${actionBtn}</td>
+                            <td class="px-4 py-3 text-center">
+                                <div class="flex items-center justify-center gap-1.5">
+                                    ${actionBtn}
+                                    ${rejectBtn}
+                                </div>
+                            </td>
                         </tr>
                     `;
                 }).join('');
@@ -3723,6 +3757,29 @@ DASHBOARD_PAGE_HTML = """
                         fetchDiscovered24h();
                     } else {
                         showToast(`Enrollment failed: ${d.error || 'Unknown error'}`, 'error');
+                    }
+                })
+                .catch(e => showToast(`Network error: ${e.message}`, 'error'));
+            }
+
+            function rejectDiscoveredLead(leadId, username) {
+                const userReason = prompt(`استبعاد القناة @${username} وتدريب المنظومة لمنع قنوات مشابهة.\n\nسبب الاستبعاد (اختياري، مثلاً: قمار، احتيال، ألعاب، محتوى غير مالي):`, "محتوى غير مناسب");
+                if (userReason === null) return;
+
+                showToast('جاري استبعاد القناة واستخراج البصمات السلبية...', 'info');
+                fetch('/api/discovered-24h/reject', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ lead_id: leadId, reason: userReason })
+                })
+                .then(r => r.json())
+                .then(d => {
+                    if (d.success) {
+                        const tokensCount = (d.learned_negative_tokens || []).length;
+                        showToast(`تم استبعاد القناة بنجاح وتعلم المنظومة من ${tokensCount} نمط سلبي!`, 'success');
+                        fetchDiscovered24h();
+                    } else {
+                        showToast(`فشل الاستبعاد: ${d.error || 'Unknown error'}`, 'error');
                     }
                 })
                 .catch(e => showToast(`Network error: ${e.message}`, 'error'));

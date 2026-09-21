@@ -34,13 +34,16 @@ class KnowledgeModel:
         self.candidate_phrases: Set[str] = set()
         self.candidate_keywords: Set[str] = set()
 
+        self.negative_keywords: Set[str] = set()
+        self.negative_phrases: Set[str] = set()
+
         # Signal details: (signal_type, signal_value) -> dict of metadata
         self.signals_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self.last_synced_at: Optional[datetime] = None
 
     def load_from_db(self, db_conn) -> bool:
         """
-        Loads active, validated, and candidate signals from PostgreSQL.
+        Loads active, validated, candidate, and negative rejection signals from PostgreSQL.
         """
         if not db_conn:
             logger.warning("[KNOWLEDGE_MODEL] Cannot load from DB: db_conn is None.")
@@ -97,6 +100,15 @@ class KnowledgeModel:
 
                     self.signals_map[(sig_type, sig_val)] = sig_info
 
+                    # 1. Learned Negative / Rejection Patterns
+                    if category == 'negative_spam' or contrast < -1.0:
+                        if sig_type == SignalType.KEYWORD:
+                            self.negative_keywords.add(norm_val)
+                        elif sig_type == SignalType.PHRASE:
+                            self.negative_phrases.add(norm_val)
+                        continue
+
+                    # 2. Positive / Validated Patterns
                     if status in (SignalStatus.ACTIVE, SignalStatus.VALIDATED):
                         if sig_type == SignalType.KEYWORD:
                             self.active_keywords.add(norm_val)
@@ -119,7 +131,7 @@ class KnowledgeModel:
                 logger.info(
                     f"[KNOWLEDGE_MODEL] Synced from DB: {len(self.active_keywords)} keywords, "
                     f"{len(self.active_phrases)} phrases, {len(self.active_symbols)} symbols, "
-                    f"{len(self.candidate_phrases)} candidate phrases."
+                    f"{len(self.negative_keywords)} negative keywords, {len(self.negative_phrases)} negative phrases."
                 )
                 return True
         except Exception as e:
@@ -220,6 +232,35 @@ class KnowledgeModel:
         final_boost = min(20.0, max(0.0, boost))
         return round(final_boost, 1), matched
 
+    def evaluate_negative_penalty(self, text: str) -> Tuple[float, List[str]]:
+        """
+        Evaluates text against learned negative spam and rejection patterns.
+        Returns (penalty_points, matched_negative_signals).
+        """
+        if not text:
+            return 0.0, []
+
+        norm_text = PatternMiner.clean_text(text)
+        tokens = set(PatternMiner.tokenize(norm_text))
+        matched = []
+        penalty = 0.0
+
+        for phrase in self.negative_phrases:
+            if phrase in norm_text:
+                penalty += 15.0
+                matched.append(f"neg_phrase:{phrase}")
+                if penalty >= 45.0:
+                    break
+
+        matched_kw = tokens.intersection(self.negative_keywords)
+        for kw in matched_kw:
+            penalty += 8.0
+            matched.append(f"neg_kw:{kw}")
+            if penalty >= 45.0:
+                break
+
+        return round(min(50.0, penalty), 1), matched
+
     @staticmethod
     def increment_discovery_yield(db_conn, signal_value: str) -> None:
         """
@@ -255,4 +296,7 @@ class KnowledgeModel:
         self.active_syntax.clear()
         self.candidate_keywords.clear()
         self.candidate_phrases.clear()
+        self.negative_keywords.clear()
+        self.negative_phrases.clear()
         self.signals_map.clear()
+
