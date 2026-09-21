@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
 
-from fastapi import FastAPI, Query, HTTPException, Security, Depends, Request, Response
+from fastapi import FastAPI, Query, HTTPException, Security, Depends, Request, Response, Body
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
@@ -251,6 +251,21 @@ def rerank_campaign(campaign_id: str):
         }
     except Exception as e:
         logging.error(f"Error reranking campaign {campaign_id}: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/campaigns/{campaign_id}/approve", dependencies=[Depends(verify_dashboard_auth)])
+def approve_campaign_leads(campaign_id: str, payload: dict = Body(default={})):
+    try:
+        lead_ids = payload.get("lead_ids") if isinstance(payload, dict) else None
+        approved_count = CampaignRepository.approve_campaign_leads(campaign_id, lead_ids)
+        logging.info(f"Campaign {campaign_id}: approved {approved_count} leads for outbound outreach.")
+        return {
+            "success": True,
+            "campaign_id": campaign_id,
+            "approved_count": approved_count
+        }
+    except Exception as e:
+        logging.error(f"Error approving campaign leads: {e}")
         return {"success": False, "error": str(e)}
 
 @app.get("/api/leads", dependencies=[Depends(verify_dashboard_auth)])
