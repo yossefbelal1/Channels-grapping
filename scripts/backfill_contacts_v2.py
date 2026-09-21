@@ -25,21 +25,7 @@ logging.basicConfig(
 logger = logging.getLogger("backfill_contacts")
 
 
-def get_db_connection():
-    load_dotenv()
-    db_host = os.getenv("POSTGRES_HOST", "localhost")
-    db_port = os.getenv("POSTGRES_PORT", "5432")
-    db_name = os.getenv("POSTGRES_DB", "leadhunter_db")
-    db_user = os.getenv("POSTGRES_USER", "postgres")
-    db_pass = os.getenv("POSTGRES_PASSWORD", "leadhunter_pass")
-
-    return psycopg2.connect(
-        host=db_host,
-        port=db_port,
-        dbname=db_name,
-        user=db_user,
-        password=db_pass
-    )
+from app.core.db import get_db_connection
 
 
 def backfill_all():
