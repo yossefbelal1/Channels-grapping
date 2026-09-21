@@ -1944,6 +1944,8 @@ DASHBOARD_PAGE_HTML = """
                         </div>
                     </div>
                 </div>
+            </div>
+
             <!-- 24h Discovered Channels & System Health Section -->
             <div id="tab-discovered-24h" class="space-y-8 hidden">
                 <!-- Top KPI / Health Bar -->
