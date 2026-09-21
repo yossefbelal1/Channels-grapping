@@ -2,11 +2,11 @@
 -- Migration: v11 Outreach Safety Hardening & Risk Minimization
 -- ============================================================================
 
--- 1. Migrate all existing un-reviewed 'pending' campaign logs to 'pending_review'
+-- 1. Migrate all existing un-reviewed 'pending' and stale 'processing' campaign logs to 'pending_review'
 -- This guarantees no queued messages are automatically dispatched without approval
 UPDATE campaign_logs 
 SET status = 'pending_review' 
-WHERE status = 'pending';
+WHERE status IN ('pending', 'processing');
 
 -- 2. Alter column default to 'pending_review' for future insertions
 DO $$
