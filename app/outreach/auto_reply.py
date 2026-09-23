@@ -92,12 +92,14 @@ class AutoReplyEngine:
                 raw_username = (getattr(sender, 'username', None) or '').strip().lstrip('@')
 
                 # Distributed lock to serialize concurrent message events from the same sender
-                lock_key = f"autoreply_lock:{sender_id}"
-                if not self.redis_conn.set(lock_key, "1", nx=True, ex=30):
+                lock_key = f"autoreply_lock:user:{sender_id}"
+                if not self.redis_conn.set(lock_key, "1", nx=True, ex=60):
                     return
 
                 done_key = f"autoreply_done:{sender_id}"
                 if self.redis_conn.get(done_key):
+                    return
+                if raw_username and self.redis_conn.get(f"autoreply_done:{raw_username.lower()}"):
                     return
 
                 # Query database for matching campaign lead
@@ -130,29 +132,48 @@ class AutoReplyEngine:
                     auto_reply_text = matched_lead.get('auto_reply_message_text')
                     auto_reply_media = matched_lead.get('auto_reply_media_path')
 
-                    # Record user_replied = TRUE
+                    # Lock log_id specifically to serialize with fallback or parallel tasks
+                    log_lock_key = f"autoreply_lock:log:{log_id}"
+                    if not self.redis_conn.set(log_lock_key, "1", nx=True, ex=120):
+                        logging.info(f"Auto-Reply Engine: Log {log_id} already locked by another task. Skipping.")
+                        return
+
+                    if self.redis_conn.get(f"autoreply_done:{log_id}"):
+                        return
+                    if self.redis_conn.get(f"autoreply_dispatched:{log_id}"):
+                        return
+
+                    # Record user_replied = TRUE with user_replied_at timestamp
                     cur.execute("""
                         UPDATE campaign_logs 
                         SET user_replied = TRUE, 
+                            user_replied_at = COALESCE(user_replied_at, NOW()),
                             telegram_user_id = COALESCE(telegram_user_id, %s) 
                         WHERE id = %s;
                     """, (sender_id, log_id))
                     conn.commit()
 
+                    # Mark in-flight in Redis with 120s TTL
+                    self.redis_conn.set(f"autoreply_in_flight:{log_id}", "1", ex=120)
+
                     logging.info(f"Auto-Reply Engine: Detected reply from lead @{raw_username} (ID: {sender_id}, log: {log_id})!")
 
                     if auto_reply_already_sent:
                         self.redis_conn.set(done_key, "1", ex=86400 * 30)
+                        self.redis_conn.set(f"autoreply_done:{log_id}", "1", ex=86400 * 30)
+                        self.redis_conn.delete(f"autoreply_in_flight:{log_id}")
                         return
 
                     if not auto_reply_enabled or not auto_reply_text:
                         logging.info("Auto-Reply Engine: Auto-reply disabled or text unset. user_replied recorded.")
+                        self.redis_conn.delete(f"autoreply_in_flight:{log_id}")
                         return
 
                     # ── Multi-Tier Safety Guard Check ────────────────────────
                     is_killed, kill_reason = is_kill_switch_active(self.redis_conn)
                     if is_killed or not is_outreach_enabled(self.redis_conn) or is_dry_run(self.redis_conn):
                         logging.info(f"Auto-Reply Engine: Outbound dispatch blocked by safety gate (kill_switch={is_killed}, reason={kill_reason}). Skipping 2nd message.")
+                        self.redis_conn.delete(f"autoreply_in_flight:{log_id}")
                         return
 
                     # Human-like delay
@@ -167,6 +188,36 @@ class AutoReplyEngine:
                     except Exception:
                         pass
 
+                    # ── Post-Sleep Re-Verification (Critical Duplicate Prevention) ──
+                    if self.redis_conn.get(f"autoreply_dispatched:{log_id}"):
+                        logging.info(f"Auto-Reply Engine: Log {log_id} already marked dispatched during delay. Skipping duplicate send.")
+                        self.redis_conn.delete(f"autoreply_in_flight:{log_id}")
+                        return
+
+                    if self.redis_conn.get(f"autoreply_done:{log_id}") or self.redis_conn.get(done_key):
+                        logging.info(f"Auto-Reply Engine: Log {log_id} or user {sender_id} marked done during delay. Skipping duplicate send.")
+                        self.redis_conn.delete(f"autoreply_in_flight:{log_id}")
+                        return
+
+                    # Re-query DB in case fallback sent it during the delay
+                    self.db_helper.check_connection()
+                    conn = self.db_helper.conn
+                    with conn.cursor(cursor_factory=RealDictCursor) as check_cur:
+                        check_cur.execute("SELECT auto_reply_sent FROM campaign_logs WHERE id = %s;", (log_id,))
+                        status_row = check_cur.fetchone()
+                        if status_row and status_row.get('auto_reply_sent'):
+                            logging.info(f"Auto-Reply Engine: DB confirms log {log_id} already has auto_reply_sent=TRUE. Skipping duplicate send.")
+                            self.redis_conn.set(done_key, "1", ex=86400 * 30)
+                            self.redis_conn.set(f"autoreply_done:{log_id}", "1", ex=86400 * 30)
+                            self.redis_conn.delete(f"autoreply_in_flight:{log_id}")
+                            return
+
+                    # ── Atomic Single-Winner Dispatch Token ──
+                    if not self.redis_conn.set(f"autoreply_dispatched:{log_id}", "1", nx=True, ex=86400 * 30):
+                        logging.info(f"Auto-Reply Engine: Atomic dispatch token already acquired for log {log_id}. Skipping.")
+                        self.redis_conn.delete(f"autoreply_in_flight:{log_id}")
+                        return
+
                     # Send second message
                     media_files = self._resolve_media(auto_reply_media)
                     if media_files:
@@ -177,17 +228,23 @@ class AutoReplyEngine:
                     else:
                         await client.send_message(event.chat_id, auto_reply_text)
 
-                    cur.execute("""
-                        UPDATE campaign_logs 
-                        SET auto_reply_sent = TRUE, 
-                            auto_reply_sent_at = NOW(), 
-                            auto_reply_error = NULL 
-                        WHERE id = %s;
-                    """, (log_id,))
-                    conn.commit()
+                    with conn.cursor() as upd_cur:
+                        upd_cur.execute("""
+                            UPDATE campaign_logs 
+                            SET auto_reply_sent = TRUE, 
+                                auto_reply_sent_at = NOW(), 
+                                auto_reply_error = NULL 
+                            WHERE id = %s;
+                        """, (log_id,))
+                        conn.commit()
 
+                    self.redis_conn.delete(f"autoreply_in_flight:{log_id}")
                     self.redis_conn.set(done_key, "1", ex=86400 * 30)
-                    logging.info(f"Auto-Reply Engine: Successfully sent 2nd message to @{raw_username} (ID: {sender_id})!")
+                    self.redis_conn.set(f"autoreply_done:{log_id}", "1", ex=86400 * 30)
+                    if raw_username:
+                        self.redis_conn.set(f"autoreply_done:{raw_username.lower()}", "1", ex=86400 * 30)
+
+                    logging.info(f"Auto-Reply Engine: Successfully sent 2nd message to @{raw_username} (ID: {sender_id}, log: {log_id})!")
 
             except errors.FloodWaitError as fw:
                 logging.error(f"🚨 Auto-Reply FloodWait: {fw.seconds}s. TRIPPING EMERGENCY STOP TO PROTECT ACCOUNT!")
@@ -218,9 +275,9 @@ class AutoReplyEngine:
 
     async def fallback_loop(self):
         """
-        Safety fallback dispatcher (runs every 60 seconds):
-        Queries DB for leads where user_replied = TRUE but auto_reply_sent = FALSE.
-        Ensures delivery even if messages arrived while worker was restarting.
+        Safety fallback dispatcher (runs every 30 seconds):
+        Queries DB for leads where user_replied = TRUE but auto_reply_sent = FALSE,
+        respecting a 2-minute grace period to prevent race conditions with real-time events.
         """
         logging.info("Auto-Reply fallback dispatcher task started.")
         while not self.shutdown_event.is_set():
@@ -255,6 +312,7 @@ class AutoReplyEngine:
                         WHERE cl.status = 'sent'
                           AND cl.user_replied = TRUE
                           AND cl.auto_reply_sent = FALSE
+                          AND (cl.user_replied_at IS NULL OR cl.user_replied_at < NOW() - INTERVAL '2 minutes')
                           AND cl.sent_at >= NOW() - INTERVAL '30 days'
                         ORDER BY cl.sent_at ASC
                         LIMIT 5;
@@ -269,15 +327,44 @@ class AutoReplyEngine:
                         if not contact_username and not telegram_user_id:
                             continue
 
-                        lock_key = f"autoreply_lock:{log_id}"
-                        if not self.redis_conn.set(lock_key, "1", nx=True, ex=60):
+                        # Check in-flight or already dispatched guards
+                        if self.redis_conn.get(f"autoreply_in_flight:{log_id}"):
+                            logging.info(f"Auto-Reply Fallback: Log {log_id} currently in-flight in real-time handler. Skipping.")
                             continue
 
+                        if self.redis_conn.get(f"autoreply_dispatched:{log_id}"):
+                            continue
+
+                        if self.redis_conn.get(f"autoreply_done:{log_id}"):
+                            continue
+
+                        if telegram_user_id and self.redis_conn.get(f"autoreply_done:{telegram_user_id}"):
+                            continue
+
+                        clean_username = contact_username.strip().lower().lstrip('@') if contact_username else None
+                        if clean_username and self.redis_conn.get(f"autoreply_done:{clean_username}"):
+                            continue
+
+                        # Distributed locks
+                        lock_key = f"autoreply_lock:log:{log_id}"
+                        if not self.redis_conn.set(lock_key, "1", nx=True, ex=120):
+                            continue
+
+                        if telegram_user_id:
+                            self.redis_conn.set(f"autoreply_lock:user:{telegram_user_id}", "1", nx=True, ex=120)
+
                         try:
+                            # Re-verify DB before network calls
+                            cur.execute("SELECT auto_reply_sent FROM campaign_logs WHERE id = %s;", (log_id,))
+                            v_row = cur.fetchone()
+                            if v_row and v_row.get('auto_reply_sent'):
+                                self.redis_conn.set(f"autoreply_done:{log_id}", "1", ex=86400 * 30)
+                                continue
+
                             peer = None
-                            if contact_username and contact_username.strip():
+                            if clean_username:
                                 try:
-                                    peer = await self.user_client.get_input_entity(contact_username.strip().lstrip('@'))
+                                    peer = await self.user_client.get_input_entity(clean_username)
                                 except Exception as u_err:
                                     logging.debug(f"Auto-Reply Fallback: Resolve by username @{contact_username} failed: {u_err}")
 
@@ -289,6 +376,11 @@ class AutoReplyEngine:
 
                             if not peer:
                                 logging.warning(f"Auto-Reply Fallback: Could not resolve peer for log {log_id} (@{contact_username}, ID:{telegram_user_id})")
+                                continue
+
+                            # Atomic Single-Winner Dispatch Token
+                            if not self.redis_conn.set(f"autoreply_dispatched:{log_id}", "1", nx=True, ex=86400 * 30):
+                                logging.info(f"Auto-Reply Fallback: Dispatch token already acquired for log {log_id}. Skipping.")
                                 continue
 
                             logging.info(f"Auto-Reply Fallback: Sending 2nd message (with media) to @{contact_username} / {telegram_user_id} (log {log_id})...")
@@ -307,10 +399,14 @@ class AutoReplyEngine:
                                 WHERE id = %s;
                             """, (log_id,))
                             conn.commit()
-                            if contact_username:
-                                self.redis_conn.set(f"autoreply_done:{contact_username.strip().lower().lstrip('@')}", "1", ex=86400 * 30)
+
+                            self.redis_conn.set(f"autoreply_done:{log_id}", "1", ex=86400 * 30)
+                            if clean_username:
+                                self.redis_conn.set(f"autoreply_done:{clean_username}", "1", ex=86400 * 30)
                             if telegram_user_id:
                                 self.redis_conn.set(f"autoreply_done:{telegram_user_id}", "1", ex=86400 * 30)
+                            self.redis_conn.delete(f"autoreply_in_flight:{log_id}")
+
                             logging.info(f"Auto-Reply Fallback: Successfully sent 2nd message to @{contact_username} / {telegram_user_id}!")
                             await asyncio.sleep(random.randint(5, 10))
 
