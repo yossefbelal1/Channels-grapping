@@ -380,7 +380,8 @@ def calculate_forex_intent_score(
     forex_core_kws = [
         "forex", "فوركس", "xauusd", "eurusd", "gbpusd", "usdjpy", "audusd",
         "usdchf", "usdcad", "nzdusd", "gbpjpy", "eurjpy", "xagusd",
-        "ذهب", "الذهب", "gold", "دهب", "الدهب", "ناسداك", "nasdaq",
+        "الذهب", "gold", "تداول الذهب", "شارت الذهب", "سعر الذهب", "أونصة الذهب",
+        "سبائك الذهب", "عقود الذهب", "ناسداك", "nasdaq",
         "us30", "داو جونز", "dow jones", "توصيات الذهب", "توصيات فوركس",
         "تحليل الذهب", "تحليل فوركس", "صفقات فوركس", "صفقات ذهب",
         "تداول العملات", "تداول الذهب", "تداول الفوركس"
@@ -461,7 +462,7 @@ def classify_forex_category(title: str, description: str, sample_text: str) -> s
     if any(k in combined for k in ["vip", "premium", "اشتراك", "باقات", "قناة مدفوعة", "اشترك"]):
         return "vip_services"
 
-    if any(k in combined for k in ["الذهب", "ذهب", "gold", "xauusd", "xagusd", "توصيات ذهب", "تحليل الذهب", "صفقات ذهب"]):
+    if any(k in combined for k in ["الذهب", "تداول الذهب", "gold", "xauusd", "xagusd", "توصيات ذهب", "توصيات الذهب", "تحليل الذهب", "صفقات ذهب", "صفقات الذهب"]):
         return "gold_signals"
 
     if any(k in combined for k in ["فوركس", "forex", "eurusd", "gbpusd", "usdjpy", "توصيات فوركس", "تداول العملات"]):
@@ -528,7 +529,8 @@ def check_is_forex(combined_text: str, is_group: bool = False) -> bool:
     # 2. Require presence of at least ONE core Forex/Gold/Indices keyword
     forex_core_kws = [
         "forex", "فوركس", "xauusd", "eurusd", "gbpusd", "usdjpy", "audusd", "usdchf", "usdcad",
-        "nzdusd", "gbpjpy", "eurjpy", "xagusd", "ذهب", "الذهب", "gold", "دهب", "الدهب",
+        "nzdusd", "gbpjpy", "eurjpy", "xagusd", "الذهب", "gold", "تداول الذهب", "شارت الذهب",
+        "سعر الذهب", "أونصة الذهب", "سبائك الذهب", "عقود الذهب",
         "ناسداك", "nasdaq", "us30", "داو جونز", "dow jones", "توصيات الذهب", "توصيات فوركس",
         "تحليل الذهب", "تحليل فوركس", "صفقات فوركس", "صفقات ذهب", "تداول العملات", "تداول الذهب", "تداول لعملات", "تداول الفوركس"
     ]
@@ -1608,17 +1610,17 @@ class LeadValidator:
                 passes_inactive_gate = (is_forex and arabic_score >= 50 and not has_forbidden)
                 
                 if passes_inactive_gate:
-                    logging.info(f"HTTP fallback: Inactive channel {actual_link} passed niche filters. Saving as low-tier qualified.")
+                    logging.info(f"HTTP fallback: Inactive channel {actual_link} passed niche filters. Saving with inactive status.")
                     self.db_helper.upsert_lead(
                         channel_username=username, member_count=member_count, description=f"Inactive channel: {inactive_reason}",
                         language='Arabic', arabic_ratio=100, website='', email='',
                         whatsapp='', contact_username='', is_group=is_group,
                         marketplace_score=0, vip=False, premium=False, subscription=False, monthly_plans=False,
                         yearly_plans=False, account_management=False, copy_trading=False, funded_accounts=False,
-                        usdt_payments=False, binance_payments=False, lead_score=10, tier='Tier_D', ai_confidence=100,
+                        usdt_payments=False, binance_payments=False, lead_score=0, tier='Tier_D', ai_confidence=100,
                         last_activity=messages[-1].date.astimezone(timezone.utc) if messages else None,
                         discovery_source=discovery_source, discovery_method=discovery_method, arabic_score=arabic_score,
-                        region_score=0, status='new', forex_intent_score=forex_intent_score, forex_category='unknown', high_risk_fraud=False
+                        region_score=0, status='rejected', forex_intent_score=forex_intent_score, forex_category='unknown', high_risk_fraud=False
                     )
                 else:
                     logging.info(f"HTTP fallback: Inactive channel {actual_link} failed niche filters (is_forex={is_forex}, arabic_score={arabic_score}, forbidden={has_forbidden}). Rejecting.")
@@ -2995,14 +2997,23 @@ class LeadValidator:
                 keyword_freqs[kw] = combined_desc_text.count(kw.lower())
                 
             # Dynamic rule-based Business Detection Engine
-            vip = bool(pos_regex.search(combined_desc_text))
+            vip = bool(pos_regex.search(combined_desc_text)) or bool(re.search(r'(vip|خاصة|خاصه|مدفوعة|مدفوعه|باقة vip|باقات vip|توصيات خاصة|توصيات vip)', combined_desc_text, re.IGNORECASE))
             premium = "premium" in title.lower() or "premium" in description.lower() or "مميز" in combined_desc_text or "بريميوم" in combined_desc_text
-            subscription = bool(re.search(r'(اشتراك|اشتراكات|باقة|باقات|عضوية|توصية|توصيات|إشارة|إشارات|اشارات|اشارة|signal|signals)', combined_desc_text, re.IGNORECASE))
+            subscription = bool(re.search(r'(اشتراك|اشتراكات|باقة|باقات|عضوية|قناة خاصة|قناه خاصه|قناة مدفوعة|قناه مدفوعه)', combined_desc_text, re.IGNORECASE))
             monthly_plans = bool(re.search(r'(شهري|شهرية|monthly)', combined_desc_text, re.IGNORECASE))
             yearly_plans = bool(re.search(r'(سنوي|سنوية|yearly|annual)', combined_desc_text, re.IGNORECASE))
-            account_management = bool(re.search(r'(إدارة حسابات|ادارة حسابات|محفظة استثمارية|استثمار|ادارة محافظ|إدارة محافظ)', combined_desc_text, re.IGNORECASE))
-            copy_trading = bool(re.search(r'(نسخ تداول|نسخ صفقات|copy trading|النسخ|نسخ)', combined_desc_text, re.IGNORECASE))
-            funded_accounts = bool(re.search(r'(حساب ممول|funded)', combined_desc_text, re.IGNORECASE))
+            account_management = bool(re.search(
+                r'(إدارة حسابات|ادارة حسابات|إدارة الحسابات|ادارة الحسابات|اداره حسابات|اداره الحسابات|إدارة محافظ|ادارة محافظ|إدارة المحافظ|ادارة المحافظ|اداره محافظ|اداره المحافظ|محفظة استثمارية|استثمار|إدارة رأس المال|ادارة راس المال|إدارة الصفقات|ادارة الصفقات|تقاسم أرباح|نسبة أرباح)',
+                combined_desc_text, re.IGNORECASE
+            ))
+            copy_trading = bool(re.search(
+                r'(نسخ تداول|نسخ صفقات|copy trading|copy trade|النسخ|نسخ|ربط حسابات|تداول آلي|تداول الي|أنظمة تداول|انظمة تداول|بوت تداول|بوتات تداول|بوتات التداول|اكسبيرت)',
+                combined_desc_text, re.IGNORECASE
+            ))
+            funded_accounts = bool(re.search(
+                r'(حساب ممول|حسابات ممولة|حسابات مموله|شركات التمويل|تحدي التمويل|prop firm|funded account|ftmo)',
+                combined_desc_text, re.IGNORECASE
+            ))
             usdt_payments = "usdt" in combined_desc_text or "يو اس دي تي" in combined_desc_text
             binance_payments = "binance" in combined_desc_text or "بينانس" in combined_desc_text
             

@@ -26,6 +26,11 @@ from app.core.concurrency import bounded_gather
 from app.core.db import get_db_connection
 from app.core.redis_client import get_redis_client
 from app.validator.contact_extractor import extract_contacts, extract_contacts_from_messages
+from app.discovery.taxonomy import (
+    get_all_keywords,
+    get_commercial_keywords,
+    get_contact_keywords
+)
 
 logger = logging.getLogger("similar_channels_crawler")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -52,20 +57,24 @@ JUNK_USERNAMES = {
     'contact', 'info', 'service', 'feedback', 'terms', 'privacy'
 }
 
+# Rich server-side targeted contact keywords
 CONTACT_SEARCH_TERMS = [
-    "تواصل", "اشتراك", "ادارة", "دعم", "راسلنا", "للتعاون", "للاعلانات", "admin", "contact"
+    "تواصل", "للتواصل", "تواصل معي", "تواصل معنا", "راسلنا", "راسلني", "للمراسلة",
+    "اشتراك", "للاشتراك", "vip", "قناة vip", "القناة الخاصة", "توصيات vip",
+    "ادارة حسابات", "إدارة حسابات", "إدارة محافظ", "ادارة محافظ", "إدارة الحسابات",
+    "نسخ صفقات", "نسخ تداول", "حساب ممول", "بوت تداول",
+    "دعم", "الدعم", "خدمة العملاء", "admin", "contact", "support",
+    "للتعاون", "للاعلانات", "تبادل اعلاني", "مدير القناة"
 ]
 
-FOREX_KEYWORDS = [
-    "forex", "فوركس", "ذهب", "الذهب", "دهب", "xauusd", "eurusd", "gbpusd", "us30", "nasdaq",
-    "تداول", "trading", "توصيات", "signals", "signal", "صفقات", "تحليل", "analysis",
-    "vip", "ادارة", "إدارة", "محافظ", "نسخ", "copy", "scalping", "سكالبينج", "عملات"
-]
+# Master keywords from taxonomy
+FOREX_KEYWORDS = get_all_keywords()
+COMMERCIAL_KEYWORDS = get_commercial_keywords()
 
 BLACKLIST_KEYWORDS = [
     "bet", "casino", "كازينو", "مراهنات", "slots", "poker", "pubg", "ببجي",
     "fortnite", "free fire", "games", "العاب", "store", "متجر", "netflix",
-    "movies", "افلام", "anime", "vpn", "proxy", "hack"
+    "movies", "افلام", "anime", "vpn", "proxy", "hack", "شيعة", "حوزة", "مرجع"
 ]
 
 
@@ -283,13 +292,16 @@ class SimilarChannelsCrawler:
                 owner_user = contacts.get('owner_username')
                 wa = contacts.get('whatsapp')
 
-                logger.info(f"[@{clean_user}] Contacts Extracted: Contact=@{contact_user} | Admin=@{admin_user} | WhatsApp={wa}")
-
-                # 4.5. Compute Forex Intent Score & Tier
-                forex_score, tier, lead_score = self._evaluate_channel_forex(title, about, pinned_text, recent_contact_text, members)
+                # 4.5. Compute Forex Intent Score, Commercial Fit & Tier
+                forex_score, tier, lead_score, commercial_meta = self._evaluate_channel_forex(
+                    title, about, pinned_text, recent_contact_text, members
+                )
 
                 # 5. Update leads record in PostgreSQL
-                self._update_channel_record(clean_user, title, members, about, contacts, forex_score, tier, lead_score)
+                self._update_channel_record(
+                    clean_user, title, members, about, contacts,
+                    forex_score, tier, lead_score, commercial_meta
+                )
 
                 # Set Redis cooldown for this channel (2 days)
                 if r_client:
@@ -298,8 +310,9 @@ class SimilarChannelsCrawler:
                     except Exception as c_err:
                         logger.debug(f"Could not set cooldown cache for @{clean_user}: {c_err}")
 
-                # 6. Auto-enroll into campaign if qualified with contact and strong forex relevance
-                if self.active_campaign_id and contact_user and forex_score >= 60:
+                # 6. Auto-enroll into campaign if qualified with contact, forex relevance AND commercial fit
+                has_comm = commercial_meta.get("has_commercial", False)
+                if self.active_campaign_id and contact_user and forex_score >= 60 and (has_comm or tier in ('Tier_A', 'Tier_B', 'Tier_C')):
                     enrolled = self._auto_enroll_channel(clean_user, title, members, contact_user, forex_score)
                     result["enrolled"] = enrolled
 
@@ -373,28 +386,72 @@ class SimilarChannelsCrawler:
 
         return result
 
-    def _evaluate_channel_forex(self, title: str, about: str, pinned_text: str, recent_msgs: str, members: int) -> Tuple[int, str, int]:
+    def _evaluate_channel_forex(
+        self, title: str, about: str, pinned_text: str, recent_msgs: str, members: int
+    ) -> Tuple[int, str, int, Dict[str, Any]]:
         combined = f"{title} {about} {pinned_text} {recent_msgs}".lower()
-        matches = sum(1 for kw in FOREX_KEYWORDS if kw in combined)
+
+        # Check blacklist
+        if any(bkw in combined for bkw in BLACKLIST_KEYWORDS):
+            return 0, 'Tier_D', 0, {
+                "vip": False, "account_management": False, "copy_trading": False,
+                "funded_accounts": False, "commercial_fit_score": 0, "has_commercial": False,
+                "status": "rejected"
+            }
+
+        forex_matches = sum(1 for kw in FOREX_KEYWORDS if kw in combined)
+        comm_matches = sum(1 for kw in COMMERCIAL_KEYWORDS if kw in combined)
+
+        # Commercial Service Flags Detection
+        vip = bool(re.search(r'(vip|خاصة|خاصه|مدفوعة|مدفوعه|باقة|باقات|اشتراك)', combined, re.IGNORECASE))
+        account_management = bool(re.search(
+            r'(إدارة حسابات|ادارة حسابات|إدارة الحسابات|ادارة الحسابات|اداره حسابات|إدارة محافظ|ادارة محافظ|إدارة المحافظ|ادارة المحافظ|اداره محافظ|إدارة رأس المال|ادارة راس المال|إدارة الصفقات|ادارة الصفقات|تقاسم أرباح|نسبة أرباح)',
+            combined, re.IGNORECASE
+        ))
+        copy_trading = bool(re.search(
+            r'(نسخ تداول|نسخ صفقات|copy trading|copy trade|ربط حسابات|تداول آلي|تداول الي|أنظمة تداول|انظمة تداول|بوت تداول|بوتات التداول|بوتات تداول|اكسبيرت)',
+            combined, re.IGNORECASE
+        ))
+        funded_accounts = bool(re.search(
+            r'(حساب ممول|حسابات ممولة|حسابات مموله|شركات التمويل|تحدي التمويل|prop firm|funded)',
+            combined, re.IGNORECASE
+        ))
+
+        has_commercial = (comm_matches > 0 or vip or account_management or copy_trading or funded_accounts)
+        commercial_fit = min(100, (comm_matches * 15) + (25 if vip else 0) + (35 if account_management else 0) + (25 if copy_trading else 0))
 
         # Base forex intent score
-        forex_score = min(100, 40 + matches * 10) if matches > 0 else 20
-
-        # Lead score combines members and forex score
-        lead_score = int(forex_score * 0.7 + min(30, int(members / 1000)))
-        lead_score = min(100, max(10, lead_score))
-
-        # Tier assignment
-        if members >= 15000 and forex_score >= 80:
-            tier = 'Tier_A'
-        elif members >= 2500 and forex_score >= 60:
-            tier = 'Tier_B'
-        elif members >= 500 and forex_score >= 40:
-            tier = 'Tier_C'
-        else:
+        if forex_matches == 0:
+            forex_score = 0
             tier = 'Tier_D'
+            lead_score = 0
+            status = 'rejected'
+        else:
+            forex_score = min(100, 30 + forex_matches * 10)
+            lead_score = int(forex_score * 0.5 + commercial_fit * 0.3 + min(20, int(members / 1000)))
+            lead_score = min(100, max(10, lead_score))
+            status = 'new' if forex_score >= 40 else 'rejected'
 
-        return forex_score, tier, lead_score
+            # Strict Tier assignment (Requires genuine forex relevance AND commercial fit)
+            if members >= 10000 and forex_score >= 80 and has_commercial:
+                tier = 'Tier_A'
+            elif members >= 2000 and forex_score >= 60 and has_commercial:
+                tier = 'Tier_B'
+            elif members >= 500 and forex_score >= 40 and (has_commercial or forex_score >= 70):
+                tier = 'Tier_C'
+            else:
+                tier = 'Tier_D'
+
+        meta = {
+            "vip": vip,
+            "account_management": account_management,
+            "copy_trading": copy_trading,
+            "funded_accounts": funded_accounts,
+            "commercial_fit_score": commercial_fit,
+            "has_commercial": has_commercial,
+            "status": status
+        }
+        return forex_score, tier, lead_score, meta
 
     def _mark_as_user(self, username: str, full_name: str, bio: str):
         try:
@@ -424,8 +481,17 @@ class SimilarChannelsCrawler:
         contacts: Dict[str, Any],
         forex_score: int = 50,
         tier: str = 'Tier_C',
-        lead_score: int = 50
+        lead_score: int = 50,
+        commercial_meta: Optional[Dict[str, Any]] = None
     ):
+        comm = commercial_meta or {}
+        vip = comm.get('vip', False)
+        ac_mgmt = comm.get('account_management', False)
+        copy_trade = comm.get('copy_trading', False)
+        funded = comm.get('funded_accounts', False)
+        comm_score = comm.get('commercial_fit_score', 0)
+        lead_status = comm.get('status', 'new' if forex_score >= 40 else 'rejected')
+
         try:
             conn = get_db_connection()
             with conn.cursor() as cur:
@@ -439,10 +505,23 @@ class SimilarChannelsCrawler:
                         owner_username = COALESCE(NULLIF(%s, ''), owner_username),
                         whatsapp = COALESCE(NULLIF(%s, ''), whatsapp),
                         forex_intent_score = GREATEST(COALESCE(forex_intent_score, 0), %s),
-                        tier = COALESCE(tier, %s::tier_level),
+                        forex_score = GREATEST(COALESCE(forex_score, 0), %s),
+                        commercial_fit_score = GREATEST(COALESCE(commercial_fit_score, 0), %s),
+                        vip = (vip OR %s),
+                        account_management = (account_management OR %s),
+                        copy_trading = (copy_trading OR %s),
+                        funded_accounts = (funded_accounts OR %s),
+                        tier = CASE 
+                            WHEN %s::tier_level IN ('Tier_A', 'Tier_B', 'Tier_C') THEN %s::tier_level
+                            ELSE COALESCE(tier, %s::tier_level)
+                        END,
                         lead_score = GREATEST(COALESCE(lead_score, 0), %s),
                         entity_type = 'channel',
-                        status = 'new',
+                        status = CASE
+                            WHEN status = 'rejected' AND %s = 'new' THEN 'new'::lead_status
+                            WHEN %s = 'rejected' AND (forex_intent_score IS NULL OR forex_intent_score < 40) THEN 'rejected'::lead_status
+                            ELSE COALESCE(status, 'new'::lead_status)
+                        END,
                         last_scan = NOW()
                     WHERE channel_username = %s;
                 """, (
@@ -451,7 +530,11 @@ class SimilarChannelsCrawler:
                     contacts.get('admin_username'),
                     contacts.get('owner_username'),
                     contacts.get('whatsapp'),
-                    forex_score, tier, lead_score,
+                    forex_score, forex_score, comm_score,
+                    vip, ac_mgmt, copy_trade, funded,
+                    tier, tier, tier,
+                    lead_score,
+                    lead_status, lead_status,
                     username
                 ))
             conn.commit()

@@ -282,12 +282,41 @@ def get_discovered_24h(
             cur.execute("""
                 SELECT 
                     COUNT(*) FILTER (WHERE (outreach_priority_reason IS NULL OR outreach_priority_reason != 'user_account') AND (entity_type IS NULL OR entity_type != 'user') AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as total_discovered,
-                    COUNT(*) FILTER (WHERE status = 'new' AND (lead_score >= 10 OR tier IS NOT NULL) AND (entity_type IS NULL OR entity_type != 'user')) as qualified_count,
+                    COUNT(*) FILTER (
+                        WHERE status = 'new'
+                          AND COALESCE(forex_intent_score, forex_score, 0) >= 40
+                          AND (
+                              tier IN ('Tier_A', 'Tier_B', 'Tier_C')
+                              OR vip = TRUE
+                              OR account_management = TRUE
+                              OR copy_trading = TRUE
+                              OR funded_accounts = TRUE
+                              OR COALESCE(commercial_fit_score, 0) >= 40
+                          )
+                          AND (language = 'Arabic' OR COALESCE(arabic_ratio, 0) >= 15 OR COALESCE(arabic_score, 0) >= 20)
+                          AND (entity_type IS NULL OR entity_type != 'user')
+                          AND (outreach_priority_reason IS NULL OR outreach_priority_reason != 'user_account')
+                    ) as qualified_count,
                     COUNT(*) FILTER (WHERE (member_count > 0 OR lead_score >= 10 OR (description IS NOT NULL AND description != '')) AND (outreach_priority_reason IS NULL OR outreach_priority_reason != 'user_account') AND (entity_type IS NULL OR entity_type != 'user') AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as verified_count,
                     COUNT(*) FILTER (WHERE status = 'new' AND lead_score IS NULL AND tier IS NULL AND (entity_type IS NULL OR entity_type != 'user') AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as pending_scan_count,
                     COUNT(*) FILTER (WHERE status = 'rejected') as rejected_count,
                     COUNT(*) FILTER (WHERE ((contact_username IS NOT NULL AND contact_username != '') OR (whatsapp IS NOT NULL AND whatsapp != '')) AND (entity_type IS NULL OR entity_type != 'user')) as with_contact_count,
-                    COUNT(*) FILTER (WHERE status = 'new' AND (lead_score >= 10 OR tier IS NOT NULL) AND ((contact_username IS NOT NULL AND contact_username != '') OR (whatsapp IS NOT NULL AND whatsapp != '')) AND (entity_type IS NULL OR entity_type != 'user')) as qualified_with_contact_count,
+                    COUNT(*) FILTER (
+                        WHERE status = 'new'
+                          AND COALESCE(forex_intent_score, forex_score, 0) >= 40
+                          AND (
+                              tier IN ('Tier_A', 'Tier_B', 'Tier_C')
+                              OR vip = TRUE
+                              OR account_management = TRUE
+                              OR copy_trading = TRUE
+                              OR funded_accounts = TRUE
+                              OR COALESCE(commercial_fit_score, 0) >= 40
+                          )
+                          AND (language = 'Arabic' OR COALESCE(arabic_ratio, 0) >= 15 OR COALESCE(arabic_score, 0) >= 20)
+                          AND ((contact_username IS NOT NULL AND contact_username != '') OR (whatsapp IS NOT NULL AND whatsapp != ''))
+                          AND (entity_type IS NULL OR entity_type != 'user')
+                          AND (outreach_priority_reason IS NULL OR outreach_priority_reason != 'user_account')
+                    ) as qualified_with_contact_count,
                     COUNT(*) FILTER (WHERE whatsapp IS NOT NULL AND whatsapp != '') as with_whatsapp_count,
                     COUNT(*) FILTER (WHERE is_group = TRUE) as groups_count,
                     COUNT(*) FILTER (WHERE is_group = FALSE AND (entity_type IS NULL OR entity_type != 'user')) as channels_count,
@@ -308,7 +337,20 @@ def get_discovered_24h(
                     to_char(date_trunc('hour', discovered_at), 'HH24:00') as hour_label,
                     date_trunc('hour', discovered_at) as hour_slot,
                     COUNT(*) as total_count,
-                    COUNT(*) FILTER (WHERE status = 'new' AND (lead_score >= 10 OR tier IS NOT NULL)) as qualified_count,
+                    COUNT(*) FILTER (
+                        WHERE status = 'new'
+                          AND COALESCE(forex_intent_score, forex_score, 0) >= 40
+                          AND (
+                              tier IN ('Tier_A', 'Tier_B', 'Tier_C')
+                              OR vip = TRUE
+                              OR account_management = TRUE
+                              OR copy_trading = TRUE
+                              OR funded_accounts = TRUE
+                              OR COALESCE(commercial_fit_score, 0) >= 40
+                          )
+                          AND (language = 'Arabic' OR COALESCE(arabic_ratio, 0) >= 15 OR COALESCE(arabic_score, 0) >= 20)
+                          AND (entity_type IS NULL OR entity_type != 'user')
+                    ) as qualified_count,
                     COUNT(*) FILTER (WHERE status = 'rejected') as rejected_count
                 FROM leads
                 WHERE discovered_at >= NOW() - INTERVAL '24 HOURS'
@@ -363,7 +405,19 @@ def get_discovered_24h(
             elif status:
                 st = status.lower()
                 if st in ('new', 'qualified'):
-                    where_clauses.append("l.status = 'new' AND (l.lead_score >= 10 OR l.tier IS NOT NULL)")
+                    where_clauses.append("""
+                        l.status = 'new'
+                        AND COALESCE(l.forex_intent_score, l.forex_score, 0) >= 40
+                        AND (
+                            l.tier IN ('Tier_A', 'Tier_B', 'Tier_C')
+                            OR l.vip = TRUE
+                            OR l.account_management = TRUE
+                            OR l.copy_trading = TRUE
+                            OR l.funded_accounts = TRUE
+                            OR COALESCE(l.commercial_fit_score, 0) >= 40
+                        )
+                        AND (l.language = 'Arabic' OR COALESCE(l.arabic_ratio, 0) >= 15 OR COALESCE(l.arabic_score, 0) >= 20)
+                    """)
                 elif st == 'rejected':
                     where_clauses.append("l.status = 'rejected'")
                 elif st == 'with_contact':
@@ -574,10 +628,20 @@ def get_leads(
     try:
         with get_db_cursor(commit_on_success=False) as cur:
             # Build query dynamically
-            # Only show genuinely qualified leads: must have score>=10, real member count, and not be a dummy/broken record
+            # Only show genuinely qualified leads: forex >= 40, commercial offering, real member count
             query = """SELECT * FROM leads WHERE status = 'new' AND last_scan IS NOT NULL
-                AND lead_score >= 10
                 AND member_count > 0
+                AND COALESCE(forex_intent_score, forex_score, 0) >= 40
+                AND (
+                    tier IN ('Tier_A', 'Tier_B', 'Tier_C')
+                    OR vip = TRUE
+                    OR account_management = TRUE
+                    OR copy_trading = TRUE
+                    OR funded_accounts = TRUE
+                    OR COALESCE(commercial_fit_score, 0) >= 40
+                )
+                AND (language = 'Arabic' OR COALESCE(arabic_ratio, 0) >= 15 OR COALESCE(arabic_score, 0) >= 20)
+                AND (entity_type IS NULL OR entity_type != 'user')
                 AND (description IS NULL OR description NOT LIKE 'Blacklisted entity%%')
                 AND (description IS NULL OR description NOT LIKE 'Entity does not exist%%')"""
             params = []
@@ -897,7 +961,22 @@ def get_quality_stats():
                 SELECT
                     COUNT(*) FILTER (WHERE is_group = FALSE) as total_discovered,
                     COUNT(*) FILTER (WHERE is_group = FALSE AND lead_score IS NOT NULL AND lead_score > 0) as total_validated,
-                    COUNT(*) FILTER (WHERE is_group = FALSE AND status = 'new' AND lead_score >= 10 AND member_count > 0) as qualified_leads,
+                    COUNT(*) FILTER (
+                        WHERE is_group = FALSE 
+                          AND status = 'new' 
+                          AND member_count > 0
+                          AND COALESCE(forex_intent_score, forex_score, 0) >= 40
+                          AND (
+                              tier IN ('Tier_A', 'Tier_B', 'Tier_C')
+                              OR vip = TRUE
+                              OR account_management = TRUE
+                              OR copy_trading = TRUE
+                              OR funded_accounts = TRUE
+                              OR COALESCE(commercial_fit_score, 0) >= 40
+                          )
+                          AND (language = 'Arabic' OR COALESCE(arabic_ratio, 0) >= 15 OR COALESCE(arabic_score, 0) >= 20)
+                          AND (entity_type IS NULL OR entity_type != 'user')
+                    ) as qualified_leads,
                     COUNT(*) FILTER (WHERE is_group = FALSE AND status = 'contacted') as partners
                 FROM leads
             """)
