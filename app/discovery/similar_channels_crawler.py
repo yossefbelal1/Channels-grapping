@@ -40,11 +40,9 @@ API_HASH = os.getenv("TELEGRAM_API_HASH", "72d90d8ac46e9293e3d5254d9645e4f9")
 SESSION_DIR = os.getenv("TELEGRAM_SESSIONS_DIR", "/app/sessions" if os.path.exists("/app/sessions") else "sessions")
 
 # Default research account pool (NEVER include user_session / @tamerads1 here)
+# Use isolated spiderweb_session exclusively to prevent SQLite locks and cross-worker FloodWait
 RESEARCH_SESSIONS = [
-    "spiderweb_session",
-    "acc_12723433281",
-    "acc_14809564829",
-    "scavenger_session"
+    "spiderweb_session"
 ]
 
 USERNAME_CLEAN_RE = re.compile(r'^[a-zA-Z0-9_]{4,32}$')
@@ -152,7 +150,7 @@ class SimilarChannelsCrawler:
         self,
         target_username: str,
         depth: int = 0,
-        max_recs: int = 15
+        max_recs: int = 100
     ) -> Dict[str, Any]:
         """
         Inspects channel, extracts pinned messages, mines contacts from pinned & recent posts,
@@ -251,11 +249,11 @@ class SimilarChannelsCrawler:
                     except Exception as p_err:
                         logger.warning(f"Could not fetch pinned message for @{clean_user}: {p_err}")
 
-                # 3.5. Search Recent & Server-Side Targeted Messages for Contact Triggers
+                # 3.5. Scan Recent Messages (limit=50 in single efficient call)
                 all_candidate_msgs = []
                 recent_contact_text = ""
                 try:
-                    msgs = await client.get_messages(entity, limit=35)
+                    msgs = await client.get_messages(entity, limit=50)
                     if msgs:
                         all_candidate_msgs.extend([m for m in msgs if m])
                         for m in msgs:
@@ -266,18 +264,23 @@ class SimilarChannelsCrawler:
                 except Exception as m_err:
                     logger.debug(f"Could not scan recent messages for @{clean_user}: {m_err}")
 
-                # Server-Side Targeted Search across Telegram servers for older high-intent contact posts
-                try:
-                    seen_msg_ids = {getattr(m, 'id', None) for m in all_candidate_msgs if getattr(m, 'id', None)}
-                    for term in CONTACT_SEARCH_TERMS:
-                        async for s_msg in client.iter_messages(entity, search=term, limit=2):
-                            if s_msg and getattr(s_msg, 'id', None) not in seen_msg_ids:
-                                seen_msg_ids.add(s_msg.id)
-                                all_candidate_msgs.append(s_msg)
-                                if s_msg.message:
-                                    recent_contact_text += "\n" + s_msg.message
-                except Exception as s_err:
-                    logger.debug(f"Server-side contact search skipped/failed for @{clean_user}: {s_err}")
+                # Quick pre-check: if contact already found in pinned or bio, SKIP expensive search calls entirely
+                has_contact_in_pinned_or_bio = bool(
+                    re.search(r'@([a-zA-Z0-9_]{4,32})', f"{about} {pinned_text}")
+                )
+                if not has_contact_in_pinned_or_bio:
+                    # Targeted search: only 2 critical terms instead of 30+ to prevent Telegram SearchRequest FloodWait
+                    try:
+                        seen_msg_ids = {getattr(m, 'id', None) for m in all_candidate_msgs if getattr(m, 'id', None)}
+                        for term in ["للتواصل", "تواصل"]:
+                            async for s_msg in client.iter_messages(entity, search=term, limit=1):
+                                if s_msg and getattr(s_msg, 'id', None) not in seen_msg_ids:
+                                    seen_msg_ids.add(s_msg.id)
+                                    all_candidate_msgs.append(s_msg)
+                                    if s_msg.message:
+                                        recent_contact_text += "\n" + s_msg.message
+                    except Exception as s_err:
+                        logger.debug(f"Server-side contact search skipped for @{clean_user}: {s_err}")
 
                 # 4. Extract Structured Contacts (entities, hyperlinks, mentions, pinned text, bio, message triggers)
                 contacts = extract_contacts_from_messages(
@@ -635,7 +638,7 @@ class SimilarChannelsCrawler:
         seed_usernames: List[str],
         batch_size: int = 5,
         depth: int = 0,
-        max_recs: int = 15
+        max_recs: int = 100
     ) -> List[Dict[str, Any]]:
         """
         Crawls a batch of seed channels concurrently using bounded_gather.

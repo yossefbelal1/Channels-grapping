@@ -237,10 +237,7 @@ class TelegramManager:
                         primary_account = acc
                     elif acc.get("role") in backup_roles:
                         backup_accounts.append(acc)
-                    elif w_type != 'campaign' and session_to_load != 'user_session' and acc.get("role") != 'user_joiner' and acc.get("session_name") != 'user_session':
-                        # Allow general research / backup accounts as secondary failovers
-                        if acc not in backup_accounts:
-                            backup_accounts.append(acc)
+                    # Only load accounts explicitly designated as backups for this worker type
             except Exception as e:
                 logging.error(f"Error reading accounts.json: {e}")
 

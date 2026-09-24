@@ -122,11 +122,14 @@ class GraphExpander:
         self.db_user = os.getenv("DB_USER", "postgres")
         self.db_password = os.getenv("DB_PASSWORD", "")
 
-        self.session_name = os.getenv("SESSION_GRAPH_EXPANDER", "graph_expander_session")
+        exp_session = os.getenv("SESSION_GRAPH_EXPANDER", "spiderweb_session")
+        if exp_session in ("radar_session_expander_backup", "radar_session"):
+            exp_session = "spiderweb_session"
+        self.session_name = exp_session
         self.post_limit = int(os.getenv("GRAPH_EXPANDER_POST_LIMIT", 300))
-        self.channel_interval = int(os.getenv("GRAPH_EXPANDER_INTERVAL_SECONDS", 180))
+        self.channel_interval = int(os.getenv("GRAPH_EXPANDER_INTERVAL_SECONDS", 90))
         self.max_depth = int(os.getenv("GRAPH_MAX_DEPTH", 6))
-        self.batch_size = int(os.getenv("GRAPH_EXPANDER_BATCH_SIZE", 20))
+        self.batch_size = int(os.getenv("GRAPH_EXPANDER_BATCH_SIZE", 30))
 
         self.redis_conn = None
         self.db_helper = None
@@ -186,7 +189,7 @@ class GraphExpander:
         except Exception as ee:
             logging.debug(f"[GRAPH] Could not fetch exchange seeds: {ee}")
 
-        # 2. Main traversal query
+        # 2. Main traversal query (validated channels with scores)
         combined_priority = list(gold_seeds) + [e for e in exchange_seeds if e['channel_username'] not in {g['channel_username'] for g in gold_seeds}]
         remaining_slots = max(1, batch_size - len(combined_priority))
         query = """
@@ -223,10 +226,47 @@ class GraphExpander:
                 for r in regular_rows:
                     if r['channel_username'] not in seen_usernames:
                         combined.append(r)
-                return combined
+                        seen_usernames.add(r['channel_username'])
         except Exception as e:
-            logging.error(f"[GRAPH] Error fetching expansion candidates: {e}")
-            return gold_seeds
+            logging.error(f"[GRAPH] Error fetching scored expansion candidates: {e}")
+
+        # 3. Fresh Discovery Batch: unscored channels that have NEVER been graph-scanned.
+        #    These are newly discovered channels (via graph edges, recommendations, etc.)
+        #    that haven't been validated yet (lead_score=0, no tier, no forex_category).
+        #    We MUST expand these to harvest their similar-channels recommendations,
+        #    otherwise the discovery pipeline stalls in a deadlock.
+        fresh_slots = max(5, batch_size - len(combined_priority))
+        fresh_query = """
+        SELECT id, channel_username, COALESCE(lead_score, 0) as lead_score,
+               COALESCE(depth, 0) as depth, COALESCE(is_group, false) as is_group,
+               tier, COALESCE(is_exchange_seed, false) as is_exchange_seed,
+               COALESCE(exchange_affinity_score, 0) as exchange_affinity_score
+        FROM leads
+        WHERE status != 'rejected'
+          AND (last_graph_scan IS NULL OR last_graph_scan < NOW() - INTERVAL '7 days')
+          AND channel_username NOT LIKE 'invite_%%'
+          AND channel_username NOT LIKE 'admin_%%'
+          AND (description IS NULL OR (description NOT LIKE 'Blacklisted entity%%' AND description NOT LIKE 'Entity does not exist%%'))
+          AND (depth IS NULL OR depth < %s)
+        ORDER BY
+          COALESCE(member_count, 0) DESC,
+          discovered_at DESC NULLS LAST
+        LIMIT %s;
+        """
+        try:
+            with self.db_helper.conn.cursor() as cur:
+                cur.execute(fresh_query, (self.max_depth, fresh_slots))
+                fresh_rows = cur.fetchall() or []
+                for r in fresh_rows:
+                    if r['channel_username'] not in seen_usernames:
+                        combined_priority.append(r)
+                        seen_usernames.add(r['channel_username'])
+                if fresh_rows:
+                    logging.info(f"[GRAPH] Added {len(fresh_rows)} fresh unscored channels for similar-channels discovery.")
+        except Exception as e:
+            logging.error(f"[GRAPH] Error fetching fresh discovery candidates: {e}")
+
+        return combined_priority if combined_priority else gold_seeds
 
     def update_last_graph_scan(self, username: str):
         self.db_helper.check_connection()
@@ -257,7 +297,7 @@ class GraphExpander:
         except Exception as e:
             logging.warning(f"[GRAPH] Failed to link contact @{contact_user} to @{source_username}: {e}")
 
-    def insert_or_get_target_lead(self, username: str, depth: int, source_username: str) -> str:
+    def insert_or_get_target_lead(self, username: str, depth: int, source_username: str, discovery_method: str = 'graph') -> str:
         """Upserts stub lead for newly discovered target only if strictly valid channel username."""
         clean_user = (username or '').strip().lstrip('@')
         # Only accept standard alphanumeric Telegram channel usernames
@@ -268,13 +308,14 @@ class GraphExpander:
         try:
             query = """
             INSERT INTO leads (channel_username, status, discovered_at, depth, discovery_source, discovery_method)
-            VALUES (%s, 'new', NOW(), %s, %s, 'graph')
+            VALUES (%s, 'new', NOW(), %s, %s, %s)
             ON CONFLICT (channel_username) DO UPDATE SET
-                discovery_source = COALESCE(leads.discovery_source, EXCLUDED.discovery_source)
+                discovery_source = COALESCE(leads.discovery_source, EXCLUDED.discovery_source),
+                discovery_method = COALESCE(leads.discovery_method, EXCLUDED.discovery_method)
             RETURNING id;
             """
             with self.db_helper.conn.cursor() as cur:
-                cur.execute(query, (clean_user, depth, source_username))
+                cur.execute(query, (clean_user, depth, source_username, discovery_method))
                 res = cur.fetchone()
                 return str(res['id']) if res else str(self.db_helper.get_lead_id_by_username(clean_user))
         except Exception as e:
@@ -465,7 +506,9 @@ class GraphExpander:
             if not target_clean or target_clean == username.lower() or target_clean.isdigit():
                 continue
 
-            target_id = self.insert_or_get_target_lead(target_clean, child_depth, username)
+            edge_rel = edge.get("relation", "")
+            disc_method = 'similar_channel' if edge_rel == EdgeRelation.RECOMMENDATION else ('forwards' if edge_rel == EdgeRelation.FORWARDED_FROM else 'graph')
+            target_id = self.insert_or_get_target_lead(target_clean, child_depth, username, discovery_method=disc_method)
             if target_id and source_id:
                 self.edge_mgr.record_edge(
                     source_channel_id=source_id,
@@ -627,7 +670,7 @@ class GraphExpander:
                         continue
 
                     # 2. Graph Edge Recording (Always record relationship, even if already seen)
-                    target_id = self.insert_or_get_target_lead(rec_username, child_depth, target_clean)
+                    target_id = self.insert_or_get_target_lead(rec_username, child_depth, target_clean, discovery_method='similar_channel')
                     if target_id and source_ch_id:
                         self.edge_mgr.record_edge(
                             source_channel_id=str(source_ch_id),
@@ -710,7 +753,7 @@ class GraphExpander:
 
         # 1. First drain and process any freshly validated channels waiting for recommendations
         try:
-            await self.process_recommendations_queue(max_items=25)
+            await self.process_recommendations_queue(max_items=50)
         except Exception as q_err:
             logging.warning(f"[GRAPH] Error draining recommendations:queue: {q_err}")
 
@@ -732,7 +775,7 @@ class GraphExpander:
                     logging.warning("[GRAPH] All discovery sessions are currently quarantined in cooldown. Pausing expansion cycle.")
                     break
 
-            await asyncio.sleep(3)
+            await asyncio.sleep(1.5)
 
     async def start(self):
         logging.info(f"Connecting to Redis at {self.redis_host}:{self.redis_port}...")

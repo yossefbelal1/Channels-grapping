@@ -28,10 +28,13 @@ async def main():
 
     # 1. High-Intent Forex Seeds with strong recommendation spiderwebs
     seeds = [
-        "AlmaalFOREX", "SarhanIndicators", "ABOSALEM2003", "ForexBreakingNews",
+        "sigma_club_001", "AlmaalFOREX", "SarhanIndicators", "ABOSALEM2003", "ForexBreakingNews",
         "fx5orx", "wolftrading25", "BEFXTRADING", "v3tradingfx", "forexiqfx",
         "angrymandubaiolllll", "wolftrading26", "forexnewspaper", "CRTFOX12",
-        "mehmetwehbe", "fftrader", "goldzone_trade", "sh0wmethemarket", "kinforexs"
+        "mehmetwehbe", "fftrader", "goldzone_trade", "sh0wmethemarket", "kinforexs",
+        "EasyForexPips", "TURBOtradersInternationals", "Tradelikemalikagroup", "whalesforex0",
+        "cr_halal", "mmsignalsfx", "cryptomena1", "crypto_currencyME", "Cryptocurrencyy9",
+        "wells_crypto", "hadibrayteh", "goldprotradertame", "Nas100freepip"
     ]
 
     try:
@@ -39,12 +42,12 @@ async def main():
             cur.execute("""
                 SELECT channel_username 
                 FROM leads 
-                WHERE status = 'new' 
-                  AND (lead_score >= 75 OR forex_intent_score >= 60)
+                WHERE status != 'rejected'
+                  AND (lead_score >= 40 OR forex_intent_score >= 40 OR member_count >= 5000 OR channel_username = 'sigma_club_001')
                   AND (entity_type IS NULL OR entity_type != 'user')
                   AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$'
                 ORDER BY member_count DESC NULLS LAST
-                LIMIT 15;
+                LIMIT 50;
             """)
             db_seeds = [r['channel_username'] for r in cur.fetchall() if r.get('channel_username')]
             for s in db_seeds:
