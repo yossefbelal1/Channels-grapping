@@ -37,20 +37,25 @@ JUNK_USERNAMES: Set[str] = {
 
 # 1. Owner triggers (high confidence of being channel creator/owner)
 OWNER_TRIGGERS = [
+    r'مؤسس\s*(?:القناة|القناه)?',
     r'مؤسس',
-    r'صاحب\s*(?:القناة|القناه)?',
+    r'صاحب\s*(?:القناة|القناه|العمل)?',
     r'مالك\s*(?:القناة|القناه)?',
     r'المالك',
     r'المؤسس',
     r'حسابي\s*(?:الوحيد|الشخصي|الرسمي|الخاص)?',
+    r'مدير\s*(?:القناة|القناه)',
+    r'👑',
     r'owner',
     r'founder',
     r'creator',
     r'ceo',
+    r'channel\s*owner',
+    r'creator\s*account',
     r'my\s*(?:personal\s*)?account',
 ]
 
-# 2. Admin & Support triggers (support team, official desk, managers)
+# 2. Admin & Support triggers (support team, official desk, managers, ads)
 ADMIN_TRIGGERS = [
     r'(?:لل|ل)?(?:ال)?دعم\s*(?:الفني)?',
     r'دعم\s*(?:القناة|القناه|الاعضاء|المشتركين)?',
@@ -66,6 +71,17 @@ ADMIN_TRIGGERS = [
     r'(?:لل|ل)?(?:ال)?مدير\s*(?:العام|التنفيذي|المسؤول|المسئول)?',
     r'(?:لل|ل)?(?:ال)?مشرف\s*(?:العام|المسؤول|المسئول)?',
     r'(?:لل|ل)?(?:ال)?مس[ؤئ]ول\s*(?:العام)?',
+    r'مدير\s*(?:الإعلانات|الاعلانات|الاعلان|الإعلان)',
+    r'مسؤول\s*(?:الإعلانات|الاعلانات|الاعلان|الإعلان)',
+    r'مسئول\s*(?:الإعلانات|الاعلانات|الاعلان|الإعلان)',
+    r'للاعلانات',
+    r'للإعلانات',
+    r'للاعلان',
+    r'للإعلان',
+    r'تبادل\s*(?:إعلاني|اعلاني)',
+    r'لتبادل\s*(?:الإعلانات|الاعلانات)',
+    r'للتعاون\s*(?:التجاري|الإعلاني|الاعلاني)?',
+    r'تعاون\s*(?:إعلاني|اعلاني|تجاري)',
     r'ادمن',
     r'أدمن',
     r'admin',
@@ -74,6 +90,10 @@ ADMIN_TRIGGERS = [
     r'manager',
     r'helpdesk',
     r'customer\s*service',
+    r'official\s*desk',
+    r'contact\s*admin',
+    r'ads\s*manager',
+    r'marketing\s*manager',
 ]
 
 # 3. Outreach / Subscription / Contact triggers (VIP subscriptions, direct messages)
@@ -85,6 +105,12 @@ CONTACT_TRIGGERS = [
     r'للتواصل',
     r'تواصل',
     r'تواصلوا',
+    r'تواصل\s*للاعلان',
+    r'تواصل\s*للإعلان',
+    r'تواصل\s*للاشتراك',
+    r'تواصل\s*للتعاون',
+    r'للراغبين\s*بالتواصل',
+    r'للاستفسار\s*والتواصل',
     r'راسلني',
     r'راسلنا',
     r'للمراسلة',
@@ -113,7 +139,11 @@ CONTACT_TRIGGERS = [
     r'contact',
     r'reach\s*me',
     r'reach\s*us',
+    r'reach\s*out',
     r'message\s*me',
+    r'send\s*(?:a\s*)?message',
+    r'write\s*(?:to\s*)?us',
+    r'follow\s*us',
     r'dm',
     r'pm',
     r'inquiries',
@@ -121,6 +151,10 @@ CONTACT_TRIGGERS = [
     r'subscribe',
     r'subscription',
     r'vip',
+    r'📞',
+    r'📲',
+    r'💬',
+    r'📩',
 ]
 
 # 4. Analyst & Trader triggers (market analysts, mentors, coaches)
@@ -420,3 +454,67 @@ def is_contact_mention(text: str, mention: str) -> bool:
             return True
             
     return False
+
+
+def extract_contacts_from_messages(
+    messages: List[Any],
+    description: str,
+    channel_username: str,
+    pinned_text: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Enhanced multi-surface contact extractor operating directly on Telethon Message objects.
+    Parses both message text and Telethon message entities:
+    - MessageEntityMention: @username handles
+    - MessageEntityTextUrl: hidden markdown hyperlinks like [تواصل معنا](https://t.me/admin)
+    - MessageEntityUrl: raw t.me/ or telegram.me/ links
+    - MessageEntityPhone / MessageEntityEmail
+    """
+    synthesized_lines: List[str] = []
+
+    for msg in (messages or []):
+        if not msg:
+            continue
+
+        m_text = getattr(msg, 'message', None) or getattr(msg, 'text', '') or ''
+        if m_text:
+            synthesized_lines.append(m_text)
+
+        # Inspect Telethon entities if present
+        entities = getattr(msg, 'entities', None) or []
+        for ent in entities:
+            try:
+                ent_type = ent.__class__.__name__
+
+                # 1. Hidden hyperlink (e.g. [تواصل معنا](https://t.me/admin_handle))
+                if ent_type == 'MessageEntityTextUrl' or hasattr(ent, 'url'):
+                    url = getattr(ent, 'url', '') or ''
+                    offset = getattr(ent, 'offset', 0)
+                    length = getattr(ent, 'length', 0)
+                    anchor = m_text[offset:offset+length] if (m_text and length > 0) else ''
+
+                    target_handles = _extract_handles_from_line(url)
+                    for h in target_handles:
+                        if anchor:
+                            synthesized_lines.append(f"{anchor} @{h}")
+                        else:
+                            synthesized_lines.append(f"تواصل @{h}")
+
+                # 2. Direct mention entity
+                elif ent_type == 'MessageEntityMention':
+                    offset = getattr(ent, 'offset', 0)
+                    length = getattr(ent, 'length', 0)
+                    mention_text = m_text[offset:offset+length] if (m_text and length > 0) else ''
+                    if mention_text:
+                        synthesized_lines.append(mention_text)
+            except Exception:
+                pass
+
+    aggregated_text = "\n".join(synthesized_lines)
+    return extract_contacts(
+        text=aggregated_text,
+        description=description,
+        channel_username=channel_username,
+        pinned_text=pinned_text
+    )
+

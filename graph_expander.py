@@ -28,7 +28,7 @@ from app.graph.graph_importance import GraphImportanceCalculator
 from app.scheduler.watermark_manager import WatermarkManager
 from app.discovery.provenance import ProvenanceManager
 from app.discovery.relevance_evaluator import RelevanceEvaluator
-from app.validator.contact_extractor import is_contact_mention, extract_contacts
+from app.validator.contact_extractor import is_contact_mention, extract_contacts, extract_contacts_from_messages
 from app.graph.exchange_graph_engine import ExchangeGraphEngine
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -147,7 +147,9 @@ class GraphExpander:
             gold_query = """
             SELECT l.id, c.channel_username, COALESCE(l.lead_score, 100) as lead_score,
                    COALESCE(l.depth, 0) as depth, COALESCE(l.is_group, false) as is_group,
-                   COALESCE(l.tier, 'Tier_A') as tier
+                   COALESCE(l.tier, 'Tier_A') as tier,
+                   COALESCE(l.is_exchange_seed, false) as is_exchange_seed,
+                   COALESCE(l.exchange_affinity_score, 0) as exchange_affinity_score
             FROM corpus_channels c
             LEFT JOIN leads l ON (c.channel_username = l.channel_username)
             WHERE c.corpus_type = 'gold_admin'
@@ -168,7 +170,9 @@ class GraphExpander:
             ex_query = """
             SELECT id, channel_username, COALESCE(lead_score, 80) as lead_score,
                    COALESCE(depth, 0) as depth, COALESCE(is_group, false) as is_group,
-                   COALESCE(tier, 'Tier_B') as tier
+                   COALESCE(tier, 'Tier_B') as tier,
+                   COALESCE(is_exchange_seed, false) as is_exchange_seed,
+                   COALESCE(exchange_affinity_score, 50) as exchange_affinity_score
             FROM leads
             WHERE (is_exchange_seed = TRUE OR is_exchange_hub = TRUE OR exchange_affinity_score >= 40)
               AND status != 'rejected'
@@ -186,7 +190,9 @@ class GraphExpander:
         combined_priority = list(gold_seeds) + [e for e in exchange_seeds if e['channel_username'] not in {g['channel_username'] for g in gold_seeds}]
         remaining_slots = max(1, batch_size - len(combined_priority))
         query = """
-        SELECT id, channel_username, lead_score, depth, is_group, tier
+        SELECT id, channel_username, lead_score, depth, is_group, tier,
+               COALESCE(is_exchange_seed, false) as is_exchange_seed,
+               COALESCE(exchange_affinity_score, 0) as exchange_affinity_score
         FROM leads
         WHERE status != 'rejected'
           AND channel_username NOT LIKE 'invite_%%'
@@ -307,8 +313,9 @@ class GraphExpander:
         child_depth = parent_depth + 1
         lead_score = int(row.get('lead_score') or 0)
         source_tier = str(row.get('tier') or 'Tier_B')
+        is_exchange_source = bool(row.get('is_exchange_seed')) or (int(row.get('exchange_affinity_score') or 0) >= 40)
 
-        logging.info(f"[GRAPH] Traversing @{username} (depth={parent_depth}, tier={source_tier}, score={lead_score}, limit={self.post_limit})...")
+        logging.info(f"[GRAPH] Traversing @{username} (depth={parent_depth}, tier={source_tier}, score={lead_score}, exchange={is_exchange_source}, limit={self.post_limit})...")
 
         async def resolve(cl):
             return await cl.get_entity(username)
@@ -475,9 +482,12 @@ class GraphExpander:
                 referrer_channel_id=source_id
             )
 
-            # Check seen_channels
+            # Fast Redis check: skip re-evaluating and queuing if already seen
             channel_link = f"https://t.me/{target_clean}"
-            if is_new and not self.redis_conn.sismember("seen_channels", channel_link):
+            if self.redis_conn and self.redis_conn.sismember("seen_channels", channel_link):
+                continue
+
+            if is_new:
                 decision = edge.get("decision")
                 if not decision:
                     decision = RelevanceEvaluator.evaluate(
@@ -492,7 +502,14 @@ class GraphExpander:
                 if RelevanceEvaluator.is_hard_disqualified(target_clean)[0]:
                     continue
 
-                self.redis_conn.sadd("seen_channels", channel_link)
+                if self.redis_conn:
+                    self.redis_conn.sadd("seen_channels", channel_link)
+
+                # Priority routing: Elevate exchange-friendly channels and promotional forwards to queue:high
+                target_q = decision.target_queue
+                if is_exchange_source or edge.get("relation") == EdgeRelation.PROMOTED:
+                    target_q = "queue:high"
+
                 payload = json.dumps({
                     "link": channel_link,
                     "source": f"@{username}",
@@ -502,18 +519,18 @@ class GraphExpander:
                     "discovered_count": count,
                     "sources": sources,
                     "relevance_score": decision.relevance_score,
-                    "tier_estimate": decision.tier_estimate
+                    "tier_estimate": decision.tier_estimate,
+                    "is_exchange_affiliated": is_exchange_source
                 })
                 # Route dynamically based on relevance evaluation
-                target_q = decision.target_queue
-                self.redis_conn.rpush(target_q, payload)
+                if self.redis_conn:
+                    self.redis_conn.rpush(target_q, payload)
                 new_queued += 1
 
-        # Deep contact extraction for the channel itself across all messages and about text
+        # Deep contact extraction for the channel itself across all messages, entities, and about text
         try:
-            posts_blob = "\n".join([getattr(m, 'message', '') or '' for m in messages[:50] if getattr(m, 'message', None)])
             about_text = getattr(entity, 'about', '') or ''
-            extracted_info = extract_contacts(text=posts_blob, description=about_text, channel_username=username)
+            extracted_info = extract_contacts_from_messages(messages=messages[:50], description=about_text, channel_username=username)
             if extracted_info.get('contact_username'):
                 self.attach_channel_contact(username, extracted_info['contact_username'], role=extracted_info.get('source', 'deep_scan'))
         except Exception as e:

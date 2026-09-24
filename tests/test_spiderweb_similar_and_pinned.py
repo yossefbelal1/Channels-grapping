@@ -71,6 +71,25 @@ class TestSpiderwebSimilarAndPinned(unittest.TestCase):
         self.assertEqual(s4, "acc_1")
         self.assertNotIn("user_session", crawler.sessions)
 
+    @patch("app.discovery.similar_channels_crawler.get_redis_client")
+    @patch("app.discovery.similar_channels_crawler.get_db_connection")
+    def test_crawl_batch_similar_cooldown_filter(self, mock_db, mock_redis):
+        """Test crawl_batch_similar skips channels that are on cooldown cache."""
+        mock_r = MagicMock()
+        # "cool_channel" is in cooldown cache, "fresh_channel" is not
+        mock_r.get.side_effect = lambda k: "1" if "cool_channel" in k else None
+        mock_redis.return_value = mock_r
+
+        crawler = SimilarChannelsCrawler(sessions=["acc_1"])
+        crawler.inspect_and_expand_channel = AsyncMock(return_value={"channel_username": "fresh_channel", "title": "Fresh Forex"})
+
+        import asyncio
+        results = asyncio.run(crawler.crawl_batch_similar(["cool_channel", "fresh_channel"], batch_size=2))
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["channel_username"], "fresh_channel")
+        crawler.inspect_and_expand_channel.assert_called_once_with("fresh_channel", depth=0, max_recs=15)
+
 
 if __name__ == "__main__":
     unittest.main()

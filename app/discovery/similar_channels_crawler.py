@@ -22,9 +22,10 @@ from telethon.tl import types
 from telethon.tl.functions.channels import GetFullChannelRequest, GetChannelRecommendationsRequest
 from telethon.tl.functions.users import GetFullUserRequest
 
+from app.core.concurrency import bounded_gather
 from app.core.db import get_db_connection
 from app.core.redis_client import get_redis_client
-from app.validator.contact_extractor import extract_contacts
+from app.validator.contact_extractor import extract_contacts, extract_contacts_from_messages
 
 logger = logging.getLogger("similar_channels_crawler")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -42,6 +43,18 @@ RESEARCH_SESSIONS = [
 ]
 
 USERNAME_CLEAN_RE = re.compile(r'^[a-zA-Z0-9_]{4,32}$')
+
+JUNK_USERNAMES = {
+    'joinchat', 'share', 'addstickers', 'addlist', 'gmail', 'hotmail',
+    'yahoo', 'outlook', 'icloud', 'mail', 'yandex', 'protonmail', 'proton',
+    'telegram', 'spambot', 'sticker', 'gif', 'bot', 'username', 'ads',
+    'advertise', 'channel', 'group', 'chat', 'support', 'help', 'admin',
+    'contact', 'info', 'service', 'feedback', 'terms', 'privacy'
+}
+
+CONTACT_SEARCH_TERMS = [
+    "تواصل", "اشتراك", "ادارة", "دعم", "راسلنا", "للتعاون", "للاعلانات", "admin", "contact"
+]
 
 FOREX_KEYWORDS = [
     "forex", "فوركس", "ذهب", "الذهب", "دهب", "xauusd", "eurusd", "gbpusd", "us30", "nasdaq",
@@ -149,6 +162,15 @@ class SimilarChannelsCrawler:
             "error": None
         }
 
+        # Fast Redis Cooldown Check
+        r_client = get_redis_client()
+        if r_client:
+            cooldown_val = r_client.get(f"cache:cooldown:{clean_user.lower()}")
+            if cooldown_val:
+                logger.info(f"[@{clean_user}] Channel is on rescan cooldown cache. Skipping inspection.")
+                result["error"] = "cooldown"
+                return result
+
         # Try sessions with round-robin failover on FloodWait
         for _ in range(len(self.sessions)):
             sname = self._get_next_session()
@@ -220,20 +242,41 @@ class SimilarChannelsCrawler:
                     except Exception as p_err:
                         logger.warning(f"Could not fetch pinned message for @{clean_user}: {p_err}")
 
-                # 3.5. Search Recent Messages for Contact Triggers (الدعم, للتواصل, للاشتراك, الإدارة, etc.)
+                # 3.5. Search Recent & Server-Side Targeted Messages for Contact Triggers
+                all_candidate_msgs = []
                 recent_contact_text = ""
                 try:
                     msgs = await client.get_messages(entity, limit=35)
-                    for m in msgs:
-                        if m and m.message:
-                            m_text = m.message
-                            if any(kw in m_text for kw in ["دعم", "الدعم", "تواصل", "للتواصل", "اشتراك", "للاشتراك", "إدارة", "ادارة", "وكالة", "استفسار", "معرف", "خدمة العملاء", "شروط الوكالة"]):
-                                recent_contact_text += "\n" + m_text
+                    if msgs:
+                        all_candidate_msgs.extend([m for m in msgs if m])
+                        for m in msgs:
+                            if m and m.message:
+                                m_text = m.message
+                                if any(kw in m_text for kw in ["دعم", "الدعم", "تواصل", "للتواصل", "اشتراك", "للاشتراك", "إدارة", "ادارة", "وكالة", "استفسار", "معرف", "خدمة العملاء", "شروط الوكالة", "راسلنا", "للتعاون", "للاعلانات", "contact", "admin"]):
+                                    recent_contact_text += "\n" + m_text
                 except Exception as m_err:
                     logger.debug(f"Could not scan recent messages for @{clean_user}: {m_err}")
 
-                # 4. Extract Structured Contacts (prioritizing pinned text, then bio, then message triggers)
-                contacts = extract_contacts(text=recent_contact_text, description=about, channel_username=clean_user, pinned_text=pinned_text)
+                # Server-Side Targeted Search across Telegram servers for older high-intent contact posts
+                try:
+                    seen_msg_ids = {getattr(m, 'id', None) for m in all_candidate_msgs if getattr(m, 'id', None)}
+                    for term in CONTACT_SEARCH_TERMS:
+                        async for s_msg in client.iter_messages(entity, search=term, limit=2):
+                            if s_msg and getattr(s_msg, 'id', None) not in seen_msg_ids:
+                                seen_msg_ids.add(s_msg.id)
+                                all_candidate_msgs.append(s_msg)
+                                if s_msg.message:
+                                    recent_contact_text += "\n" + s_msg.message
+                except Exception as s_err:
+                    logger.debug(f"Server-side contact search skipped/failed for @{clean_user}: {s_err}")
+
+                # 4. Extract Structured Contacts (entities, hyperlinks, mentions, pinned text, bio, message triggers)
+                contacts = extract_contacts_from_messages(
+                    messages=all_candidate_msgs,
+                    description=about,
+                    channel_username=clean_user,
+                    pinned_text=pinned_text
+                )
                 result["contacts"] = contacts
                 contact_user = contacts.get('contact_username')
                 admin_user = contacts.get('admin_username')
@@ -247,6 +290,13 @@ class SimilarChannelsCrawler:
 
                 # 5. Update leads record in PostgreSQL
                 self._update_channel_record(clean_user, title, members, about, contacts, forex_score, tier, lead_score)
+
+                # Set Redis cooldown for this channel (2 days)
+                if r_client:
+                    try:
+                        r_client.set(f"cache:cooldown:{clean_user.lower()}", "1", ex=86400 * 2)
+                    except Exception as c_err:
+                        logger.debug(f"Could not set cooldown cache for @{clean_user}: {c_err}")
 
                 # 6. Auto-enroll into campaign if qualified with contact and strong forex relevance
                 if self.active_campaign_id and contact_user and forex_score >= 60:
@@ -497,9 +547,55 @@ class SimilarChannelsCrawler:
         except Exception as e:
             logger.warning(f"Failed to ingest recommended channel @{channel_username}: {e}")
 
-    async def spiderweb_crawl(self, seed_usernames: List[str], max_depth: int = 2) -> Dict[str, Any]:
+    async def crawl_batch_similar(
+        self,
+        seed_usernames: List[str],
+        batch_size: int = 5,
+        depth: int = 0,
+        max_recs: int = 15
+    ) -> List[Dict[str, Any]]:
+        """
+        Crawls a batch of seed channels concurrently using bounded_gather.
+        Pre-filters seeds against Redis cooldown cache to prevent redundant Telegram network calls.
+        """
+        clean_seeds = [s.strip().lstrip('@') for s in seed_usernames if s and s.strip()]
+        if not clean_seeds:
+            return []
+
+        r_client = get_redis_client()
+        filtered_seeds = []
+        for s in clean_seeds:
+            s_low = s.lower()
+            if r_client:
+                try:
+                    if r_client.get(f"cache:cooldown:{s_low}"):
+                        logger.info(f"[@{s}] Skipping batch inspection — active cooldown.")
+                        continue
+                except Exception as c_err:
+                    logger.debug(f"Redis cooldown check error for @{s}: {c_err}")
+            filtered_seeds.append(s)
+
+        if not filtered_seeds:
+            return []
+
+        async def _crawl_single(u: str):
+            return await self.inspect_and_expand_channel(u, depth=depth, max_recs=max_recs)
+
+        results = await bounded_gather(
+            *[_crawl_single(u) for u in filtered_seeds],
+            max_concurrent=batch_size
+        )
+        return results
+
+    async def spiderweb_crawl(
+        self,
+        seed_usernames: List[str],
+        max_depth: int = 2,
+        batch_size: int = 5
+    ) -> Dict[str, Any]:
         """
         Runs a multi-hop BFS spiderweb crawl from given seed channels.
+        Processes recommendations in bounded concurrent batches.
         """
         visited: Set[str] = set()
         queue: List[Tuple[str, int]] = [(s.strip().lstrip('@'), 0) for s in seed_usernames if s]
@@ -514,33 +610,48 @@ class SimilarChannelsCrawler:
         }
 
         while queue:
-            current_user, depth = queue.pop(0)
-            if current_user.lower() in visited:
+            batch_items = []
+            while queue and len(batch_items) < batch_size:
+                u, d = queue.pop(0)
+                if u.lower() not in visited:
+                    visited.add(u.lower())
+                    batch_items.append((u, d))
+
+            if not batch_items:
                 continue
-            visited.add(current_user.lower())
 
-            logger.info(f"\n🕷️ Spiderweb Hop [Depth {depth}]: Inspecting @{current_user}...")
-            res = await self.inspect_and_expand_channel(current_user, depth=depth)
+            batch_users = [u for u, _ in batch_items]
+            current_depth = batch_items[0][1]
+            logger.info(f"\n🕷️ Spiderweb Hop [Depth {current_depth}]: Inspecting batch {batch_users}...")
 
-            stats["inspected_channels"] += 1
-            if res.get("pinned_text"):
-                stats["pinned_messages_found"] += 1
-            if res.get("contacts", {}).get("contact_username"):
-                stats["contacts_extracted"] += 1
-            if res.get("enrolled"):
-                stats["campaign_auto_enrolled"] += 1
+            results = await self.crawl_batch_similar(
+                seed_usernames=batch_users,
+                batch_size=batch_size,
+                depth=current_depth
+            )
 
-            recs = res.get("recommendations", [])
-            stats["similar_channels_discovered"] += len(recs)
+            for res in results:
+                if not res:
+                    continue
+                stats["inspected_channels"] += 1
+                if res.get("pinned_text"):
+                    stats["pinned_messages_found"] += 1
+                if res.get("contacts", {}).get("contact_username"):
+                    stats["contacts_extracted"] += 1
+                if res.get("enrolled"):
+                    stats["campaign_auto_enrolled"] += 1
 
-            if depth < max_depth:
-                for r in recs:
-                    r_user = r["username"].lower()
-                    if r_user not in visited and len(queue) < 100:
-                        queue.append((r["username"], depth + 1))
+                recs = res.get("recommendations", [])
+                stats["similar_channels_discovered"] += len(recs)
+
+                if current_depth < max_depth:
+                    for r in recs:
+                        r_user = r.get("username", "").lower()
+                        if r_user and r_user not in visited and len(queue) < 100:
+                            queue.append((r["username"], current_depth + 1))
 
             # Small polite pause to preserve Telethon quota
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(1.5)
 
         await self.close_all()
         return stats

@@ -45,6 +45,7 @@ telegram-saas-key.pem
 !migrate_v9_auto_reply.sql
 !migrate_v10_campaign_logs_unique.sql
 !migrate_v11_outreach_safety_hardening.sql
+!migrate_v12_spiderweb_optimization.sql
 db_backups/
 postgres_data/
 redis_data/

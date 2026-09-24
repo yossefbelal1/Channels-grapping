@@ -288,7 +288,7 @@ class TelegramManager:
 
             session_path = get_session_path(session_name)
             client = TelegramClient(session_path, api_id, api_hash)
-            client.flood_sleep_threshold = 120
+            client.flood_sleep_threshold = int(os.getenv("TELEGRAM_FLOOD_SLEEP_THRESHOLD", "120"))
             self.clients[session_name] = client
 
             if not self.redis_conn.exists(f"health:{session_name}:score"):

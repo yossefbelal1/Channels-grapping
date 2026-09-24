@@ -228,7 +228,10 @@ def apply_natural_greeting_variation(text: str) -> str:
 
     return f"{chosen_greeting}،\n{text}"
 
-from app.validator.contact_extractor import extract_contacts as _smart_extract_contacts
+from app.validator.contact_extractor import (
+    extract_contacts as _smart_extract_contacts,
+    extract_contacts_from_messages
+)
 
 def extract_contacts(text: str, description: str, channel_username: str, pinned_text: Optional[str] = None) -> dict:
     """
@@ -1301,7 +1304,17 @@ class LeadValidator:
         """
         Checks if the channel or group has been scanned recently.
         Returns True if the entity is still in cooldown and should NOT be rescanned.
+        Uses Redis fast-caching to avoid repetitive PostgreSQL lookups.
         """
+        clean_u = (username or '').strip().lower().lstrip('@')
+        cache_key = f"cache:cooldown:{clean_u}"
+        try:
+            cached = self.redis_conn.get(cache_key)
+            if cached is not None:
+                return bool(cached == "1" or cached == b"1")
+        except Exception:
+            pass
+
         self.db_helper.check_connection()
         query = "SELECT last_scan, lead_score, marketplace_score, is_group FROM leads WHERE channel_username = %s"
         try:
@@ -1309,6 +1322,10 @@ class LeadValidator:
                 cur.execute(query, (username,))
                 res = cur.fetchone()
                 if not res:
+                    try:
+                        self.redis_conn.set(cache_key, "0", ex=120)
+                    except Exception:
+                        pass
                     return False # No prior record, scan immediately
                 
                 last_scan = res['last_scan']
@@ -1322,6 +1339,10 @@ class LeadValidator:
                     score = res['lead_score']
                     
                 if not last_scan:
+                    try:
+                        self.redis_conn.set(cache_key, "0", ex=120)
+                    except Exception:
+                        pass
                     return False
                     
                 # Calculate required cooldown based on scan priority engine
@@ -1340,7 +1361,13 @@ class LeadValidator:
                 if last_scan.tzinfo is None:
                     last_scan = last_scan.replace(tzinfo=timezone.utc)
                     
-                if (now - last_scan) < cooldown:
+                is_cooling = (now - last_scan) < cooldown
+                try:
+                    self.redis_conn.set(cache_key, "1" if is_cooling else "0", ex=300)
+                except Exception:
+                    pass
+
+                if is_cooling:
                     logging.info(f"Entity @{username} is in cooldown (Score/Marketplace: {score}, Last Scan: {last_scan}). Skipping rescan.")
                     return True
         except Exception as e:
@@ -1820,6 +1847,42 @@ class LeadValidator:
                 return await cl.get_messages(entity, limit=limit, min_id=min_id)
             return await cl.get_messages(entity, limit=limit)
         return await self.tg_manager.execute_request(self.session_name, fetch, shutdown_event=self.shutdown_event)
+
+    async def search_channel_contact_messages(self, entity, limit_per_term: int = 2) -> List[Any]:
+        """
+        Server-side targeted search using Telethon iter_messages(entity, search='...').
+        Directly queries Telegram's search index for high-intent contact posts
+        (تواصل, اشتراك, ادارة, دعم, راسلنا, للتعاون, admin, contact) without downloading
+        hundreds of irrelevant market analysis or chart posts.
+        """
+        search_terms = [
+            "تواصل", "للتواصل", "اشتراك", "للاشتراك", "ادارة", "إدارة",
+            "دعم", "راسلنا", "للتعاون", "admin", "contact"
+        ]
+
+        async def _search(cl):
+            found = []
+            seen_ids = set()
+            for term in search_terms:
+                if self.shutdown_event.is_set():
+                    break
+                try:
+                    async for msg in cl.iter_messages(entity, search=term, limit=limit_per_term):
+                        if msg and getattr(msg, 'id', None) not in seen_ids:
+                            seen_ids.add(msg.id)
+                            found.append(msg)
+                except Exception as s_err:
+                    logging.debug(f"Targeted search for '{term}' on {getattr(entity, 'id', '')} note: {s_err}")
+            return found
+
+        try:
+            return await self.tg_manager.execute_request(
+                self.session_name, _search, shutdown_event=self.shutdown_event
+            ) or []
+        except Exception as e:
+            logging.debug(f"Server-side contact search note: {e}")
+            return []
+
 
     async def get_member_count_safe(self, entity):
         """
@@ -2482,16 +2545,36 @@ class LeadValidator:
                             pass
                 return
                 
-            # Compile messages sample text
+            # Compile messages sample text & query server-side targeted contact messages
+            search_messages = await self.search_channel_contact_messages(entity, limit_per_term=2)
+            all_channel_messages = list(messages or [])
+            seen_m_ids = {getattr(m, 'id', None) for m in all_channel_messages}
+            for sm in (search_messages or []):
+                if getattr(sm, 'id', None) not in seen_m_ids:
+                    all_channel_messages.append(sm)
+                    seen_m_ids.add(sm.id)
+
             sample_text_list = []
-            for msg in messages:
-                if msg.text:
-                    sample_text_list.append(msg.text)
+            for msg in all_channel_messages:
+                m_txt = getattr(msg, 'message', None) or getattr(msg, 'text', '') or ''
+                if m_txt:
+                    sample_text_list.append(m_txt)
             if pinned_text:
                 sample_text_list.append(pinned_text)
             sample_text = " \n ".join(sample_text_list)
             
-            contacts = extract_contacts(sample_text, description, username, pinned_text=pinned_text)
+            # Extract contacts using enhanced entity unpacking (handles hidden hyperlinks)
+            contacts = extract_contacts_from_messages(
+                messages=all_channel_messages,
+                description=description,
+                channel_username=username,
+                pinned_text=pinned_text
+            )
+            if contacts.get('contact_username') or contacts.get('admin_username') or contacts.get('owner_username'):
+                logging.info(
+                    f"Contacts extracted for @{username}: contact=@{contacts.get('contact_username')} "
+                    f"admin=@{contacts.get('admin_username')} owner=@{contacts.get('owner_username')}"
+                )
             
             # Pre-register lead to get its UUID and count incoming mentions
             source_id = self.db_helper.insert_stub_lead(username)
@@ -4369,17 +4452,17 @@ class LeadValidator:
                     target_key = f"campaign_daily_target:{today_str}"
                     sent_today = int(self.redis_conn.get(campaign_sent_key) or 0)
 
-                    env_max = int(os.getenv("CAMPAIGN_DAILY_LIMIT", 20))
-                    hard_cap = min(env_max, 20)  # Absolute hard maximum: never exceed 20/day
+                    risk_budget = int(os.getenv("RISK_BUDGET_DAILY", os.getenv("CAMPAIGN_DAILY_LIMIT", "20")))
+                    hard_cap = risk_budget
                     
                     stored_target = self.redis_conn.get(target_key)
                     if stored_target:
                         try:
                             daily_target = min(int(stored_target), hard_cap)
                         except (ValueError, TypeError):
-                            daily_target = random.randint(min(15, hard_cap), hard_cap)
+                            daily_target = random.randint(max(1, int(hard_cap * 0.75)), hard_cap)
                     else:
-                        daily_target = random.randint(min(15, hard_cap), hard_cap)
+                        daily_target = random.randint(max(1, int(hard_cap * 0.75)), hard_cap)
                         self.redis_conn.set(target_key, str(daily_target), ex=86400 * 2)
 
                     jitter_min = int(os.getenv("CAMPAIGN_JITTER_MIN", 90))
