@@ -1,3 +1,4 @@
+import random
 """
 graph_expander.py — Production Multi-Edge Graph Intelligence Engine (Worker D)
 
@@ -122,9 +123,9 @@ class GraphExpander:
         self.db_user = os.getenv("DB_USER", "postgres")
         self.db_password = os.getenv("DB_PASSWORD", "")
 
-        exp_session = os.getenv("SESSION_GRAPH_EXPANDER", "spiderweb_session")
+        exp_session = os.getenv("SESSION_GRAPH_EXPANDER", "acc_14809564829")
         if exp_session in ("radar_session_expander_backup", "radar_session"):
-            exp_session = "spiderweb_session"
+            exp_session = "acc_14809564829"
         self.session_name = exp_session
         self.post_limit = int(os.getenv("GRAPH_EXPANDER_POST_LIMIT", 300))
         self.channel_interval = int(os.getenv("GRAPH_EXPANDER_INTERVAL_SECONDS", 90))
@@ -272,7 +273,11 @@ class GraphExpander:
         self.db_helper.check_connection()
         try:
             with self.db_helper.conn.cursor() as cur:
-                cur.execute("UPDATE leads SET last_graph_scan = NOW() WHERE channel_username = %s", (username,))
+                cur.execute("""
+                    INSERT INTO leads (channel_username, status, discovered_at, last_graph_scan)
+                    VALUES (%s, 'new', NOW(), NOW())
+                    ON CONFLICT (channel_username) DO UPDATE SET last_graph_scan = NOW();
+                """, (username,))
             self.db_helper.conn.commit()
         except Exception as e:
             logging.warning(f"[GRAPH] Failed to update last_graph_scan for @{username}: {e}")
@@ -365,7 +370,22 @@ class GraphExpander:
         try:
             entity = await self.tg_manager.execute_request(self.session_name, resolve, shutdown_event=self.shutdown_event)
         except Exception as e:
+            err_msg = str(e).lower()
             logging.warning(f"[GRAPH] Could not resolve entity @{username}: {e}")
+            if "no user has" in err_msg or "cannot find any entity" in err_msg or "not found" in err_msg:
+                try:
+                    with self.db_helper.conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO leads (channel_username, status, description, last_graph_scan)
+                            VALUES (%s, 'rejected', 'Entity does not exist on Telegram', NOW())
+                            ON CONFLICT (channel_username) DO UPDATE SET 
+                                status = 'rejected',
+                                description = 'Entity does not exist on Telegram',
+                                last_graph_scan = NOW();
+                        """, (username,))
+                    self.db_helper.conn.commit()
+                except Exception:
+                    pass
             self.update_last_graph_scan(username)
             return False
 
@@ -728,7 +748,7 @@ class GraphExpander:
                 )
                 processed += 1
                 # Rate limit safety: 2s delay between Telegram recommendation API calls
-                await asyncio.sleep(2)
+                await asyncio.sleep(random.uniform(4, 7))
             except Exception as err:
                 logging.warning(f"[GRAPH-REC] Error processing recommendation item: {err}")
 

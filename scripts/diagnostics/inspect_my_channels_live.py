@@ -3,7 +3,8 @@ import os
 import sys
 from telethon import TelegramClient
 
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+sys.path.insert(0, '/app')
 from tg_manager import get_session_path
 
 async def main():
@@ -42,6 +43,8 @@ async def main():
 
     my_filter = None
     for f in filters:
+        if not hasattr(f, 'title') or f.title is None:
+            continue
         title = f.title.text if hasattr(f.title, 'text') else str(getattr(f, 'title', ''))
         print(f"Folder ID {getattr(f, 'id', None)}: '{title}' ({len(getattr(f, 'include_peers', []))} peers)")
         if title == "My_Channels":

@@ -440,9 +440,9 @@ def get_discovered_24h(
                 params.append(tier)
 
             if search and search.strip():
-                where_clauses.append("(l.channel_username ILIKE %s OR l.description ILIKE %s OR l.contact_username ILIKE %s)")
+                where_clauses.append("(l.channel_username ILIKE %s OR l.title ILIKE %s OR l.description ILIKE %s OR l.contact_username ILIKE %s)")
                 term = f"%{search.strip()}%"
-                params.extend([term, term, term])
+                params.extend([term, term, term, term])
 
             where_sql = " AND ".join(where_clauses)
             
@@ -454,20 +454,29 @@ def get_discovered_24h(
             channel_query = f"""
                 SELECT 
                     l.id, l.channel_username, l.title, l.member_count, l.description,
-                    l.language, l.arabic_ratio, l.contact_username, l.whatsapp, l.website,
-                    l.lead_score, l.tier, l.status, l.discovered_at, l.last_activity,
+                    l.language, l.arabic_ratio, l.contact_username, l.admin_username, l.owner_username,
+                    l.whatsapp, l.website, l.email,
+                    l.lead_score, l.tier, l.status, l.discovered_at, l.last_activity, l.last_scan,
+                    l.forex_category,
                     COALESCE(l.forex_intent_score, l.forex_score, 0) as forex_score,
                     COALESCE(l.commercial_fit_score, 0) as commercial_fit_score,
                     COALESCE(l.relevance_score, 0) as relevance_score,
                     COALESCE(l.outreach_priority, 'P3') as outreach_priority,
                     COALESCE(l.outreach_priority_score, 25) as outreach_priority_score,
                     l.outreach_priority_reason,
+                    COALESCE(l.vip, FALSE) as vip,
+                    COALESCE(l.account_management, FALSE) as account_management,
+                    COALESCE(l.copy_trading, FALSE) as copy_trading,
+                    COALESCE(l.funded_accounts, FALSE) as funded_accounts,
+                    COALESCE(l.subscription, FALSE) as subscription,
                     COALESCE(l.is_exchange_hub, FALSE) as is_exchange_hub,
                     COALESCE(l.is_exchange_seed, FALSE) as is_exchange_seed,
                     COALESCE(l.exchange_affinity_score, 0) as exchange_affinity_score,
                     COALESCE(l.network_value_score, 0) as network_value_score,
                     COALESCE(l.growth_openness_score, 0) as growth_openness_score,
                     l.exchange_evidence,
+                    l.scoring_evidence,
+                    l.commercial_evidence,
                     l.cluster_id,
                     l.discovery_source, l.discovery_method, l.is_group,
                     cl.status as campaign_status, cl.id as campaign_log_id
@@ -475,8 +484,14 @@ def get_discovered_24h(
                 LEFT JOIN campaign_logs cl ON cl.lead_id = l.id
                 WHERE {where_sql}
                 ORDER BY 
-                    CASE WHEN l.member_count > 0 OR l.lead_score >= 10 THEN 0 ELSE 1 END,
-                    COALESCE(l.exchange_affinity_score, 0) DESC,
+                    CASE 
+                        WHEN l.outreach_priority = 'P0' THEN 1
+                        WHEN l.outreach_priority = 'P1' THEN 2
+                        WHEN l.outreach_priority = 'P2' THEN 3
+                        ELSE 4 
+                    END ASC,
+                    COALESCE(l.forex_intent_score, l.forex_score, 0) DESC,
+                    CASE WHEN l.member_count > 0 THEN 0 ELSE 1 END,
                     l.discovered_at DESC
                 LIMIT %s OFFSET %s;
             """
@@ -494,6 +509,38 @@ def get_discovered_24h(
                     ch['last_activity'] = ch['last_activity'].isoformat()
                 elif ch.get('last_activity'):
                     ch['last_activity'] = str(ch['last_activity'])
+
+                if hasattr(ch.get('last_scan'), 'isoformat'):
+                    ch['last_scan'] = ch['last_scan'].isoformat()
+                elif ch.get('last_scan'):
+                    ch['last_scan'] = str(ch['last_scan'])
+
+                # Compute Human-readable diagnostic badge & status
+                prio = ch.get('outreach_priority') or 'P3'
+                status_val = ch.get('status')
+                mem = ch.get('member_count')
+                contact = ch.get('contact_username') or ch.get('whatsapp')
+                fx = ch.get('forex_score') or 0
+                cat = ch.get('forex_category') or 'unknown'
+                
+                if status_val == 'rejected':
+                    ch['diagnostic_status'] = '🚫 مستبعد من الاكتشاف (مخالف للمنطقة أو غير تجاري)'
+                    ch['diagnostic_class'] = 'bg-rose-500/10 text-rose-400 border-rose-500/20'
+                elif mem is None or mem == 0:
+                    ch['diagnostic_status'] = '⏳ بانتظار فحص المشتركين والبايو بالـ Validator'
+                    ch['diagnostic_class'] = 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                elif prio in ('P0', 'P1') and contact:
+                    ch['diagnostic_status'] = '👑 جاهزة للتواصل الفوري (نخبة فوركس مع يوزر مباشر)'
+                    ch['diagnostic_class'] = 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                elif prio in ('P0', 'P1') and not contact:
+                    ch['diagnostic_status'] = '🎯 فوركس عالي الأهمية (بحاجة استخراج يوزر الأدمن)'
+                    ch['diagnostic_class'] = 'bg-cyan-500/10 text-cyan-400 border-cyan-500/20'
+                elif fx < 35:
+                    ch['diagnostic_status'] = '⚠️ غير مرتبطة بالفوركس بشكل كافٍ (درجة منخفضة)'
+                    ch['diagnostic_class'] = 'bg-slate-800 text-slate-400 border-slate-700'
+                else:
+                    ch['diagnostic_status'] = '📊 قناة تداول عادية قيد المراقبة'
+                    ch['diagnostic_class'] = 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20'
 
         # Redis System Health
         is_killed = False
@@ -1306,10 +1353,39 @@ DASHBOARD_PAGE_HTML = """
         <script src="https://cdn.tailwindcss.com"></script>
         <link rel="preconnect" href="https://fonts.googleapis.com">
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
         <style>
             body {
-                font-family: 'Outfit', sans-serif;
+                font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+                background-color: #060911;
+            }
+            .font-mono {
+                font-family: 'JetBrains Mono', monospace;
+            }
+            .bezel-shell {
+                background: linear-gradient(180deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0.01) 100%);
+                border: 1px solid rgba(255, 255, 255, 0.07);
+                border-radius: 1.25rem;
+                padding: 1px;
+                box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+            }
+            .bezel-core {
+                background: rgba(11, 17, 32, 0.75);
+                backdrop-filter: blur(20px);
+                border-radius: calc(1.25rem - 1px);
+                box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.06);
+            }
+            .glassmorphism {
+                background: rgba(13, 20, 38, 0.65);
+                backdrop-filter: blur(20px);
+                border: 1px solid rgba(255, 255, 255, 0.07);
+                box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 12px 32px -8px rgba(0, 0, 0, 0.4);
+            }
+            .glassmorphism-card {
+                background: linear-gradient(180deg, rgba(20, 30, 55, 0.5) 0%, rgba(10, 16, 32, 0.6) 100%);
+                backdrop-filter: blur(16px);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.07), 0 16px 36px -12px rgba(0, 0, 0, 0.5);
             }
             .glassmorphism {
                 background: rgba(15, 23, 42, 0.45);
@@ -2162,241 +2238,408 @@ DASHBOARD_PAGE_HTML = """
             </div>
 
             <!-- 24h Discovered Channels & System Health Section -->
-            <div id="tab-discovered-24h" class="space-y-8 hidden">
-                <!-- Top KPI / Health Bar -->
-                <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+            <div id="tab-discovered-24h" class="space-y-6 hidden">
+                <!-- Top Cockpit Ribbon (Double-Bezel Architecture) -->
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5">
                     <!-- KPI 1: 24h Discovery Velocity -->
-                    <div class="glassmorphism p-6 rounded-2xl flex items-center space-x-4 shadow-xl border-l-4 border-emerald-500">
-                        <div class="h-12 w-12 rounded-lg bg-emerald-500/10 text-emerald-400 flex items-center justify-center border border-emerald-500/20 text-xl font-bold">
-                            ⚡
-                        </div>
-                        <div>
-                            <p class="text-xs text-slate-400 font-medium uppercase tracking-wider">24h Discovered Channels</p>
-                            <div class="flex items-baseline space-x-2">
-                                <h3 id="disc24-total" class="text-2xl font-bold mt-1 text-emerald-400">-</h3>
-                                <span id="disc24-rate" class="text-xs text-slate-400">rolling 24h</span>
+                    <div class="bezel-shell">
+                        <div class="bezel-core p-5 flex items-center justify-between">
+                            <div>
+                                <span class="text-[10px] uppercase font-bold text-emerald-400/80 tracking-widest block mb-1">INGESTION VELOCITY</span>
+                                <h3 id="disc24-total" class="text-3xl font-extrabold font-mono text-emerald-400 tracking-tight">-</h3>
+                                <p class="text-xs text-slate-400 mt-1 flex items-center gap-1.5">
+                                    <span>معدل التدفق:</span>
+                                    <span id="disc24-rate" class="font-mono text-emerald-300/90 font-medium">rolling 24h</span>
+                                </p>
+                            </div>
+                            <div class="h-12 w-12 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 flex items-center justify-center text-xl font-bold shadow-lg shadow-emerald-500/10">
+                                ⚡
                             </div>
                         </div>
                     </div>
 
                     <!-- KPI 2: Qualified Leads (Forex/Arabic) -->
-                    <div class="glassmorphism p-6 rounded-2xl flex items-center space-x-4 shadow-xl border-l-4 border-indigo-500">
-                        <div class="h-12 w-12 rounded-lg bg-indigo-500/10 text-indigo-400 flex items-center justify-center border border-indigo-500/20 text-xl font-bold">
-                            🎯
-                        </div>
-                        <div>
-                            <p class="text-xs text-slate-400 font-medium uppercase tracking-wider">Qualified Leads</p>
-                            <div class="flex items-baseline space-x-2">
-                                <h3 id="disc24-qualified" class="text-2xl font-bold mt-1 text-indigo-400">-</h3>
-                                <span id="disc24-qual-pct" class="text-xs text-indigo-300/80">(-%)</span>
+                    <div class="bezel-shell">
+                        <div class="bezel-core p-5 flex items-center justify-between">
+                            <div>
+                                <span class="text-[10px] uppercase font-bold text-indigo-400/80 tracking-widest block mb-1">P0 VIP & P1 SIGNALS</span>
+                                <div class="flex items-baseline gap-2">
+                                    <h3 id="disc24-qualified" class="text-3xl font-extrabold font-mono text-indigo-400 tracking-tight">-</h3>
+                                    <span id="disc24-qual-pct" class="text-xs font-mono text-indigo-300/80 font-semibold">(-%)</span>
+                                </div>
+                                <p class="text-xs text-slate-400 mt-1">نخبة قنوات الفوركس المستهدفة</p>
+                            </div>
+                            <div class="h-12 w-12 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 flex items-center justify-center text-xl font-bold shadow-lg shadow-indigo-500/10">
+                                👑
                             </div>
                         </div>
                     </div>
 
-                    <!-- KPI 3: Contact Extraction Rate -->
-                    <div class="glassmorphism p-6 rounded-2xl flex items-center space-x-4 shadow-xl border-l-4 border-cyan-500">
-                        <div class="h-12 w-12 rounded-lg bg-cyan-500/10 text-cyan-400 flex items-center justify-center border border-cyan-500/20 text-xl font-bold">
-                            👤
-                        </div>
-                        <div>
-                            <p class="text-xs text-slate-400 font-medium uppercase tracking-wider">Direct Contacts Found</p>
-                            <div class="flex items-baseline space-x-2">
-                                <h3 id="disc24-contacts" class="text-2xl font-bold mt-1 text-cyan-400">-</h3>
-                                <span id="disc24-contact-pct" class="text-xs text-cyan-300/80">(-%)</span>
+                    <!-- KPI 3: Direct Contacts Found -->
+                    <div class="bezel-shell">
+                        <div class="bezel-core p-5 flex items-center justify-between">
+                            <div>
+                                <span class="text-[10px] uppercase font-bold text-cyan-400/80 tracking-widest block mb-1">DIRECT CONTACT EXTRACTION</span>
+                                <h3 id="disc24-contacts" class="text-3xl font-extrabold font-mono text-cyan-400 tracking-tight">-</h3>
+                                <p id="disc24-contact-pct" class="text-xs text-cyan-300/80 mt-1 font-mono">(-% of Total)</p>
+                            </div>
+                            <div class="h-12 w-12 rounded-2xl bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 flex items-center justify-center text-xl font-bold shadow-lg shadow-cyan-500/10">
+                                👤
                             </div>
                         </div>
                     </div>
 
-                    <!-- KPI 4: System Outreach & Pipeline Health -->
-                    <div class="glassmorphism p-6 rounded-2xl flex items-center space-x-4 shadow-xl border-l-4 border-purple-500">
-                        <div class="h-12 w-12 rounded-lg bg-purple-500/10 text-purple-400 flex items-center justify-center border border-purple-500/20 text-xl font-bold">
-                            🛡️
-                        </div>
-                        <div>
-                            <p class="text-xs text-slate-400 font-medium uppercase tracking-wider">Pipeline & Safety Status</p>
-                            <div class="mt-1 flex items-center gap-2">
-                                <span id="disc24-health-status" class="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">Normal</span>
-                                <span id="disc24-kill-badge" class="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30">KillSwitch: Ready</span>
+                    <!-- KPI 4: Telegram Outreach Safety -->
+                    <div class="bezel-shell">
+                        <div class="bezel-core p-5 flex items-center justify-between">
+                            <div>
+                                <span class="text-[10px] uppercase font-bold text-purple-400/80 tracking-widest block mb-1">TELEGRAM DEFENSE ENGINE</span>
+                                <div class="mt-1 flex items-center gap-2">
+                                    <span id="disc24-health-status" class="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">Safe Protocol</span>
+                                    <span id="disc24-kill-badge" class="px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-400 border border-slate-700">Max 12/Day</span>
+                                </div>
+                                <p class="text-[11px] text-slate-400 mt-1 font-mono">Jitter: 25-45m • 0 Ban Risk</p>
+                            </div>
+                            <div class="h-12 w-12 rounded-2xl bg-purple-500/10 border border-purple-500/20 text-purple-400 flex items-center justify-center text-xl font-bold shadow-lg shadow-purple-500/10">
+                                🛡️
                             </div>
                         </div>
                     </div>
                 </div>
 
-                <!-- Velocity Timeline & Source Distribution Cards -->
+                <!-- Bento Grid: Velocity Timeline & Source Distribution -->
                 <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                    <!-- Hourly Discovery Velocity Chart -->
-                    <div class="lg:col-span-2 glassmorphism p-6 rounded-2xl shadow-xl space-y-4">
-                        <div class="flex justify-between items-center">
-                            <div>
-                                <h4 class="text-sm font-semibold uppercase tracking-wider text-slate-300 flex items-center gap-2">
-                                    <span>📈 Hourly Discovery Velocity</span>
-                                    <span class="text-xs font-normal text-slate-500">(Last 24 Hours)</span>
-                                </h4>
-                                <p class="text-xs text-slate-400 mt-0.5">Rolling throughput showing new channels ingested per hour</p>
+                    <!-- Hourly Discovery Velocity Chart (2 cols) -->
+                    <div class="lg:col-span-2 bezel-shell">
+                        <div class="bezel-core p-6 space-y-4">
+                            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                                <div>
+                                    <h4 class="text-sm font-bold uppercase tracking-wider text-slate-200 flex items-center gap-2">
+                                        <span>📈 سرعة وتدفق الاكتشاف بالساعة</span>
+                                        <span class="text-xs font-normal text-slate-500 font-mono">(Last 24 Hours)</span>
+                                    </h4>
+                                    <p class="text-xs text-slate-400 mt-0.5">معدل استيعاب القنوات الجديدة عبر شبكة العناكب اللحظية</p>
+                                </div>
+                                <div class="flex items-center space-x-4 text-xs font-medium">
+                                    <span class="flex items-center gap-1.5 text-emerald-400"><span class="w-2.5 h-2.5 rounded bg-emerald-500 inline-block shadow-sm shadow-emerald-500/50"></span> مؤهلة فوركس</span>
+                                    <span class="flex items-center gap-1.5 text-slate-400"><span class="w-2.5 h-2.5 rounded bg-slate-700 inline-block"></span> قنوات أخرى/مستبعدة</span>
+                                </div>
                             </div>
-                            <div class="flex items-center space-x-4 text-xs">
-                                <span class="flex items-center gap-1 text-emerald-400"><span class="w-2.5 h-2.5 rounded-sm bg-emerald-500 inline-block"></span> Qualified</span>
-                                <span class="flex items-center gap-1 text-slate-400"><span class="w-2.5 h-2.5 rounded-sm bg-slate-700 inline-block"></span> Filtered/Other</span>
+                            <div id="disc24-hourly-chart" class="h-40 w-full flex items-end gap-1.5 pt-4 pb-2 border-b border-slate-800/80 overflow-x-auto">
+                                <div class="text-xs text-slate-500 w-full text-center py-12">Loading velocity metrics...</div>
                             </div>
-                        </div>
-                        <div id="disc24-hourly-chart" class="h-44 w-full flex items-end gap-1.5 pt-4 pb-2 border-b border-slate-800/80 overflow-x-auto">
-                            <!-- Populated dynamically via JS -->
-                            <div class="text-xs text-slate-500 w-full text-center py-12">Loading velocity metrics...</div>
-                        </div>
-                        <div class="flex justify-between items-center text-xs text-slate-500 pt-1">
-                            <span>-24 Hours Ago</span>
-                            <span id="disc24-hourly-summary" class="font-medium text-slate-400">Peak: - channels/hr</span>
-                            <span>Right Now</span>
+                            <div class="flex justify-between items-center text-xs text-slate-500 pt-1 font-mono">
+                                <span>-24 Hours Ago</span>
+                                <span id="disc24-hourly-summary" class="font-bold text-slate-300">Peak: - channels/hr</span>
+                                <span>Right Now</span>
+                            </div>
                         </div>
                     </div>
 
-                    <!-- Tier Breakdown & Discovery Sources -->
-                    <div class="glassmorphism p-6 rounded-2xl shadow-xl space-y-5 flex flex-col justify-between">
-                        <div>
-                            <h4 class="text-sm font-semibold uppercase tracking-wider text-slate-300 mb-3">🏷️ 24h Tier Breakdown</h4>
-                            <div class="space-y-2.5" id="disc24-tier-container">
-                                <div class="flex justify-between items-center text-xs">
-                                    <span class="text-amber-400 font-semibold">Tier A (Elite VIP)</span>
-                                    <span id="disc24-tier-a" class="font-bold text-slate-200">0</span>
-                                </div>
-                                <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                                    <div id="disc24-tier-a-bar" class="bg-amber-400 h-1.5 rounded-full" style="width: 0%"></div>
-                                </div>
+                    <!-- Tier Breakdown & Discovery Sources (1 col) -->
+                    <div class="bezel-shell">
+                        <div class="bezel-core p-6 space-y-5 flex flex-col justify-between h-full">
+                            <div>
+                                <h4 class="text-sm font-bold uppercase tracking-wider text-slate-200 mb-3 flex items-center justify-between">
+                                    <span>🏷️ توزيع مستويات الجودة (24h)</span>
+                                    <span class="text-[10px] text-slate-500 font-mono">Multi-Tier Funnel</span>
+                                </h4>
+                                <div class="space-y-3" id="disc24-tier-container">
+                                    <div>
+                                        <div class="flex justify-between items-center text-xs mb-1">
+                                            <span class="text-amber-400 font-semibold flex items-center gap-1.5">
+                                                <span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
+                                                <span>Tier A (Elite VIP & Mgmt)</span>
+                                            </span>
+                                            <span id="disc24-tier-a" class="font-bold font-mono text-slate-100">0</span>
+                                        </div>
+                                        <div class="w-full bg-slate-900 rounded-full h-1.5 overflow-hidden border border-slate-800">
+                                            <div id="disc24-tier-a-bar" class="bg-gradient-to-r from-amber-500 to-yellow-400 h-1.5 rounded-full" style="width: 0%"></div>
+                                        </div>
+                                    </div>
 
-                                <div class="flex justify-between items-center text-xs mt-2">
-                                    <span class="text-indigo-400 font-semibold">Tier B (Commercial Signals)</span>
-                                    <span id="disc24-tier-b" class="font-bold text-slate-200">0</span>
-                                </div>
-                                <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                                    <div id="disc24-tier-b-bar" class="bg-indigo-500 h-1.5 rounded-full" style="width: 0%"></div>
-                                </div>
+                                    <div>
+                                        <div class="flex justify-between items-center text-xs mb-1">
+                                            <span class="text-indigo-400 font-semibold flex items-center gap-1.5">
+                                                <span class="w-2 h-2 rounded-full bg-indigo-400"></span>
+                                                <span>Tier B (Forex Signals)</span>
+                                            </span>
+                                            <span id="disc24-tier-b" class="font-bold font-mono text-slate-100">0</span>
+                                        </div>
+                                        <div class="w-full bg-slate-900 rounded-full h-1.5 overflow-hidden border border-slate-800">
+                                            <div id="disc24-tier-b-bar" class="bg-gradient-to-r from-indigo-500 to-cyan-500 h-1.5 rounded-full" style="width: 0%"></div>
+                                        </div>
+                                    </div>
 
-                                <div class="flex justify-between items-center text-xs mt-2">
-                                    <span class="text-cyan-400 font-semibold">Tier C (Standard Trading)</span>
-                                    <span id="disc24-tier-c" class="font-bold text-slate-200">0</span>
-                                </div>
-                                <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                                    <div id="disc24-tier-c-bar" class="bg-cyan-500 h-1.5 rounded-full" style="width: 0%"></div>
-                                </div>
+                                    <div>
+                                        <div class="flex justify-between items-center text-xs mb-1">
+                                            <span class="text-cyan-400 font-semibold flex items-center gap-1.5">
+                                                <span class="w-2 h-2 rounded-full bg-cyan-400"></span>
+                                                <span>Tier C (Standard Trading)</span>
+                                            </span>
+                                            <span id="disc24-tier-c" class="font-bold font-mono text-slate-100">0</span>
+                                        </div>
+                                        <div class="w-full bg-slate-900 rounded-full h-1.5 overflow-hidden border border-slate-800">
+                                            <div id="disc24-tier-c-bar" class="bg-cyan-500 h-1.5 rounded-full" style="width: 0%"></div>
+                                        </div>
+                                    </div>
 
-                                <div class="flex justify-between items-center text-xs mt-2">
-                                    <span class="text-slate-400 font-semibold">Tier D / Unclassified</span>
-                                    <span id="disc24-tier-d" class="font-bold text-slate-200">0</span>
-                                </div>
-                                <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                                    <div id="disc24-tier-d-bar" class="bg-slate-600 h-1.5 rounded-full" style="width: 0%"></div>
+                                    <div>
+                                        <div class="flex justify-between items-center text-xs mb-1">
+                                            <span class="text-slate-400 font-semibold">Tier D / Unclassified</span>
+                                            <span id="disc24-tier-d" class="font-bold font-mono text-slate-400">0</span>
+                                        </div>
+                                        <div class="w-full bg-slate-900 rounded-full h-1.5 overflow-hidden border border-slate-800">
+                                            <div id="disc24-tier-d-bar" class="bg-slate-700 h-1.5 rounded-full" style="width: 0%"></div>
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
-                        </div>
 
-                        <div class="pt-4 border-t border-slate-800">
-                            <h4 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">🔍 Top Ingestion Sources (24h)</h4>
-                            <div id="disc24-top-sources" class="space-y-1.5 text-xs">
-                                <span class="text-slate-500">Loading sources...</span>
+                            <div class="pt-4 border-t border-slate-800/80">
+                                <h4 class="text-xs font-bold uppercase tracking-wider text-slate-300 mb-2.5 flex items-center justify-between">
+                                    <span>🔍 أعلى قنوات مصدرية جلبت قنوات (24h)</span>
+                                </h4>
+                                <div id="disc24-top-sources" class="space-y-2 text-xs">
+                                    <span class="text-slate-500">Loading sources...</span>
+                                </div>
                             </div>
                         </div>
                     </div>
                 </div>
 
                 <!-- Review Filter & Action Controls -->
-                <div class="glassmorphism p-6 rounded-2xl shadow-xl space-y-4">
-                    <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
-                        <!-- Left: Status Filter Pills -->
-                        <div class="flex flex-wrap items-center gap-2">
-                            <span class="text-xs font-semibold uppercase tracking-wider text-slate-400 mr-1">Status:</span>
-                            <button onclick="setDiscoveredFilter('verified')" id="disc-flt-verified" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-500 text-white transition">⚡ Verified Channels</button>
-                            <button onclick="setDiscoveredFilter('qualified')" id="disc-flt-qualified" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">🎯 Qualified Only</button>
-                            <button onclick="setDiscoveredFilter('exchange_hubs')" id="disc-flt-hubs" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">🔄 Exchange Hubs</button>
-                            <button onclick="setDiscoveredFilter('exchange_seeds')" id="disc-flt-seeds" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">🌱 Exchange Seeds</button>
-                            <button onclick="setDiscoveredFilter('sweet_spot')" id="disc-flt-sweetspot" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">🎯 Sweet Spot (1k-35k)</button>
-                            <button onclick="setDiscoveredFilter('high_affinity')" id="disc-flt-affinity" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">🤝 Cross-Promo</button>
-                            <button onclick="setDiscoveredFilter('with_contact')" id="disc-flt-contact" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">👤 With Direct Contact</button>
-                            <button onclick="setDiscoveredFilter('pending_scan')" id="disc-flt-pending" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">⏳ Pending Scan</button>
-                            <button onclick="setDiscoveredFilter('rejected')" id="disc-flt-rejected" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">🚫 Filtered / Rejected</button>
-                            <button onclick="setDiscoveredFilter('all')" id="disc-flt-all" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition">All Candidates</button>
-                        </div>
-
-                        <!-- Right: Tier & Search Inputs -->
-                        <div class="flex flex-wrap items-center gap-3">
-                            <select id="disc-filter-tier" onchange="setDiscoveredTier(this.value)" class="p-2 rounded-xl glassmorphism-input text-slate-200 text-xs bg-slate-900">
-                                <option value="all">All Tiers</option>
-                                <option value="Tier_A">Tier A (VIP)</option>
-                                <option value="Tier_B">Tier B (Signals)</option>
-                                <option value="Tier_C">Tier C (Standard)</option>
-                                <option value="Tier_D">Tier D</option>
-                            </select>
-                            <div class="relative">
-                                <input type="text" id="disc-search-input" onkeyup="onDiscoveredSearch(event)" placeholder="Search @channel or keyword..." class="p-2 pl-8 rounded-xl glassmorphism-input text-slate-200 text-xs w-48 md:w-64">
-                                <svg class="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                <div class="bezel-shell">
+                    <div class="bezel-core p-6 space-y-4">
+                        <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                            <!-- Left: Status Filter Pills -->
+                            <div class="flex flex-wrap items-center gap-2">
+                                <span class="text-xs font-bold uppercase tracking-wider text-slate-400 mr-1">الفلترة السريعة:</span>
+                                <button onclick="setDiscoveredFilter('qualified')" id="disc-flt-qualified" class="px-3.5 py-2 rounded-xl text-xs font-bold bg-indigo-600 text-white shadow-lg shadow-indigo-600/30 transition flex items-center gap-1.5">
+                                    <span>👑 النخبة المؤهلة (P0 & P1)</span>
+                                </button>
+                                <button onclick="setDiscoveredFilter('with_contact')" id="disc-flt-contact" class="px-3 py-2 rounded-xl text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/80 border border-slate-800 hover:border-slate-700 transition flex items-center gap-1.5">
+                                    <span>👤 تواصل مباشر متاح</span>
+                                </button>
+                                <button onclick="setDiscoveredFilter('verified')" id="disc-flt-verified" class="px-3 py-2 rounded-xl text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/80 border border-slate-800 hover:border-slate-700 transition flex items-center gap-1.5">
+                                    <span>⚡ قنوات مفحوصة (Scanned)</span>
+                                </button>
+                                <button onclick="setDiscoveredFilter('exchange_hubs')" id="disc-flt-hubs" class="px-3 py-2 rounded-xl text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/80 border border-slate-800 hover:border-slate-700 transition">
+                                    <span>🔄 Hubs & Seeds</span>
+                                </button>
+                                <button onclick="setDiscoveredFilter('pending_scan')" id="disc-flt-pending" class="px-3 py-2 rounded-xl text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/80 border border-slate-800 hover:border-slate-700 transition">
+                                    <span>⏳ قيد الفحص</span>
+                                </button>
+                                <button onclick="setDiscoveredFilter('rejected')" id="disc-flt-rejected" class="px-3 py-2 rounded-xl text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/80 border border-slate-800 hover:border-slate-700 transition">
+                                    <span>🚫 المستبعدة للديبياج</span>
+                                </button>
+                                <button onclick="setDiscoveredFilter('all')" id="disc-flt-all" class="px-3 py-2 rounded-xl text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/80 border border-slate-800 hover:border-slate-700 transition">
+                                    <span>🌐 جميع القنوات</span>
+                                </button>
                             </div>
-                            <button onclick="fetchDiscovered24h()" class="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 transition text-xs font-medium rounded-xl text-slate-300 flex items-center gap-1.5 cursor-pointer">
-                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-                                <span>Refresh</span>
-                            </button>
-                            <button onclick="triggerNetworkRecalculate()" id="btn-recalc-network" class="px-3.5 py-2 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 transition text-xs font-semibold rounded-xl text-white flex items-center gap-1.5 cursor-pointer shadow-lg shadow-purple-600/20" title="Detect exchange hubs, mutual clusters, and harvest graph targets">
-                                <span>⚡ Recalculate Network</span>
-                            </button>
-                        </div>
-                    </div>
 
-                    <!-- Batch Actions Toolbar -->
-                    <div class="pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3 bg-slate-950/40 p-3 rounded-xl">
-                        <div class="flex items-center space-x-3 text-xs">
-                            <span class="text-slate-400 font-medium">Selected for Outreach:</span>
-                            <span id="disc-selected-count" class="font-bold text-indigo-400">0 channels</span>
-                            <span class="text-slate-600">|</span>
-                            <span id="disc-total-matched" class="text-slate-400">Showing 0 channels</span>
+                            <!-- Right: Tier & Search Inputs -->
+                            <div class="flex flex-wrap items-center gap-3">
+                                <select id="disc-filter-tier" onchange="setDiscoveredTier(this.value)" class="p-2.5 rounded-xl glassmorphism-input text-slate-200 text-xs bg-slate-900 border border-slate-800 font-medium">
+                                    <option value="all">جميع المستويات (All Tiers)</option>
+                                    <option value="Tier_A">Tier A (Elite VIP)</option>
+                                    <option value="Tier_B">Tier B (Signals)</option>
+                                    <option value="Tier_C">Tier C (Standard)</option>
+                                    <option value="Tier_D">Tier D (General)</option>
+                                </select>
+                                <div class="relative">
+                                    <input type="text" id="disc-search-input" onkeyup="onDiscoveredSearch(event)" placeholder="بحث بالاسم أو @اليوزر أو البايو..." class="p-2.5 pl-9 rounded-xl glassmorphism-input text-slate-200 text-xs w-60 md:w-72 bg-slate-900 border border-slate-800 focus:border-indigo-500">
+                                    <svg class="w-4 h-4 text-slate-400 absolute left-3 top-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                                </div>
+                                <button onclick="fetchDiscovered24h()" class="px-4 py-2.5 bg-slate-800 hover:bg-slate-700 transition text-xs font-semibold rounded-xl text-slate-200 flex items-center gap-2 cursor-pointer border border-slate-700/60 shadow">
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                    <span>تحديث</span>
+                                </button>
+                            </div>
                         </div>
-                        <div class="flex items-center space-x-2">
-                            <button onclick="batchApproveDiscovered()" id="disc-batch-approve-btn" class="px-4 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 transition text-xs font-semibold rounded-xl text-white shadow-lg shadow-emerald-600/20 flex items-center space-x-1.5 disabled:opacity-50 cursor-pointer">
-                                <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
-                                <span>Approve Selected Leads for Outreach</span>
-                            </button>
+
+                        <!-- Batch Actions Toolbar -->
+                        <div class="pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3 bg-slate-950/60 p-3.5 rounded-xl border border-slate-900">
+                            <div class="flex items-center space-x-3 text-xs">
+                                <span class="text-slate-400 font-medium">القنوات المحددة للإرسال:</span>
+                                <span id="disc-selected-count" class="font-bold font-mono text-indigo-400">0 channels</span>
+                                <span class="text-slate-700">|</span>
+                                <span id="disc-total-matched" class="text-slate-400 font-mono">Showing 0 channels</span>
+                            </div>
+                            <div class="flex items-center space-x-2">
+                                <button onclick="batchApproveDiscovered()" id="disc-batch-approve-btn" class="px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 transition text-xs font-bold rounded-xl text-white shadow-lg shadow-emerald-600/30 flex items-center space-x-2 disabled:opacity-40 cursor-pointer">
+                                    <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
+                                    <span>الموافقة الجماعية على القنوات المحددة لحملة الإرسال الآمنة</span>
+                                </button>
+                            </div>
                         </div>
                     </div>
                 </div>
 
-                <!-- 24h Channels Table -->
-                <div class="glassmorphism rounded-2xl shadow-xl overflow-hidden flex flex-col">
-                    <div class="px-6 py-4 border-b border-slate-900 flex justify-between items-center bg-slate-950/40">
-                        <div>
-                            <h3 class="text-sm font-semibold uppercase tracking-wider text-slate-300">Channels Discovered in Last 24 Hours</h3>
-                            <p class="text-xs text-slate-500 mt-0.5">Real-time rolling ledger. Check channels to approve them into Tamer's safe outreach campaign.</p>
+                <!-- 24h Channels High-Density Intelligence Ledger Table -->
+                <div class="bezel-shell">
+                    <div class="bezel-core overflow-hidden flex flex-col">
+                        <div class="px-6 py-4.5 border-b border-slate-800/80 flex flex-col sm:flex-row justify-between sm:items-center gap-2 bg-slate-950/50">
+                            <div>
+                                <h3 class="text-sm font-bold uppercase tracking-wider text-slate-200 flex items-center gap-2">
+                                    <span>💎 جدول استخبارات وتحليل قنوات اليوم المكتشفة</span>
+                                    <span class="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 font-mono">Real-Time Ledger</span>
+                                </h3>
+                                <p class="text-xs text-slate-400 mt-0.5">يعرض أسماء القنوات وبياناتها الكاملة، درجات الملاءمة، ووسائل التواصل للتحليل والموافقة الفورية.</p>
+                            </div>
+                            <span id="disc24-auto-refresh-label" class="text-xs font-mono text-emerald-400/90 bg-emerald-950/40 border border-emerald-500/30 px-3 py-1 rounded-full flex items-center gap-2 self-start sm:self-auto">
+                                <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                                <span>Auto-refresh: 60s</span>
+                            </span>
                         </div>
-                        <span id="disc24-auto-refresh-label" class="text-[11px] text-emerald-400/80 bg-emerald-950/40 border border-emerald-500/20 px-2.5 py-1 rounded-full flex items-center gap-1.5">
-                            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                            <span>Auto-refresh: 60s</span>
-                        </span>
-                    </div>
-                    <div class="overflow-x-auto">
-                        <table class="w-full text-left border-collapse text-xs">
-                            <thead>
-                                <tr class="bg-slate-900/80 border-b border-slate-900 text-slate-400 font-medium">
-                                    <th class="px-4 py-3 text-center w-[45px]">
-                                        <input type="checkbox" id="disc-select-all" onclick="toggleSelectAllDiscovered(this)" class="h-4 w-4 bg-slate-900 border-slate-700 rounded text-indigo-600 accent-indigo-500 cursor-pointer">
-                                    </th>
-                                    <th class="px-4 py-3">Channel / Handle</th>
-                                    <th class="px-4 py-3 text-center">Type</th>
-                                    <th class="px-4 py-3 text-right">Members</th>
-                                    <th class="px-4 py-3 text-center">Score</th>
-                                    <th class="px-4 py-3 text-center">Tier</th>
-                                    <th class="px-4 py-3 text-center">Arabic Ratio</th>
-                                    <th class="px-4 py-3">Direct Contact</th>
-                                    <th class="px-4 py-3">Discovery Source</th>
-                                    <th class="px-4 py-3">Discovered</th>
-                                    <th class="px-4 py-3 text-center">Campaign State</th>
-                                    <th class="px-4 py-3 text-center">Action</th>
-                                </tr>
-                            </thead>
-                            <tbody id="discovered-24h-body" class="divide-y divide-slate-900/40 text-slate-300">
-                                <tr>
-                                    <td colspan="12" class="px-6 py-12 text-center text-slate-500">Loading 24-hour discovery ledger...</td>
-                                </tr>
-                            </tbody>
-                        </table>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-left border-collapse text-xs">
+                                <thead>
+                                    <tr class="bg-slate-900/90 border-b border-slate-800 text-slate-400 font-semibold tracking-wider uppercase text-[11px]">
+                                        <th class="px-4 py-3.5 text-center w-[45px]">
+                                            <input type="checkbox" id="disc-select-all" onclick="toggleSelectAllDiscovered(this)" class="h-4 w-4 bg-slate-900 border-slate-700 rounded text-indigo-600 accent-indigo-500 cursor-pointer">
+                                        </th>
+                                        <th class="px-4 py-3.5">هوية القناة واسمها الرسمي</th>
+                                        <th class="px-4 py-3.5 text-center">الأولوية والنوع</th>
+                                        <th class="px-4 py-3.5 text-right">المشتركون</th>
+                                        <th class="px-4 py-3.5 text-center">نقاط الملاءمة</th>
+                                        <th class="px-4 py-3.5 text-center">المحتوى العربي</th>
+                                        <th class="px-4 py-3.5">وسيلة التواصل المباشرة</th>
+                                        <th class="px-4 py-3.5">مصدر الاكتشاف</th>
+                                        <th class="px-4 py-3.5">حالة الفحص والتشخيص</th>
+                                        <th class="px-4 py-3.5 text-center">إجراءات</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="discovered-24h-body" class="divide-y divide-slate-800/60 text-slate-300">
+                                    <tr>
+                                        <td colspan="10" class="px-6 py-12 text-center text-slate-500 font-medium">جاري تحميل سجل الاستخبارات اللحظي...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
                     </div>
                 </div>
             </div>
+
+            <!-- Slide-over Channel Intelligence Dossier Drawer -->
+            <div id="channel-dossier-backdrop" onclick="closeChannelDossier()" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-[99] hidden transition-opacity duration-300"></div>
+            <aside id="channel-dossier-drawer" class="fixed top-0 right-0 h-full w-full max-w-xl bg-slate-950 border-l border-slate-800 shadow-2xl z-[100] transform translate-x-full transition-transform duration-300 ease-out flex flex-col overflow-hidden">
+                <!-- Drawer Header -->
+                <div class="p-6 border-b border-slate-800/80 bg-slate-900/60 flex items-start justify-between">
+                    <div class="flex items-center gap-3.5">
+                        <div id="dossier-avatar" class="w-12 h-12 rounded-2xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center font-bold text-lg text-white shadow-lg shadow-indigo-500/20 font-mono">
+                            FX
+                        </div>
+                        <div>
+                            <h3 id="dossier-title" class="text-base font-bold text-white tracking-tight leading-snug">Channel Title</h3>
+                            <div class="flex items-center gap-2 mt-1">
+                                <span id="dossier-username" class="text-xs text-indigo-400 font-mono font-semibold">@username</span>
+                                <a id="dossier-tme-link" href="#" target="_blank" class="text-xs text-slate-400 hover:text-white flex items-center gap-1 transition bg-slate-800/80 px-2 py-0.5 rounded-md border border-slate-700/60">
+                                    <span>↗ فتح في تليجرام</span>
+                                </a>
+                            </div>
+                        </div>
+                    </div>
+                    <button onclick="closeChannelDossier()" class="p-2 text-slate-400 hover:text-white rounded-xl hover:bg-slate-800/80 transition cursor-pointer">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </div>
+
+                <!-- Drawer Body Scrollable Content -->
+                <div class="flex-1 overflow-y-auto p-6 space-y-6 text-xs text-slate-300">
+                    <!-- Diagnostic Status Box -->
+                    <div id="dossier-diagnostic-box" class="p-4 rounded-xl border flex items-start gap-3 bg-slate-900/60 border-slate-800">
+                        <span id="dossier-diagnostic-icon" class="text-lg">🔍</span>
+                        <div class="flex-1">
+                            <h4 class="font-bold text-slate-200">حالة الفحص والتشخيص الذكي (Diagnostic Status)</h4>
+                            <p id="dossier-diagnostic-text" class="text-slate-300 mt-1 leading-relaxed">جاري قراءة تقرير القناة...</p>
+                        </div>
+                    </div>
+
+                    <!-- Channel Bio & Description -->
+                    <div class="space-y-2">
+                        <div class="flex items-center justify-between">
+                            <h4 class="text-xs font-bold uppercase tracking-wider text-slate-400">وصف وبايو القناة (Bio & Description)</h4>
+                            <span id="dossier-bio-length" class="text-[10px] text-slate-500 font-mono">0 chars</span>
+                        </div>
+                        <div id="dossier-bio" class="p-4 rounded-xl bg-slate-900/90 border border-slate-800/80 text-slate-200 leading-relaxed font-sans whitespace-pre-wrap max-h-48 overflow-y-auto selection:bg-indigo-500/40">
+                            لا يوجد وصف مسجل للقناة.
+                        </div>
+                    </div>
+
+                    <!-- Intelligence Scores Grid -->
+                    <div class="space-y-2.5">
+                        <h4 class="text-xs font-bold uppercase tracking-wider text-slate-400">تفكيك الدرجات الاستخباراتية (Intelligence Scores)</h4>
+                        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 font-mono">
+                            <div class="p-3.5 rounded-xl bg-slate-900/80 border border-slate-800 text-center">
+                                <span class="text-[10px] text-slate-400 block mb-0.5">Forex Intent</span>
+                                <span id="dossier-score-forex" class="text-xl font-bold text-emerald-400">0</span>
+                            </div>
+                            <div class="p-3.5 rounded-xl bg-slate-900/80 border border-slate-800 text-center">
+                                <span class="text-[10px] text-slate-400 block mb-0.5">Commercial Fit</span>
+                                <span id="dossier-score-fit" class="text-xl font-bold text-indigo-400">0</span>
+                            </div>
+                            <div class="p-3.5 rounded-xl bg-slate-900/80 border border-slate-800 text-center">
+                                <span class="text-[10px] text-slate-400 block mb-0.5">Arabic Ratio</span>
+                                <span id="dossier-score-arabic" class="text-xl font-bold text-cyan-400">0%</span>
+                            </div>
+                            <div class="p-3.5 rounded-xl bg-slate-900/80 border border-slate-800 text-center">
+                                <span class="text-[10px] text-slate-400 block mb-0.5">Cross-Promo</span>
+                                <span id="dossier-score-affinity" class="text-xl font-bold text-purple-400">0%</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Direct Contacts -->
+                    <div class="space-y-2">
+                        <h4 class="text-xs font-bold uppercase tracking-wider text-slate-400">جهات التواصل المباشرة (Direct Contacts)</h4>
+                        <div id="dossier-contacts-container" class="space-y-2">
+                            <!-- Populated dynamically -->
+                        </div>
+                    </div>
+
+                    <!-- Detected Offerings -->
+                    <div class="space-y-2">
+                        <h4 class="text-xs font-bold uppercase tracking-wider text-slate-400">الخدمات والعروض المكتشفة (Detected Monetization)</h4>
+                        <div id="dossier-offerings" class="flex flex-wrap gap-2">
+                            <!-- Populated dynamically -->
+                        </div>
+                    </div>
+
+                    <!-- Discovery Provenance Tree -->
+                    <div class="space-y-2">
+                        <h4 class="text-xs font-bold uppercase tracking-wider text-slate-400">شجرة ومسار الاكتشاف (Discovery Provenance)</h4>
+                        <div class="p-4 rounded-xl bg-slate-900/80 border border-slate-800 space-y-2.5">
+                            <div class="flex justify-between items-center text-xs">
+                                <span class="text-slate-400">Referring Source (القناة الأم):</span>
+                                <span id="dossier-source" class="font-mono text-indigo-300 font-semibold">@source</span>
+                            </div>
+                            <div class="flex justify-between items-center text-xs">
+                                <span class="text-slate-400">Discovery Method:</span>
+                                <span id="dossier-method" class="text-slate-200 font-medium">Graph Expansion</span>
+                            </div>
+                            <div class="flex justify-between items-center text-xs">
+                                <span class="text-slate-400">Discovered At:</span>
+                                <span id="dossier-time" class="text-slate-300 font-mono">-</span>
+                            </div>
+                            <div class="flex justify-between items-center text-xs">
+                                <span class="text-slate-400">Priority Reason:</span>
+                                <span id="dossier-priority-reason" class="text-slate-300 italic">-</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Drawer Footer Actions -->
+                <div class="p-5 border-t border-slate-800/80 bg-slate-900/80 flex items-center justify-between gap-3">
+                    <button id="dossier-reject-btn" class="px-4 py-2.5 bg-rose-950/40 hover:bg-rose-900/40 text-rose-300 border border-rose-800/40 rounded-xl transition text-xs font-semibold cursor-pointer">
+                        🚫 استبعاد وتدريب الفلتر
+                    </button>
+                    <button id="dossier-approve-btn" class="flex-1 px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl transition text-xs flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/30 cursor-pointer">
+                        <span>✅ إدراج فوري في حملة الإرسال الآمنة</span>
+                    </button>
+                </div>
+            </aside>
 
         </main>
 
@@ -3641,29 +3884,27 @@ DASHBOARD_PAGE_HTML = """
             };
 
             // ── Discovered 24h State & Handlers ────────────────────────────────
-            let discFilterStatus = 'verified';
+            let discFilterStatus = 'qualified';
             let discFilterTier = 'all';
             let discSearchQuery = '';
             let discSelectedLeads = new Set();
             let discAutoRefreshTimer = null;
+            window.discChannelsMap = {};
 
             function setDiscoveredFilter(status) {
                 discFilterStatus = status;
                 const buttons = {
-                    'verified': document.getElementById('disc-flt-verified'),
                     'qualified': document.getElementById('disc-flt-qualified'),
-                    'exchange_hubs': document.getElementById('disc-flt-hubs'),
-                    'exchange_seeds': document.getElementById('disc-flt-seeds'),
-                    'sweet_spot': document.getElementById('disc-flt-sweetspot'),
-                    'high_affinity': document.getElementById('disc-flt-affinity'),
                     'with_contact': document.getElementById('disc-flt-contact'),
+                    'verified': document.getElementById('disc-flt-verified'),
+                    'exchange_hubs': document.getElementById('disc-flt-hubs'),
                     'pending_scan': document.getElementById('disc-flt-pending'),
                     'rejected': document.getElementById('disc-flt-rejected'),
                     'all': document.getElementById('disc-flt-all')
                 };
-                const activeClass = "px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-500 text-white transition";
-                const inactiveClass = "px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/60 border border-slate-800 transition";
-                
+                const activeClass = "px-3.5 py-2 rounded-xl text-xs font-bold bg-indigo-600 text-white shadow-lg shadow-indigo-600/30 transition flex items-center gap-1.5 cursor-pointer";
+                const inactiveClass = "px-3.5 py-2 rounded-xl text-xs font-semibold text-slate-400 hover:text-slate-200 bg-slate-900/80 border border-slate-800 hover:border-slate-700 transition flex items-center gap-1.5 cursor-pointer";
+
                 Object.keys(buttons).forEach(k => {
                     if (buttons[k]) buttons[k].className = (k === status ? activeClass : inactiveClass);
                 });
@@ -3714,26 +3955,34 @@ DASHBOARD_PAGE_HTML = """
                 if (counter) counter.innerText = `${count} channel${count === 1 ? '' : 's'}`;
                 if (batchBtn) {
                     batchBtn.disabled = count === 0;
-                    batchBtn.style.opacity = count === 0 ? '0.5' : '1';
+                    batchBtn.style.opacity = count === 0 ? '0.4' : '1';
                 }
+            }
+
+            function copyToClipboard(str, label) {
+                navigator.clipboard.writeText(str).then(() => {
+                    showToast(`تم نسخ ${label || 'النص'} بنجاح!`, 'success');
+                }).catch(() => {
+                    prompt('انسخ الرابط يدوياً:', str);
+                });
             }
 
             function fetchDiscovered24h() {
                 const url = `/api/discovered-24h?status=${discFilterStatus}&tier=${discFilterTier}&search=${encodeURIComponent(discSearchQuery)}&limit=250`;
                 const tbody = document.getElementById('discovered-24h-body');
-                
+
                 fetch(url)
                     .then(res => res.json())
                     .then(data => {
                         if (!data.success) {
-                            if (tbody) tbody.innerHTML = `<tr><td colspan="12" class="px-6 py-8 text-center text-rose-500">Error loading 24h ledger: ${data.error || 'Unknown'}</td></tr>`;
+                            if (tbody) tbody.innerHTML = `<tr><td colspan="10" class="px-6 py-8 text-center text-rose-500 font-semibold">خطأ في جلب بيانات القنوات: ${data.error || 'Unknown'}</td></tr>`;
                             return;
                         }
                         renderDiscovered24h(data);
                     })
                     .catch(err => {
+                        if (tbody) tbody.innerHTML = `<tr><td colspan="10" class="px-6 py-8 text-center text-rose-500 font-semibold">خطأ في الاتصال بالخادم: ${err.message}</td></tr>`;
                         console.error('24h discovery fetch error:', err);
-                        if (tbody) tbody.innerHTML = `<tr><td colspan="12" class="px-6 py-8 text-center text-rose-500">Failed to connect to server API</td></tr>`;
                     });
             }
 
@@ -3742,6 +3991,10 @@ DASHBOARD_PAGE_HTML = """
                 const h = data.system_health || {};
                 const channels = data.channels || [];
 
+                // Store in global lookup
+                window.discChannelsMap = {};
+                channels.forEach(ch => { window.discChannelsMap[ch.id] = ch; });
+
                 // 1. Update KPIs
                 const totalElem = document.getElementById('disc24-total');
                 if (totalElem) totalElem.innerText = (s.total_discovered || 0).toLocaleString();
@@ -3749,45 +4002,46 @@ DASHBOARD_PAGE_HTML = """
                 const qualElem = document.getElementById('disc24-qualified');
                 const qualPct = document.getElementById('disc24-qual-pct');
                 if (qualElem) qualElem.innerText = (s.qualified_count || 0).toLocaleString();
-                if (qualPct) qualPct.innerText = `(${s.qualification_rate || 0}%)`;
+                if (qualPct) qualPct.innerText = `(${s.qualification_rate || 0}% مؤهل)`;
 
                 const contactElem = document.getElementById('disc24-contacts');
                 const contactPct = document.getElementById('disc24-contact-pct');
                 if (contactElem) contactElem.innerText = (s.with_contact_count || 0).toLocaleString();
-                if (contactPct) contactPct.innerText = `(${s.contact_extraction_rate || 0}% of Qualified)`;
+                const contactTotalPct = (s.total_discovered > 0) ? Math.round((s.with_contact_count * 100.0) / s.total_discovered) : 0;
+                if (contactPct) contactPct.innerText = `(${s.qualified_with_contact_count || 0} مؤهل • ${contactTotalPct}% من الإجمالي)`;
 
                 // System Health Badges
                 const healthBadge = document.getElementById('disc24-health-status');
                 const killBadge = document.getElementById('disc24-kill-badge');
                 if (healthBadge) {
                     if (h.kill_switch_active) {
-                        healthBadge.className = "px-2.5 py-0.5 rounded-full text-xs font-semibold bg-rose-500/20 text-rose-300 border border-rose-500/30";
-                        healthBadge.innerText = "Kill Switch Stopped";
+                        healthBadge.className = "px-2.5 py-0.5 rounded-full text-xs font-bold bg-rose-500/20 text-rose-300 border border-rose-500/30";
+                        healthBadge.innerText = "Kill Switch Triggered";
                     } else if (h.outreach_globally_enabled) {
-                        healthBadge.className = "px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30";
+                        healthBadge.className = "px-2.5 py-0.5 rounded-full text-xs font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30";
                         healthBadge.innerText = "Active Safe Outreach";
                     } else {
-                        healthBadge.className = "px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30";
-                        healthBadge.innerText = "Awaiting Activation";
+                        healthBadge.className = "px-2.5 py-0.5 rounded-full text-xs font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30";
+                        healthBadge.innerText = "Ready for Batch";
                     }
                 }
                 if (killBadge) {
-                    killBadge.innerText = h.kill_switch_active ? "KillSwitch: TRIGGERED" : "KillSwitch: STANDBY";
+                    killBadge.innerText = h.kill_switch_active ? "KillSwitch: HALTED" : "Max 12/Day Protected";
                     killBadge.className = h.kill_switch_active
-                        ? "px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-500/30 text-rose-300 border border-rose-500/40"
-                        : "px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30";
+                        ? "px-2 py-0.5 rounded text-[10px] font-bold bg-rose-500/30 text-rose-300 border border-rose-500/40"
+                        : "px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-950/40 text-emerald-400 border border-emerald-500/20 font-mono";
                 }
 
                 // Total matched indicator
                 const matchedElem = document.getElementById('disc-total-matched');
-                if (matchedElem) matchedElem.innerText = `Showing ${channels.length} of ${(s.total_matched || channels.length).toLocaleString()} channels`;
+                if (matchedElem) matchedElem.innerText = `عرض ${channels.length} من ${(data.total_matched || channels.length).toLocaleString()} قناة`;
 
                 // 2. Render Hourly Velocity Chart
                 renderHourlyVelocityChart(s.hourly_throughput || []);
 
                 // 3. Render Tier Breakdown
                 const tierDist = s.tier_distribution || {};
-                const totalDisc = s.total_discovered || 1;
+                const totalDisc = Math.max(1, s.total_discovered || 1);
                 const tierA = tierDist['Tier_A'] || 0;
                 const tierB = tierDist['Tier_B'] || 0;
                 const tierC = tierDist['Tier_C'] || 0;
@@ -3796,34 +4050,37 @@ DASHBOARD_PAGE_HTML = """
                 const elA = document.getElementById('disc24-tier-a');
                 const elAbar = document.getElementById('disc24-tier-a-bar');
                 if (elA) elA.innerText = tierA.toLocaleString();
-                if (elAbar) elAbar.style.width = `${Math.round((tierA / totalDisc) * 100)}%`;
+                if (elAbar) elAbar.style.width = `${Math.min(100, Math.round((tierA / totalDisc) * 100))}%`;
 
                 const elB = document.getElementById('disc24-tier-b');
                 const elBbar = document.getElementById('disc24-tier-b-bar');
                 if (elB) elB.innerText = tierB.toLocaleString();
-                if (elBbar) elBbar.style.width = `${Math.round((tierB / totalDisc) * 100)}%`;
+                if (elBbar) elBbar.style.width = `${Math.min(100, Math.round((tierB / totalDisc) * 100))}%`;
 
                 const elC = document.getElementById('disc24-tier-c');
                 const elCbar = document.getElementById('disc24-tier-c-bar');
                 if (elC) elC.innerText = tierC.toLocaleString();
-                if (elCbar) elCbar.style.width = `${Math.round((tierC / totalDisc) * 100)}%`;
+                if (elCbar) elCbar.style.width = `${Math.min(100, Math.round((tierC / totalDisc) * 100))}%`;
 
                 const elD = document.getElementById('disc24-tier-d');
                 const elDbar = document.getElementById('disc24-tier-d-bar');
                 if (elD) elD.innerText = tierD.toLocaleString();
-                if (elDbar) elDbar.style.width = `${Math.round((tierD / totalDisc) * 100)}%`;
+                if (elDbar) elDbar.style.width = `${Math.min(100, Math.round((tierD / totalDisc) * 100))}%`;
 
                 // 4. Render Top Sources
                 const sourcesContainer = document.getElementById('disc24-top-sources');
                 if (sourcesContainer) {
                     const topSources = s.top_sources || [];
                     if (topSources.length === 0) {
-                        sourcesContainer.innerHTML = `<span class="text-slate-500">No sources logged</span>`;
+                        sourcesContainer.innerHTML = '<span class="text-slate-500">لا توجد مصادر مسجلة خلال 24 ساعة.</span>';
                     } else {
                         sourcesContainer.innerHTML = topSources.slice(0, 5).map(src => `
-                            <div class="flex justify-between items-center text-slate-300">
-                                <span class="font-medium text-slate-400 truncate max-w-[170px]" title="${src.source} (${src.method})">${src.source}</span>
-                                <span class="font-bold text-slate-200">${src.count.toLocaleString()}</span>
+                            <div class="flex items-center justify-between text-xs py-1 border-b border-slate-900 last:border-0">
+                                <span class="font-mono text-indigo-300 truncate max-w-[170px]" title="${src.source}">@${src.source.replace('@','')}</span>
+                                <div class="flex items-center gap-1.5 font-mono">
+                                    <span class="font-bold text-slate-200">${src.discovered_count}</span>
+                                    <span class="text-[10px] text-slate-500">قناة</span>
+                                </div>
                             </div>
                         `).join('');
                     }
@@ -3834,113 +4091,174 @@ DASHBOARD_PAGE_HTML = """
                 if (!tbody) return;
 
                 if (channels.length === 0) {
-                    tbody.innerHTML = `<tr><td colspan="12" class="px-6 py-12 text-center text-slate-500">No channels found matching the selected filters in the last 24 hours.</td></tr>`;
+                    tbody.innerHTML = `
+                        <tr>
+                            <td colspan="10" class="px-6 py-14 text-center">
+                                <div class="max-w-md mx-auto space-y-3">
+                                    <div class="w-12 h-12 rounded-2xl bg-slate-900 border border-slate-800 text-slate-400 flex items-center justify-center mx-auto text-xl">
+                                        🔍
+                                    </div>
+                                    <h4 class="text-slate-200 font-bold text-sm">لا توجد قنوات تطابق الفلتر المحدد حالياً</h4>
+                                    <p class="text-slate-500 text-xs leading-relaxed">
+                                        يمكنك تجربة الضغط على <b>"🌐 جميع القنوات"</b> أو <b>"⚡ قنوات مفحوصة"</b> لرؤية تدفق القنوات المكتشفة اليوم بالكامل.
+                                    </p>
+                                    <button onclick="setDiscoveredFilter('all')" class="mt-2 px-4 py-2 bg-indigo-600/30 hover:bg-indigo-600/50 text-indigo-300 border border-indigo-500/30 rounded-xl text-xs font-semibold transition cursor-pointer">
+                                        عرض جميع قنوات الـ 24 ساعة
+                                    </button>
+                                </div>
+                            </td>
+                        </tr>
+                    `;
                     return;
                 }
 
                 tbody.innerHTML = channels.map(ch => {
                     const isChecked = discSelectedLeads.has(ch.id);
-                    const username = ch.channel_username ? `@${ch.channel_username}` : '(Private)';
-                    const tmeLink = ch.channel_username ? `https://t.me/${ch.channel_username}` : '#';
-                    const isGroup = ch.is_group;
+                    const rawUser = (ch.channel_username || '').replace(/^@/, '');
+                    const username = rawUser ? `@${rawUser}` : '(Private)';
+                    const tmeLink = rawUser ? `https://t.me/${rawUser}` : '#';
+                    const displayTitle = ch.title && ch.title.trim() ? ch.title.trim() : username;
                     const members = (ch.member_count || 0).toLocaleString();
                     const score = ch.lead_score || 0;
                     const forexScore = ch.forex_score || 0;
-                    const arabicRatio = ch.arabic_ratio ? `${Math.round(ch.arabic_ratio * 100)}%` : '0%';
-                    
-                    // Tier badge
-                    let tierBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-400">Tier D</span>`;
-                    if (ch.tier === 'Tier_A') tierBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30">Tier A</span>`;
-                    else if (ch.tier === 'Tier_B') tierBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">Tier B</span>`;
-                    else if (ch.tier === 'Tier_C') tierBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">Tier C</span>`;
+                    const fitScore = ch.commercial_fit_score || 0;
+                    const arabicRatioNum = Math.round((ch.arabic_ratio || 0) * 100);
 
-                    // Contact cell
-                    let contactHtml = `<span class="text-slate-600">—</span>`;
-                    if (ch.contact_username) {
-                        contactHtml = `<a href="https://t.me/${ch.contact_username.replace('@','')}" target="_blank" class="text-cyan-400 hover:text-cyan-300 font-medium">@${ch.contact_username.replace('@','')}</a>`;
-                    } else if (ch.whatsapp) {
-                        contactHtml = `<a href="https://wa.me/${ch.whatsapp.replace(/[^0-9]/g,'')}" target="_blank" class="text-emerald-400 hover:text-emerald-300 font-medium">WA: ${ch.whatsapp}</a>`;
+                    // Category Pill
+                    let catPill = '<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-400 border border-slate-700">فوركس عام</span>';
+                    if (ch.vip) {
+                        catPill = '<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40">👑 VIP Club</span>';
+                    } else if (ch.account_management) {
+                        catPill = '<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">💼 إدارة محافظ</span>';
+                    } else if (ch.copy_trading) {
+                        catPill = '<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-purple-500/20 text-purple-300 border border-purple-500/40">🤝 نسخ صفقات</span>';
+                    } else if (ch.forex_category === 'gold_signals') {
+                        catPill = '<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-yellow-500/20 text-yellow-300 border border-yellow-500/40">🏆 توصيات ذهب</span>';
+                    } else if (forexScore >= 50) {
+                        catPill = '<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-500/20 text-indigo-300 border border-indigo-500/40">📈 إشارات فوركس</span>';
                     }
 
+                    // Priority Badge
+                    const prio = ch.outreach_priority || 'P3';
+                    let prioBadge = '<span class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-slate-800 text-slate-400 border border-slate-700 font-mono">P3</span>';
+                    if (prio === 'P0') {
+                        prioBadge = '<span class="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-gradient-to-r from-amber-500/30 to-yellow-500/30 text-amber-300 border border-amber-500/50 shadow-sm shadow-amber-500/20 font-mono">P0 VIP</span>';
+                    } else if (prio === 'P1') {
+                        prioBadge = '<span class="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-mono">P1 Signals</span>';
+                    } else if (prio === 'P2') {
+                        prioBadge = '<span class="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono">P2 Trading</span>';
+                    }
+
+                    // Direct Contact Cell
+                    let contactHtml = '<span class="text-slate-600 text-[11px] italic">⚠️ غير متوفر</span>';
+                    const directContact = ch.contact_username || ch.admin_username || ch.owner_username;
+                    if (directContact) {
+                        const cleanContact = directContact.replace(/^@/, '');
+                        contactHtml = `
+                            <div class="flex items-center gap-1.5">
+                                <a href="https://t.me/${cleanContact}" target="_blank" class="font-mono text-cyan-400 hover:text-cyan-300 font-semibold text-[11px] truncate max-w-[120px] transition">
+                                    @${cleanContact}
+                                </a>
+                                <button onclick="copyToClipboard('@${cleanContact}', 'يوزر الأدمن')" title="نسخ اليوزر" class="p-1 text-slate-500 hover:text-white rounded bg-slate-900 border border-slate-800 hover:border-slate-700 transition cursor-pointer">
+                                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                                </button>
+                            </div>
+                        `;
+                    } else if (ch.whatsapp) {
+                        const cleanWA = ch.whatsapp.replace(/[^0-9]/g, '');
+                        contactHtml = `
+                            <a href="https://wa.me/${cleanWA}" target="_blank" class="font-mono text-emerald-400 hover:text-emerald-300 font-semibold text-[11px] flex items-center gap-1">
+                                <span>WA: ${ch.whatsapp}</span>
+                            </a>
+                        `;
+                    }
+
+                    // Diagnostic Badge
+                    const diagText = ch.diagnostic_status || '📊 قيد المراقبة';
+                    const diagClass = ch.diagnostic_class || 'bg-slate-800 text-slate-400 border-slate-700';
+
                     // Relative discovery time
-                    let discTimeStr = 'recently';
+                    let discTimeStr = 'اليوم';
                     if (ch.discovered_at) {
                         const discDate = new Date(ch.discovered_at);
                         const diffMins = Math.round((new Date() - discDate) / 60000);
-                        if (diffMins < 60) discTimeStr = `${diffMins}m ago`;
+                        if (diffMins < 60) discTimeStr = `منذ ${diffMins} دقيقة`;
                         else {
                             const hours = Math.floor(diffMins / 60);
-                            discTimeStr = `${hours}h ${diffMins % 60}m ago`;
+                            discTimeStr = `منذ ${hours} ساعة`;
                         }
                     }
 
-                    // Campaign status badge
-                    let campStatusBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-400">Not Enrolled</span>`;
+                    // Enrolled Action
                     const cs = ch.campaign_status;
-                    if (cs === 'approved') campStatusBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">Approved</span>`;
-                    else if (cs === 'sent') campStatusBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">Sent</span>`;
-                    else if (cs === 'pending_review' || cs === 'pending') campStatusBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30">Pending</span>`;
-                    else if (cs === 'failed') campStatusBadge = `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-500/20 text-rose-300 border border-rose-500/30">Failed</span>`;
-
-                    // Single action buttons
                     const isApproved = cs === 'approved' || cs === 'sent';
-                    const actionBtn = isApproved
-                        ? `<button disabled class="px-2 py-1 text-[11px] font-semibold bg-slate-800/80 text-emerald-400 rounded-lg cursor-not-allowed">✓ Enrolled</button>`
-                        : `<button onclick="approveDiscoveredLead('${ch.id}')" class="px-2 py-1 text-[11px] font-semibold bg-emerald-600/30 hover:bg-emerald-600/50 text-emerald-300 border border-emerald-500/30 rounded-lg transition cursor-pointer">✓ Approve</button>`;
-                    const rejectBtn = `<button onclick="rejectDiscoveredLead('${ch.id}', '${(ch.channel_username || '').replace(/'/g, "\\'")}')" class="px-2 py-1 text-[11px] font-semibold bg-rose-600/20 hover:bg-rose-600/40 text-rose-300 border border-rose-500/30 rounded-lg transition cursor-pointer" title="استبعاد وتعلم من القناة لمنع تكرارها">🚫 Reject</button>`;
-
-                    // Exchange Badges
-                    let exchangeBadges = '';
-                    if (ch.is_exchange_hub) {
-                        exchangeBadges += `<span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30 mr-1" title="Exchange Hub: Connected to multiple channels">🔄 Hub</span>`;
-                    }
-                    if (ch.is_exchange_seed) {
-                        exchangeBadges += `<span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 mr-1" title="Exchange Seed: High-expansion node">🌱 Seed</span>`;
-                    }
-                    const numMembers = ch.member_count || 0;
-                    if (numMembers >= 1000 && numMembers <= 35000) {
-                        exchangeBadges += `<span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 mr-1" title="Sweet Spot: 1k–35k members (optimal for mutual shoutouts)">🎯 Sweet Spot</span>`;
-                    }
-                    if ((ch.exchange_affinity_score || 0) >= 35) {
-                        exchangeBadges += `<span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-purple-500/20 text-purple-300 border border-purple-500/30 mr-1" title="Exchange Affinity: ${ch.exchange_affinity_score}% evidence of cross-promotions">🤝 Affinity: ${ch.exchange_affinity_score}%</span>`;
-                    }
 
                     return `
-                        <tr class="hover:bg-slate-900/40 transition">
-                            <td class="px-4 py-3 text-center">
+                        <tr class="hover:bg-slate-900/60 transition group border-b border-slate-800/40">
+                            <td class="px-4 py-3.5 text-center">
                                 <input type="checkbox" data-id="${ch.id}" ${isChecked ? 'checked' : ''} onchange="toggleDiscoveredLead('${ch.id}')" class="disc-row-cb h-4 w-4 bg-slate-900 border-slate-700 rounded text-indigo-600 accent-indigo-500 cursor-pointer">
                             </td>
-                            <td class="px-4 py-3">
-                                <div class="flex items-center space-x-1.5">
-                                    <a href="${tmeLink}" target="_blank" class="font-semibold text-slate-100 hover:text-indigo-300 truncate max-w-[220px]">${ch.title ? ch.title : '@' + username}</a>
+                            <td class="px-4 py-3.5">
+                                <div class="flex items-center gap-2">
+                                    <a href="${tmeLink}" target="_blank" class="font-bold text-slate-100 hover:text-indigo-400 text-xs tracking-tight truncate max-w-[200px] transition" title="${displayTitle}">
+                                        ${displayTitle}
+                                    </a>
                                 </div>
-                                ${ch.title ? `<div class="text-[10px] text-indigo-400 font-mono">@${username}</div>` : ''}
-                                ${exchangeBadges ? `<div class="mt-1 flex flex-wrap items-center gap-1">${exchangeBadges}</div>` : ''}
-                                <div class="text-[11px] text-slate-500 truncate max-w-[220px] mt-0.5" title="${(ch.description || '').replace(/"/g, '&quot;')}">${ch.description || 'No description'}</div>
+                                <div class="flex items-center gap-2 mt-1">
+                                    <span class="font-mono text-[11px] text-indigo-400/90 font-medium">${username}</span>
+                                    ${catPill}
+                                </div>
+                                <p class="text-[11px] text-slate-500 truncate max-w-[240px] mt-1" title="${(ch.description || '').replace(/"/g, '&quot;')}">
+                                    ${ch.description ? ch.description : '<span class="italic text-slate-600">لا يوجد بايو مسجل</span>'}
+                                </p>
                             </td>
-                            <td class="px-4 py-3 text-center">
-                                <span class="px-1.5 py-0.5 rounded text-[10px] font-medium ${isGroup ? 'bg-purple-950/60 text-purple-300 border border-purple-800/40' : 'bg-blue-950/60 text-blue-300 border border-blue-800/40'}">
-                                    ${isGroup ? 'Group' : 'Channel'}
+                            <td class="px-4 py-3.5 text-center">
+                                <div class="flex flex-col items-center gap-1">
+                                    ${prioBadge}
+                                    <span class="text-[10px] text-slate-500 font-mono">${ch.is_group ? 'Group' : 'Channel'}</span>
+                                </div>
+                            </td>
+                            <td class="px-4 py-3.5 text-right font-mono font-bold text-slate-200">
+                                ${members}
+                            </td>
+                            <td class="px-4 py-3.5 text-center font-mono">
+                                <span class="font-bold text-sm ${forexScore >= 50 ? 'text-emerald-400' : 'text-slate-300'}">${forexScore}</span>
+                                <span class="text-[10px] text-slate-500 block">Fit: ${fitScore}</span>
+                            </td>
+                            <td class="px-4 py-3.5 text-center">
+                                <div class="flex flex-col items-center gap-1">
+                                    <span class="font-mono font-bold text-xs ${arabicRatioNum >= 40 ? 'text-cyan-400' : 'text-slate-400'}">${arabicRatioNum}%</span>
+                                    <div class="w-12 bg-slate-800 rounded-full h-1 overflow-hidden">
+                                        <div class="bg-cyan-500 h-1 rounded-full" style="width: ${arabicRatioNum}%"></div>
+                                    </div>
+                                </div>
+                            </td>
+                            <td class="px-4 py-3.5">
+                                ${contactHtml}
+                            </td>
+                            <td class="px-4 py-3.5">
+                                <span class="font-mono text-[11px] text-indigo-300/90 block truncate max-w-[120px]" title="${ch.discovery_source || 'system'}">
+                                    @${(ch.discovery_source || 'system').replace(/^@/,'')}
+                                </span>
+                                <span class="text-[10px] text-slate-500 block mt-0.5">${ch.discovery_method || 'graph'} • ${discTimeStr}</span>
+                            </td>
+                            <td class="px-4 py-3.5">
+                                <span class="px-2.5 py-1 rounded-lg text-[10px] font-semibold border ${diagClass} inline-block leading-tight">
+                                    ${diagText}
                                 </span>
                             </td>
-                            <td class="px-4 py-3 text-right font-medium text-slate-300">${members}</td>
-                            <td class="px-4 py-3 text-center">
-                                <span class="font-bold ${score >= 50 ? 'text-emerald-400' : 'text-slate-300'}">${score}</span>
-                                <span class="text-[10px] text-slate-500 block">FX: ${forexScore} | Exch: ${ch.exchange_affinity_score || 0}%</span>
-                            </td>
-                            <td class="px-4 py-3 text-center">${tierBadge}</td>
-                            <td class="px-4 py-3 text-center font-medium text-slate-400">${arabicRatio}</td>
-                            <td class="px-4 py-3">${contactHtml}</td>
-                            <td class="px-4 py-3">
-                                <span class="text-[11px] text-slate-400 block truncate max-w-[120px]">${ch.discovery_source || 'system'}</span>
-                                <span class="text-[10px] text-slate-500">${ch.discovery_method || ''}</span>
-                            </td>
-                            <td class="px-4 py-3 text-slate-400 whitespace-nowrap">${discTimeStr}</td>
-                            <td class="px-4 py-3 text-center">${campStatusBadge}</td>
-                            <td class="px-4 py-3 text-center">
+                            <td class="px-4 py-3.5 text-center">
                                 <div class="flex items-center justify-center gap-1.5">
-                                    ${actionBtn}
-                                    ${rejectBtn}
+                                    <button onclick="openChannelDossier('${ch.id}')" title="فتح الملف الاستخباراتي الكامل" class="px-2.5 py-1 text-[11px] font-bold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg transition flex items-center gap-1 cursor-pointer">
+                                        🔍 ملف
+                                    </button>
+                                    ${isApproved 
+                                        ? `<button disabled class="px-2.5 py-1 text-[11px] font-semibold bg-emerald-950/40 text-emerald-400 rounded-lg border border-emerald-500/20 cursor-not-allowed">✓ مدرج</button>`
+                                        : `<button onclick="approveDiscoveredLead('${ch.id}')" title="موافقة وإدراج فوري في الحملة" class="px-2.5 py-1 text-[11px] font-bold bg-emerald-600/30 hover:bg-emerald-600/50 text-emerald-300 border border-emerald-500/40 rounded-lg transition cursor-pointer">⚡ إدراج</button>`
+                                    }
+                                    <button onclick="rejectDiscoveredLead('${ch.id}', '${rawUser}')" title="استبعاد وتدريب الفلتر" class="p-1 text-slate-500 hover:text-rose-400 rounded-lg hover:bg-rose-950/30 transition cursor-pointer">
+                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                                    </button>
                                 </div>
                             </td>
                         </tr>
@@ -3950,47 +4268,175 @@ DASHBOARD_PAGE_HTML = """
                 updateDiscoveredSelectionUI();
             }
 
+            function openChannelDossier(channelId) {
+                const ch = window.discChannelsMap[channelId];
+                if (!ch) return;
+
+                const rawUser = (ch.channel_username || '').replace(/^@/, '');
+                const displayTitle = ch.title && ch.title.trim() ? ch.title.trim() : (rawUser ? '@' + rawUser : 'Private Channel');
+                
+                // Header
+                const avatar = document.getElementById('dossier-avatar');
+                if (avatar) avatar.innerText = displayTitle.slice(0, 2).toUpperCase();
+
+                const titleEl = document.getElementById('dossier-title');
+                if (titleEl) titleEl.innerText = displayTitle;
+
+                const userEl = document.getElementById('dossier-username');
+                if (userEl) userEl.innerText = rawUser ? `@${rawUser}` : '(Private Channel)';
+
+                const tmeLink = document.getElementById('dossier-tme-link');
+                if (tmeLink) {
+                    tmeLink.href = rawUser ? `https://t.me/${rawUser}` : '#';
+                    tmeLink.style.display = rawUser ? 'inline-flex' : 'none';
+                }
+
+                // Diagnostic
+                const diagBox = document.getElementById('dossier-diagnostic-box');
+                const diagText = document.getElementById('dossier-diagnostic-text');
+                if (diagText) diagText.innerText = ch.diagnostic_status || 'قيد المراقبة';
+                if (diagBox) diagBox.className = `p-4 rounded-xl border flex items-start gap-3 ${ch.diagnostic_class || 'bg-slate-900/60 border-slate-800'}`;
+
+                // Bio
+                const bioEl = document.getElementById('dossier-bio');
+                const bioLen = document.getElementById('dossier-bio-length');
+                if (bioEl) {
+                    const desc = ch.description || 'لا يوجد بايو مسجل للقناة في قاعدة البيانات.';
+                    bioEl.innerText = desc;
+                }
+                if (bioLen) bioLen.innerText = `${(ch.description || '').length} حروف`;
+
+                // Scores
+                const sForex = document.getElementById('dossier-score-forex');
+                if (sForex) sForex.innerText = ch.forex_score || 0;
+
+                const sFit = document.getElementById('dossier-score-fit');
+                if (sFit) sFit.innerText = ch.commercial_fit_score || 0;
+
+                const sArabic = document.getElementById('dossier-score-arabic');
+                if (sArabic) sArabic.innerText = `${Math.round((ch.arabic_ratio || 0) * 100)}%`;
+
+                const sAffinity = document.getElementById('dossier-score-affinity');
+                if (sAffinity) sAffinity.innerText = `${ch.exchange_affinity_score || 0}%`;
+
+                // Direct Contacts
+                const contactsBox = document.getElementById('dossier-contacts-container');
+                if (contactsBox) {
+                    const contactsList = [];
+                    if (ch.contact_username) contactsList.push({ type: 'Admin Handle', val: '@' + ch.contact_username.replace(/^@/,''), link: 'https://t.me/' + ch.contact_username.replace(/^@/,'') });
+                    if (ch.admin_username) contactsList.push({ type: 'Admin Listed', val: '@' + ch.admin_username.replace(/^@/,''), link: 'https://t.me/' + ch.admin_username.replace(/^@/,'') });
+                    if (ch.owner_username) contactsList.push({ type: 'Channel Owner', val: '@' + ch.owner_username.replace(/^@/,''), link: 'https://t.me/' + ch.owner_username.replace(/^@/,'') });
+                    if (ch.whatsapp) contactsList.push({ type: 'WhatsApp Business', val: ch.whatsapp, link: 'https://wa.me/' + ch.whatsapp.replace(/[^0-9]/g,'') });
+
+                    if (contactsList.length === 0) {
+                        contactsBox.innerHTML = '<span class="text-slate-500 italic">لم يتم استخراج جهات اتصال مباشرة حتى الآن.</span>';
+                    } else {
+                        contactsBox.innerHTML = contactsList.map(c => `
+                            <div class="flex items-center justify-between p-3 rounded-xl bg-slate-900/90 border border-slate-800">
+                                <div>
+                                    <span class="text-[10px] text-slate-400 block">${c.type}</span>
+                                    <span class="font-mono font-bold text-cyan-300 text-xs">${c.val}</span>
+                                </div>
+                                <div class="flex items-center gap-2">
+                                    <button onclick="copyToClipboard('${c.val}', '${c.type}')" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[11px] transition">نسخ</button>
+                                    <a href="${c.link}" target="_blank" class="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded text-[11px] transition">مراسلة ↗</a>
+                                </div>
+                            </div>
+                        `).join('');
+                    }
+                }
+
+                // Detected Offerings
+                const offeringsBox = document.getElementById('dossier-offerings');
+                if (offeringsBox) {
+                    const tags = [];
+                    if (ch.vip) tags.push('👑 VIP Club / قناة مدفوعة');
+                    if (ch.account_management) tags.push('💼 إدارة محافظ');
+                    if (ch.copy_trading) tags.push('🤝 نسخ صفقات');
+                    if (ch.funded_accounts) tags.push('🏢 حسابات ممولة (Prop Firms)');
+                    if (ch.subscription) tags.push('📅 اشتراكات شهرية/سنوية');
+                    if (ch.forex_category === 'gold_signals') tags.push('🏆 توصيات ذهب XAUUSD');
+                    
+                    if (tags.length === 0) {
+                        offeringsBox.innerHTML = '<span class="text-slate-500 italic">لم تُرصد خدمات تجارية صريحة بعد.</span>';
+                    } else {
+                        offeringsBox.innerHTML = tags.map(t => `<span class="px-2.5 py-1 rounded-lg text-xs font-semibold bg-indigo-500/10 text-indigo-300 border border-indigo-500/20">${t}</span>`).join('');
+                    }
+                }
+
+                // Provenance
+                const srcEl = document.getElementById('dossier-source');
+                if (srcEl) srcEl.innerText = `@${(ch.discovery_source || 'system').replace(/^@/,'')}`;
+
+                const methEl = document.getElementById('dossier-method');
+                if (methEl) methEl.innerText = ch.discovery_method || 'Graph Expansion';
+
+                const timeEl = document.getElementById('dossier-time');
+                if (timeEl) timeEl.innerText = ch.discovered_at || 'Recently';
+
+                const reasonEl = document.getElementById('dossier-priority-reason');
+                if (reasonEl) reasonEl.innerText = ch.outreach_priority_reason || 'Standard evaluation';
+
+                // Wire up actions
+                const approveBtn = document.getElementById('dossier-approve-btn');
+                if (approveBtn) {
+                    approveBtn.onclick = () => {
+                        approveDiscoveredLead(ch.id);
+                        closeChannelDossier();
+                    };
+                }
+                const rejectBtn = document.getElementById('dossier-reject-btn');
+                if (rejectBtn) {
+                    rejectBtn.onclick = () => {
+                        rejectDiscoveredLead(ch.id, rawUser);
+                        closeChannelDossier();
+                    };
+                }
+
+                // Show drawer
+                const backdrop = document.getElementById('channel-dossier-backdrop');
+                const drawer = document.getElementById('channel-dossier-drawer');
+                if (backdrop) backdrop.classList.remove('hidden');
+                if (drawer) drawer.classList.remove('translate-x-full');
+            }
+
+            function closeChannelDossier() {
+                const backdrop = document.getElementById('channel-dossier-backdrop');
+                const drawer = document.getElementById('channel-dossier-drawer');
+                if (drawer) drawer.classList.add('translate-x-full');
+                if (backdrop) backdrop.classList.add('hidden');
+            }
+
             function renderHourlyVelocityChart(hourlyList) {
                 const chartElem = document.getElementById('disc24-hourly-chart');
                 const peakSummaryElem = document.getElementById('disc24-hourly-summary');
                 if (!chartElem) return;
 
                 if (!hourlyList || hourlyList.length === 0) {
-                    chartElem.innerHTML = `<div class="text-xs text-slate-500 w-full text-center py-12">No discovery events recorded in the last 24 hours.</div>`;
+                    chartElem.innerHTML = `<div class="text-xs text-slate-500 w-full text-center py-12">لا توجد عمليات اكتشاف مسجلة خلال الـ 24 ساعة الماضية.</div>`;
+                    if (peakSummaryElem) peakSummaryElem.innerText = 'Peak: 0 channels/hr';
                     return;
                 }
 
-                let maxTotal = 1;
-                let peakHour = '';
-                hourlyList.forEach(h => {
-                    if (h.total > maxTotal) {
-                        maxTotal = h.total;
-                        peakHour = h.hour;
-                    }
-                });
-
-                if (peakSummaryElem) {
-                    peakSummaryElem.innerText = `Peak: ${maxTotal.toLocaleString()} channels/hr at ${peakHour || 'N/A'}`;
+                const maxCount = Math.max(...hourlyList.map(h => h.count || 0), 1);
+                const peakHour = hourlyList.reduce((max, h) => (h.count > max.count ? h : max), hourlyList[0]);
+                if (peakSummaryElem && peakHour) {
+                    peakSummaryElem.innerText = `الذروة: ${peakHour.count} قناة/ساعة عند ${peakHour.hour}`;
                 }
 
                 chartElem.innerHTML = hourlyList.map(h => {
-                    const totalHeightPct = Math.max(8, Math.round((h.total / maxTotal) * 100));
-                    const qualHeightPct = h.total > 0 ? Math.round((h.qualified / h.total) * 100) : 0;
+                    const totalH = Math.max(4, Math.round(((h.count || 0) / maxCount) * 100));
+                    const qualH = (h.count > 0 && h.qualified > 0) ? Math.round(((h.qualified || 0) / h.count) * totalH) : 0;
+                    const otherH = Math.max(0, totalH - qualH);
+
                     return `
-                        <div class="flex-1 flex flex-col items-center group relative min-w-[28px] h-full justify-end" title="${h.hour}: ${h.total} total (${h.qualified} qualified, ${h.rejected} rejected)">
-                            <!-- Tooltip -->
-                            <div class="absolute -top-10 hidden group-hover:flex flex-col items-center z-20 pointer-events-none">
-                                <div class="bg-slate-900 border border-slate-700 px-2 py-1 rounded text-[10px] text-slate-200 whitespace-nowrap shadow-xl">
-                                    <span class="font-bold text-white">${h.hour}</span>: ${h.total} (${h.qualified} qual)
-                                </div>
-                                <div class="w-1.5 h-1.5 bg-slate-900 rotate-45 border-r border-b border-slate-700 -mt-1"></div>
+                        <div class="flex-1 flex flex-col items-center justify-end h-full group relative cursor-pointer" title="${h.hour}: ${h.count} قنوات مكتشفة (${h.qualified || 0} مؤهلة)">
+                            <div class="text-[9px] font-mono text-slate-400 mb-1 opacity-0 group-hover:opacity-100 transition whitespace-nowrap absolute -top-4">${h.count}</div>
+                            <div class="w-full max-w-[18px] flex flex-col justify-end rounded-t overflow-hidden transition-all duration-300 group-hover:scale-y-105" style="height: ${totalH}%">
+                                ${qualH > 0 ? `<div class="bg-gradient-to-t from-emerald-600 to-teal-400 w-full" style="height: ${qualH}%"></div>` : ''}
+                                <div class="bg-slate-700/80 group-hover:bg-slate-600 w-full" style="height: ${otherH}%"></div>
                             </div>
-                            <!-- Bar -->
-                            <div class="w-full bg-slate-800/80 rounded-t flex flex-col justify-end overflow-hidden transition-all duration-300 group-hover:brightness-125" style="height: ${totalHeightPct}%;">
-                                <div class="w-full bg-emerald-500/90" style="height: ${qualHeightPct}%;"></div>
-                            </div>
-                            <!-- X Label -->
-                            <span class="text-[9px] text-slate-500 mt-1 truncate w-full text-center">${h.hour.split(':')[0]}h</span>
+                            <span class="text-[9px] font-mono text-slate-500 mt-1 truncate w-full text-center">${h.hour.split(':')[0]}h</span>
                         </div>
                     `;
                 }).join('');

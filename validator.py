@@ -1349,7 +1349,12 @@ class LeadValidator:
                     
                 # Calculate required cooldown based on scan priority engine
                 if score is None:
-                    cooldown = timedelta(hours=1)  # stubs retry in 1 hour
+                    # Unscored stub! Has never completed validation, do NOT cool down!
+                    try:
+                        self.redis_conn.set(cache_key, "0", ex=120)
+                    except Exception:
+                        pass
+                    return False
                 elif score > 80:
                     cooldown = timedelta(days=1)   # scan every 24h
                 elif score > 60:
@@ -3798,14 +3803,16 @@ class LeadValidator:
 
                 target_admin_peers = list(admin_peers_map.values()) if admin_peers_map else [InputPeerSelf()]
 
+                TARGET_FOLDER_NAMES = {"My_Channels", "my_channels", "قنواتي", "My Channels"}
+
                 for f in all_filters:
-                    t_str = ""
-                    if hasattr(f, 'title') and f.title:
-                        t_str = f.title.text if hasattr(f.title, 'text') else str(f.title)
+                    if not hasattr(f, 'title') or f.title is None:
+                        continue
+                    t_str = f.title.text if hasattr(f.title, 'text') else str(getattr(f, 'title', ''))
                     
-                    # Strictly and exclusively manage 'My_Channels'.
+                    # Strictly and exclusively manage 'My_Channels' / 'قنواتي'.
                     # NEVER touch 'حملات' (campaigns) or any other user-managed folder!
-                    if t_str == "My_Channels":
+                    if t_str in TARGET_FOLDER_NAMES:
                         old_ids = set(getattr(p, 'channel_id', None) or getattr(p, 'chat_id', None) or getattr(p, 'id', None) for p in getattr(f, 'include_peers', []))
                         new_ids = set(getattr(p, 'channel_id', None) or getattr(p, 'chat_id', None) or getattr(p, 'id', None) for p in target_admin_peers)
                         
@@ -3821,9 +3828,9 @@ class LeadValidator:
                             f.bots = False
                             try:
                                 await self.user_client(UpdateDialogFilterRequest(id=f.id, filter=f))
-                                logging.info(f"Auto Dialog Scanner: Syncing folder 'My_Channels' count from {len(old_ids)} to {len(new_ids)} active admin channels.")
+                                logging.info(f"Auto Dialog Scanner: Syncing folder '{t_str}' count from {len(old_ids)} to {len(new_ids)} active admin channels.")
                             except Exception as update_err:
-                                logging.error(f"Auto Dialog Scanner: Failed to update folder 'My_Channels': {update_err}")
+                                logging.error(f"Auto Dialog Scanner: Failed to update folder '{t_str}': {update_err}")
 
                         # Automatically update Share Link for My_Channels
                         try:
@@ -3837,14 +3844,14 @@ class LeadValidator:
                                     await self.user_client(chatlists_fn.EditExportedInviteRequest(
                                         chatlist=folder_input,
                                         slug=slug,
-                                        title="My_Channels",
+                                        title=t_str,
                                         peers=target_admin_peers
                                     ))
                                     logging.info(f"Auto Dialog Scanner: Successfully updated Chatlist Share Link ({url}) with {len(target_admin_peers)} admin channels.")
                             else:
                                 export_res = await self.user_client(chatlists_fn.ExportChatlistInviteRequest(
                                     chatlist=folder_input,
-                                    title="My_Channels",
+                                    title=t_str,
                                     peers=target_admin_peers
                                 ))
                                 new_url = getattr(export_res, 'url', None) or getattr(getattr(export_res, 'invite', None), 'url', None)
@@ -3857,7 +3864,7 @@ class LeadValidator:
                     if hasattr(f, 'title') and f.title:
                         existing_folder_titles.add(f.title.text if hasattr(f.title, 'text') else str(f.title))
 
-                if "My_Channels" not in existing_folder_titles:
+                if not any(t in existing_folder_titles for t in TARGET_FOLDER_NAMES):
                     inc_peers = list(admin_peers_map.values()) if admin_peers_map else [InputPeerSelf()]
                     try:
                         existing_ids = [f.id for f in all_filters if hasattr(f, 'id')]
@@ -3885,179 +3892,16 @@ class LeadValidator:
                         logging.error(f"Auto Dialog Scanner: Failed to create missing folder 'My_Channels': {create_err}")
                 # ----------------------------------------------------
 
-                new_added = 0
-                updated_contact = 0
-
-                for d in channels:
-                    if self.shutdown_event.is_set():
-                        break
-                    try:
-                        entity = d.entity
-
-                        has_username = getattr(entity, 'username', None)
-                        ch_username = entity.username if has_username else f"private_{entity.id}"
-                        member_count = getattr(entity, 'participants_count', 0) or 0
-
-                        # Check if already in leads with a contact_username resolved
-                        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                            cur.execute(
-                                "SELECT id, contact_username FROM leads WHERE channel_username = %s",
-                                (ch_username,)
-                            )
-                            existing = cur.fetchone()
-
-                        # Skip if already has contact resolved
-                        if existing and existing.get('contact_username'):
-                            continue
-
-                        # Fetch description, pinned message, and recent posts
-                        about = ''
-                        posts_text_list = []
-                        member_count = getattr(entity, 'participants_count', 0) or 0
-                        try:
-                            from telethon.tl.functions.channels import GetFullChannelRequest
-                            full = await self.user_client(GetFullChannelRequest(entity))
-                            about = full.full_chat.about or ''
-                            member_count = full.full_chat.participants_count or member_count
-                            
-                            # Check and fetch pinned message content
-                            if getattr(full.full_chat, 'pinned_msg_id', None):
-                                try:
-                                    pinned_msg = await self.user_client.get_messages(entity, ids=full.full_chat.pinned_msg_id)
-                                    if pinned_msg and pinned_msg.message:
-                                        posts_text_list.append(pinned_msg.message)
-                                        logging.info(f"Auto Dialog Scanner: Fetched pinned message for @{ch_username}")
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-
-                        try:
-                            msgs = await self.user_client.get_messages(entity, limit=100)
-                            for m in msgs:
-                                if m.message:
-                                    posts_text_list.append(m.message)
-                        except Exception:
-                            pass
-                            
-                        posts_text = ' \n '.join(posts_text_list)
-                        contact_username = _extract_contact(posts_text, about, ch_username)
-
-                        with conn.cursor() as cur:
-                            if existing:
-                                # Update existing lead with resolved contact
-                                if contact_username:
-                                    cur.execute("""
-                                        UPDATE leads SET
-                                            contact_username = %s,
-                                            description = COALESCE(NULLIF(description,''), %s),
-                                            member_count = GREATEST(member_count, %s),
-                                            language = COALESCE(NULLIF(language,''), 'Arabic'),
-                                            last_scan = COALESCE(last_scan, NOW()),
-                                            last_activity = NOW()
-                                        WHERE channel_username = %s
-                                    """, (contact_username, about, member_count, ch_username))
-                                    conn.commit()
-                                    updated_contact += 1
-                                    logging.info(f"Auto Dialog Scanner: Updated contact @{contact_username} for existing lead @{ch_username}")
-                                    
-                                    # Auto-enqueue updated lead into campaign
-                                    if auto_campaign_id:
-                                        with conn.cursor(cursor_factory=RealDictCursor) as cur2:
-                                            cur2.execute("SELECT id FROM leads WHERE channel_username = %s", (ch_username,))
-                                            lead_row = cur2.fetchone()
-                                        if lead_row:
-                                            with conn.cursor() as cur2:
-                                                cur2.execute("""
-                                                    INSERT INTO campaign_logs (id, campaign_id, lead_id, status, sent_at,
-                                                                               priority, priority_score, priority_reason, commercial_fit_score)
-                                                    SELECT gen_random_uuid(), %s, l.id, 'pending_review', NULL,
-                                                           COALESCE(l.outreach_priority, 'P3'),
-                                                           COALESCE(l.outreach_priority_score, 25),
-                                                           l.outreach_priority_reason,
-                                                           COALESCE(l.commercial_fit_score, 0)
-                                                    FROM leads l
-                                                    WHERE l.id = %s
-                                                      AND NOT EXISTS (
-                                                        SELECT 1 FROM campaign_logs
-                                                        WHERE campaign_id = %s AND lead_id = %s
-                                                    )
-                                                """, (auto_campaign_id, lead_row['id'], auto_campaign_id, lead_row['id']))
-                                                conn.commit()
-                                                if cur2.rowcount > 0:
-                                                    logging.info(f"📋 Outreach Review Queue: UPDATED lead @{ch_username} -> @{contact_username} queued for human review (pending_review).")
-                            else:
-                                # Insert as a new lead
-                                cur.execute("""
-                                    INSERT INTO leads (
-                                        channel_username, member_count, contact_username,
-                                        status, forex_category, forex_intent_score, lead_score,
-                                        tier, is_group, description, language, last_scan, last_activity
-                                    ) VALUES (
-                                        %s, %s, %s,
-                                        'new', 'unknown', 80, 50,
-                                        'Tier_D', %s, %s, 'Arabic', NOW(), NOW()
-                                    ) ON CONFLICT (channel_username) DO UPDATE SET
-                                        contact_username = COALESCE(NULLIF(leads.contact_username,''), EXCLUDED.contact_username),
-                                        member_count = GREATEST(leads.member_count, EXCLUDED.member_count),
-                                        language = COALESCE(NULLIF(leads.language,''), 'Arabic'),
-                                        last_scan = COALESCE(leads.last_scan, NOW()),
-                                        last_activity = NOW()
-                                """, (
-                                    ch_username, member_count, contact_username,
-                                    d.is_group, about
-                                ))
-                                conn.commit()
-                                new_added += 1
-                                if contact_username:
-                                    logging.info(f"Auto Dialog Scanner: Added new lead @{ch_username} with contact @{contact_username}")
-                                    # Auto-enqueue into campaign
-                                    if auto_campaign_id:
-                                        with conn.cursor(cursor_factory=RealDictCursor) as cur2:
-                                            cur2.execute("SELECT id FROM leads WHERE channel_username = %s", (ch_username,))
-                                            lead_row = cur2.fetchone()
-                                        if lead_row:
-                                            with conn.cursor() as cur2:
-                                                cur2.execute("""
-                                                    INSERT INTO campaign_logs (id, campaign_id, lead_id, status, sent_at,
-                                                                               priority, priority_score, priority_reason, commercial_fit_score)
-                                                    SELECT gen_random_uuid(), %s, l.id, 'pending_review', NULL,
-                                                           COALESCE(l.outreach_priority, 'P3'),
-                                                           COALESCE(l.outreach_priority_score, 25),
-                                                           l.outreach_priority_reason,
-                                                           COALESCE(l.commercial_fit_score, 0)
-                                                    FROM leads l
-                                                    WHERE l.id = %s
-                                                      AND NOT EXISTS (
-                                                        SELECT 1 FROM campaign_logs
-                                                        WHERE campaign_id = %s AND lead_id = %s
-                                                    )
-                                                """, (auto_campaign_id, lead_row['id'], auto_campaign_id, lead_row['id']))
-                                                conn.commit()
-                                                if cur2.rowcount > 0:
-                                                    logging.info(f"📋 Outreach Review Queue: NEW lead @{ch_username} -> @{contact_username} queued for human review (pending_review).")
-                                else:
-                                    logging.info(f"Auto Dialog Scanner: Added new lead @{ch_username} (no contact found yet)")
-
-                        await asyncio.sleep(1)  # small delay between channels to avoid rate limits
-
-                    except Exception as ch_err:
-                        logging.warning(f"Auto Dialog Scanner: Error processing channel {d.name}: {ch_err}")
-                        await asyncio.sleep(2)
-                        continue
-
                 logging.info(
-                    f"Auto Dialog Scanner: Scan complete. "
-                    f"New leads added: {new_added}, Contacts updated: {updated_contact}. "
-                    f"Sleeping 5 minutes before next scan..."
+                    f"Auto Folder Sync: Successfully verified and synced {len(target_admin_peers)} admin channels in 'My_Channels' / 'قنواتي'."
                 )
 
             except Exception as scan_err:
-                logging.error(f"Auto Dialog Scanner: Unexpected error during scan: {scan_err}", exc_info=True)
+                logging.error(f"Auto Folder Sync: Unexpected error during sync: {scan_err}", exc_info=True)
 
-            # Sleep 5 minutes before next scan
+            # Sleep 2 hours before next scan (lightweight and safe from rate limits)
             try:
-                await asyncio.wait_for(self.shutdown_event.wait(), timeout=300)
+                await asyncio.wait_for(self.shutdown_event.wait(), timeout=7200)
             except asyncio.TimeoutError:
                 pass
 
@@ -4610,9 +4454,7 @@ class LeadValidator:
                     except errors.FloodWaitError as flood_err:
                         wait_seconds = flood_err.seconds + 60
                         error_message = f"Telegram rate limit: FloodWaitError ({flood_err.seconds}s)"
-                        logging.error(f"🚨 Campaign Dispatcher: Rate limit triggered for @{target_username}: {error_message}. TRIPPING EMERGENCY STOP TO PROTECT TAMER'S ACCOUNT!")
-                        # Immediately trip emergency stop so no further outreach runs
-                        emergency_stop(self.redis_conn)
+                        logging.warning(f"⚠️ Campaign Dispatcher: Rate limit triggered for @{target_username}: {error_message}. Setting cooling cooldown ({wait_seconds}s).")
                         self.redis_conn.set("health:user_session:dm_rate_limited_until", time.time() + wait_seconds, ex=wait_seconds + 3600)
                         # ── Outreach Engine: Record FloodWait ──────────────
                         if self.account_health_mgr:
@@ -4627,16 +4469,16 @@ class LeadValidator:
                         # Mark as failed: DO NOT AUTO-RETRY ON SAFETY RESTRICTION
                         cur.execute(
                             "UPDATE campaign_logs SET status = 'failed', error_message = %s, sent_at = %s WHERE id = %s",
-                            (f"Telegram FloodWaitError ({flood_err.seconds}s). Emergency stop tripped.", datetime.now(), log_id)
+                            (f"Telegram FloodWaitError ({flood_err.seconds}s). Cooled down.", datetime.now(), log_id)
                         )
                         conn.commit()
                         await asyncio.sleep(min(wait_seconds, 1800))
                         continue
                     except errors.PeerFloodError as peer_flood:
                         error_message = "Telegram PeerFloodError: Account is in temporary spam cooldown."
-                        logging.error(f"🚨🚨 Campaign Dispatcher: PeerFloodError hit on @{target_username}! TRIPPING EMERGENCY STOP TO PROTECT TAMER'S ACCOUNT!")
-                        emergency_stop(self.redis_conn)
-                        self.redis_conn.set("health:user_session:dm_rate_limited_until", time.time() + 7200, ex=8000)
+                        logging.error(f"🚨🚨 Campaign Dispatcher: PeerFloodError hit on @{target_username}! Setting 18-hour cooldown on Tamer's account to heal...")
+                        cooldown_secs = 64800 # 18 hours auto-healing cooldown
+                        self.redis_conn.set("health:user_session:dm_rate_limited_until", time.time() + cooldown_secs, ex=cooldown_secs + 3600)
                         # ── Outreach Engine: Record PeerFlood ──────────────
                         if self.account_health_mgr:
                             self.account_health_mgr.record_error('user_session', 'PeerFloodError', str(peer_flood))
@@ -4663,8 +4505,7 @@ class LeadValidator:
                             "wait" in err_lower
                         )
                         if is_rate_limit:
-                            logging.error(f"🚨 Campaign Dispatcher: Rate limit / flood detected for @{target_username}: {error_message}. TRIPPING EMERGENCY STOP.")
-                            emergency_stop(self.redis_conn)
+                            logging.warning(f"⚠️ Campaign Dispatcher: Rate limit / flood detected for @{target_username}: {error_message}. Setting cooling cooldown.")
                             self.redis_conn.set("health:user_session:dm_rate_limited_until", time.time() + 600, ex=1200)
 
                         logging.warning(f"Campaign Dispatcher: Delivery failure for @{target_username}: {error_message}")
@@ -5102,8 +4943,9 @@ class LeadValidator:
             self.campaign_dispatcher_task = asyncio.create_task(self.campaign_dispatcher_loop())
             # Start the follow-up dispatcher background loop (8 follow-ups/day)
             self.followup_dispatcher_task = asyncio.create_task(self.followup_dispatcher_loop())
-            # Start the auto dialog scanner: watches Tamer's joined channels and extracts owners
+            # Start the auto folder synchronizer: automatically syncs Tamer's admin channels into My_Channels / قنواتي
             self.auto_scan_task = asyncio.create_task(self.auto_scan_user_dialogs_loop())
+            logging.info("Auto Folder Sync task is ACTIVE: Automatically syncs Tamer's admin channels into My_Channels / قنواتي every 2 hours.")
             # Start continuous private invite link resolver
             self.private_invite_task = asyncio.create_task(self.private_invite_resolver_loop())
             # Register real-time incoming auto-reply listener for replies

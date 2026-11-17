@@ -423,12 +423,12 @@ def calculate_all_dimensions(
     else:
         classification = "LOW_CONFIDENCE"
 
-    # Tier mapping
-    if final_score >= 75:
+    # Tier mapping: Combines final_score with structural audience and niche intent
+    if final_score >= 75 or (member_count >= 15000 and (forex_score >= 25 or gold_score >= 35)):
         tier = "Tier_A"
-    elif final_score >= 55:
+    elif final_score >= 50 or (member_count >= 4000 and (forex_score >= 20 or gold_score >= 25)):
         tier = "Tier_B"
-    elif final_score >= 35:
+    elif final_score >= 25 or (member_count >= 300 and (forex_score >= 15 or gold_score >= 15 or signal_score >= 15)):
         tier = "Tier_C"
     else:
         tier = "Tier_D"

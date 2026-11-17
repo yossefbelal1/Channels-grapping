@@ -42,6 +42,7 @@ SESSION_DIR = os.getenv("TELEGRAM_SESSIONS_DIR", "/app/sessions" if os.path.exis
 # Default research account pool (NEVER include user_session / @tamerads1 here)
 # Use isolated spiderweb_session exclusively to prevent SQLite locks and cross-worker FloodWait
 RESEARCH_SESSIONS = [
+    "acc_14809564829",
     "spiderweb_session"
 ]
 
@@ -435,12 +436,14 @@ class SimilarChannelsCrawler:
             lead_score = min(100, max(10, lead_score))
             status = 'new' if forex_score >= 40 else 'rejected'
 
-            # Strict Tier assignment (Requires genuine forex relevance AND commercial fit)
-            if members >= 10000 and forex_score >= 80 and has_commercial:
+            # Strict Tier assignment (Requires genuine forex relevance AND commercial fit or substantial trading community)
+            if (members >= 10000 and forex_score >= 80 and has_commercial) or (members >= 15000 and forex_score >= 70):
                 tier = 'Tier_A'
-            elif members >= 2000 and forex_score >= 60 and has_commercial:
+            elif (members >= 2000 and forex_score >= 60 and has_commercial) or (members >= 4000 and forex_score >= 60):
                 tier = 'Tier_B'
-            elif members >= 500 and forex_score >= 40 and (has_commercial or forex_score >= 70):
+            elif (members >= 500 and forex_score >= 40) or (has_commercial and forex_score >= 40):
+                tier = 'Tier_C'
+            elif forex_score >= 50:
                 tier = 'Tier_C'
             else:
                 tier = 'Tier_D'
@@ -607,7 +610,7 @@ class SimilarChannelsCrawler:
                     INSERT INTO leads (
                         channel_username, title, member_count, discovery_source, discovery_method, depth, status, entity_type, discovered_at, last_scan
                     )
-                    VALUES (%s, %s, %s, %s, 'similar_channel', %s, 'new', 'channel', NOW(), NOW())
+                    VALUES (%s, %s, %s, %s, 'similar_channel', %s, 'new', 'channel', NOW(), NULL)
                     ON CONFLICT (channel_username) DO UPDATE SET
                         title = COALESCE(NULLIF(EXCLUDED.title, ''), leads.title),
                         member_count = GREATEST(leads.member_count, EXCLUDED.member_count),
