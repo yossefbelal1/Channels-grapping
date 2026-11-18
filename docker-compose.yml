@@ -1,5 +1,15 @@
 version: '3.8'
 
+# ==============================================================================
+# Channels-Grapping (LeadHunter) - Streamlined Single-User Production Stack
+# Architecture: High-Efficiency Core Triad + Dashboard
+# - leadhunter_postgres: Persistent Storage (pgdata volume)
+# - leadhunter_redis: High-speed queues, locks, deduplication cache
+# - worker_validator: Unified Master Worker (Telethon User Client,
+#                     Validation, Auto-Folder Sync, AI Extraction, Campaign Dispatcher)
+# - leadhunter_dashboard: Real-Time Web Operations Dashboard (Port 8000)
+# ==============================================================================
+
 services:
   postgres:
     image: postgres:15-alpine
@@ -34,32 +44,6 @@ services:
       timeout: 5s
       retries: 5
 
-  worker_scavenger:
-    build: .
-    container_name: worker_scavenger
-    restart: unless-stopped
-    command: python scavenger.py
-    depends_on:
-      redis:
-        condition: service_healthy
-    env_file:
-      - .env
-    volumes:
-      - sessions_data:/app/sessions
-
-  worker_radar:
-    build: .
-    container_name: worker_radar
-    restart: unless-stopped
-    command: python radar.py
-    depends_on:
-      redis:
-        condition: service_healthy
-    env_file:
-      - .env
-    volumes:
-      - sessions_data:/app/sessions
-
   worker_validator:
     build: .
     container_name: worker_validator
@@ -73,67 +57,10 @@ services:
     env_file:
       - .env
     environment:
-      - ENABLE_EMBEDDED_SCHEDULER=false
+      - ENABLE_EMBEDDED_SCHEDULER=true
     volumes:
       - sessions_data:/app/sessions
       - media_data:/app/media
-
-  worker_web_scraper:
-    build: .
-    container_name: worker_web_scraper
-    restart: unless-stopped
-    command: python web_scraper.py
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    env_file:
-      - .env
-
-  worker_graph_expander:
-    build: .
-    container_name: worker_graph_expander
-    restart: unless-stopped
-    command: python graph_expander.py
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    env_file:
-      - .env
-    volumes:
-      - sessions_data:/app/sessions
-
-  worker_seed_intake:
-    build: .
-    container_name: worker_seed_intake
-    restart: unless-stopped
-    command: python seed_intake_worker.py
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    env_file:
-      - .env
-
-  worker_scheduler:
-    build: .
-    container_name: worker_scheduler
-    restart: unless-stopped
-    command: python scheduler_worker.py
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    env_file:
-      - .env
-    environment:
-      - SCHEDULER_POLL_INTERVAL_SECONDS=30
-      - SCHEDULER_BATCH_SIZE=50
 
   dashboard:
     build: .
@@ -155,6 +82,40 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
+
+  # ── Archived / Optional Secondary Workers ───────────────────────────────────
+  # In single-user mode, secondary workers are disabled to prevent session concurrency
+  # conflicts and save VPS RAM (~500MB). Enable only if multi-session scale is needed.
+  #
+  # worker_scavenger:
+  #   build: .
+  #   container_name: worker_scavenger
+  #   command: python scavenger.py
+  #
+  # worker_radar:
+  #   build: .
+  #   container_name: worker_radar
+  #   command: python radar.py
+  #
+  # worker_graph_expander:
+  #   build: .
+  #   container_name: worker_graph_expander
+  #   command: python graph_expander.py
+  #
+  # worker_web_scraper:
+  #   build: .
+  #   container_name: worker_web_scraper
+  #   command: python web_scraper.py
+  #
+  # worker_seed_intake:
+  #   build: .
+  #   container_name: worker_seed_intake
+  #   command: python seed_intake_worker.py
+  #
+  # worker_scheduler:
+  #   build: .
+  #   container_name: worker_scheduler
+  #   command: python scheduler_worker.py
 
 volumes:
   pgdata:
