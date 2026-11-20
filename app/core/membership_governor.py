@@ -194,6 +194,12 @@ class MembershipGovernor:
             stats["status"] = "DAILY_LIMIT_REACHED"
             return stats
 
+        # Protect user's primary session (Tamer Ads) from auto-leaving channels
+        if session_name == 'user_session':
+            logger.info(f"[GOVERNOR] Session '{session_name}' is primary user account (Immune from auto-pruning).")
+            stats["status"] = "USER_SESSION_IMMUNE"
+            return stats
+
         # 1. Inspect account dialogs
         try:
             admin_dialogs, non_admin_dialogs = await self.scan_account_capacity(client)

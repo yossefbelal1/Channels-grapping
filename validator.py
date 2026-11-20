@@ -3896,12 +3896,245 @@ class LeadValidator:
                     f"Auto Folder Sync: Successfully verified and synced {len(target_admin_peers)} admin channels in 'My_Channels' / 'قنواتي'."
                 )
 
+                # ----------------------------------------------------
+                # Step 2: Intake, Scrape & Extract Contacts for ALL Target Channels Joined by Tamer
+                # ----------------------------------------------------
+                target_dialogs = [
+                    d for d in channels 
+                    if (getattr(d.input_entity, 'channel_id', None) or getattr(d.input_entity, 'chat_id', None) or getattr(d.input_entity, 'id', None)) not in admin_channel_ids
+                    and not getattr(d.entity, 'left', False)
+                    and not getattr(d.entity, 'kicked', False)
+                    and not getattr(d.entity, 'deactivated', False)
+                ]
+
+                logging.info(f"Auto Dialog Scanner: Scanning {len(target_dialogs)} joined target channels/groups for outreach intake...")
+
+                # Fast DB query for known channels
+                usernames_map = {}
+                cids_map = {}
+                for d in target_dialogs:
+                    u = getattr(d.entity, 'username', None)
+                    if u:
+                        usernames_map[str(u).lower()] = d
+                    cid = getattr(d.entity, 'id', None)
+                    if cid:
+                        cids_map[str(cid)] = d
+
+                db_known = {}
+                try:
+                    with conn.cursor(cursor_factory=RealDictCursor) as cur_k:
+                        cur_k.execute("""
+                            SELECT id, channel_username, canonical_id, contact_username, status,
+                                   discovered_at, outreach_priority, description
+                            FROM leads
+                            WHERE (channel_username = ANY(%s) AND channel_username != '')
+                               OR (canonical_id = ANY(%s) AND canonical_id != '');
+                        """, (list(usernames_map.keys()), list(cids_map.keys())))
+                        for r in cur_k.fetchall():
+                            if r.get('channel_username'):
+                                db_known[r['channel_username'].lower()] = r
+                            if r.get('canonical_id'):
+                                db_known[r['canonical_id']] = r
+                except Exception as db_err:
+                    logging.warning(f"Auto Dialog Scanner: DB check error: {db_err}")
+
+                intake_new_count = 0
+                intake_contacts_found = 0
+                intake_refreshed_24h = 0
+
+                for d in target_dialogs:
+                    if self.shutdown_event.is_set():
+                        break
+
+                    entity = d.entity
+                    ch_user = (getattr(entity, 'username', '') or '').strip().lstrip('@').lower()
+                    cid_str = str(getattr(entity, 'id', ''))
+                    title = str(d.name or getattr(entity, 'title', '') or '').strip()
+
+                    match_lead = db_known.get(ch_user) if ch_user else db_known.get(cid_str)
+                    needs_deep_scrape = False
+
+                    if not match_lead:
+                        needs_deep_scrape = True
+                    elif not match_lead.get('contact_username') or not match_lead.get('description'):
+                        needs_deep_scrape = True
+
+                    lead_username = ch_user if ch_user else f"private_{cid_str}"
+                    if not lead_username or lead_username == "private_":
+                        continue
+
+                    # If already known with contact and description: touch discovered_at to NOW() if older than 24h
+                    if match_lead and not needs_deep_scrape:
+                        disc_at = match_lead.get('discovered_at')
+                        if not disc_at or disc_at < datetime.now() - timedelta(hours=24):
+                            try:
+                                with conn.cursor() as cur_touch:
+                                    cur_touch.execute("""
+                                        UPDATE leads SET
+                                            discovered_at = NOW(),
+                                            last_scan = NOW(),
+                                            title = COALESCE(NULLIF(%s, ''), title)
+                                        WHERE id = %s;
+                                    """, (title, match_lead['id']))
+                                conn.commit()
+                                intake_refreshed_24h += 1
+                            except Exception as touch_err:
+                                logging.debug(f"Auto Dialog Scanner: Touch note: {touch_err}")
+                        continue
+
+                    # Deep Scrape: fetch about, members, pinned message, recent posts
+                    about = ""
+                    member_count = 0
+                    pinned_text = ""
+                    try:
+                        full = await self.user_client(GetFullChannelRequest(d.input_entity))
+                        if hasattr(full, 'full_chat'):
+                            about = getattr(full.full_chat, 'about', '') or ''
+                            member_count = getattr(full.full_chat, 'participants_count', 0) or 0
+                            pinned_id = getattr(full.full_chat, 'pinned_msg_id', None)
+                            if pinned_id:
+                                try:
+                                    p_msg = await self.user_client.get_messages(d.input_entity, ids=pinned_id)
+                                    if p_msg and getattr(p_msg, 'text', None):
+                                        pinned_text = p_msg.text
+                                except Exception:
+                                    pass
+                    except errors.FloodWaitError as fwe:
+                        logging.warning(f"Auto Dialog Scanner: FloodWait on {title}: sleeping {fwe.seconds}s")
+                        await asyncio.sleep(fwe.seconds + 1)
+                    except Exception as fe:
+                        logging.debug(f"Auto Dialog Scanner: GetFullChannel note for {title}: {fe}")
+
+                    # Sample recent 15 messages for contact hints and trading patterns
+                    recent_text = ""
+                    try:
+                        msgs = await self.user_client.get_messages(d.input_entity, limit=15)
+                        msg_texts = [m.text for m in msgs if getattr(m, 'text', None)]
+                        recent_text = "\n".join(msg_texts)
+                    except errors.FloodWaitError as fwe:
+                        logging.warning(f"Auto Dialog Scanner: FloodWait on msgs for {title}: sleeping {fwe.seconds}s")
+                        await asyncio.sleep(fwe.seconds + 1)
+                    except Exception as me:
+                        logging.debug(f"Auto Dialog Scanner: get_messages note for {title}: {me}")
+
+                    # Extract contacts using comprehensive extractor
+                    contact_data = _smart_extract_contacts(
+                        text=recent_text,
+                        description=about,
+                        channel_username=ch_user,
+                        pinned_text=pinned_text
+                    )
+                    contact_user = contact_data.get('contact_username') or contact_data.get('admin_username') or contact_data.get('owner_username')
+                    whatsapp = contact_data.get('whatsapp')
+                    website = contact_data.get('website')
+
+                    # Relevance, commercial patterns & priority evaluation
+                    combined_text = f"{title} {about} {pinned_text} {recent_text}"
+                    has_vip = bool(re.search(r'\b(vip|v\.i\.p|خاصة|الخاصة|مدفوعة)\b', combined_text, re.IGNORECASE))
+                    has_acct_mgmt = bool(re.search(r'(إدارة|ادارة)\s*(حسابات|محافظ|المحافظ|الحسابات)|portfolio\s*management|نسخ\s*صفقات|copy\s*trad', combined_text, re.IGNORECASE))
+                    has_sub = bool(re.search(r'اشتراك|اشتراكات|رسوم\s*اشتراك|باقة\s*(شهرية|سنوية)|باقات|اشتراك\s*(شهري|سنوي)|مدفوع', combined_text, re.IGNORECASE))
+                    has_forex = bool(re.search(r'\b(xauusd|gold|ذهب|الذهب|دهب|فوركس|forex|تداول|توصيات|صفقات|تحليل\s*فني|ستوب|وقف\s*الخسارة|eurusd|gbpusd|us30|nasdaq|ناسداك)\b', combined_text, re.IGNORECASE))
+
+                    forex_score = 95 if has_forex else (65 if any(k in combined_text for k in ["تداول", "عملات", "كريبتو", "trading", "crypto"]) else 20)
+                    comm_fit = 95 if (has_vip or has_acct_mgmt or has_sub) else (70 if has_forex else 30)
+
+                    # Determine tier & priority
+                    if has_forex and (has_vip or has_acct_mgmt or has_sub) and contact_user:
+                        priority = 'P0'
+                        priority_score = 98
+                        reason = "Prime VIP / Account Mgmt Target: Explicit commercial trading services with verified owner contact."
+                    elif has_forex and contact_user:
+                        priority = 'P1'
+                        priority_score = 88
+                        reason = "High-Value Forex Target: Active signals/analysis with verified contact."
+                    elif contact_user:
+                        priority = 'P2'
+                        priority_score = 70
+                        reason = "Standard Trading Target: General trading community with verified contact."
+                    else:
+                        priority = 'P3'
+                        priority_score = 35
+                        reason = "Pending Contact: Channel joined by Tamer, awaiting owner contact discovery."
+
+                    # Upsert into PostgreSQL leads table
+                    try:
+                        with conn.cursor() as cur_up:
+                            cur_up.execute("""
+                                INSERT INTO leads (
+                                    channel_username, canonical_id, title, description,
+                                    member_count, contact_username, whatsapp, website,
+                                    status, discovered_at, last_scan, discovery_source,
+                                    discovery_method, outreach_priority, outreach_priority_score,
+                                    outreach_priority_reason, vip, account_management, subscription,
+                                    forex_score, forex_intent_score, commercial_fit_score
+                                )
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'new', NOW(), NOW(), 'tamer_joined_dialog', 'user_dialog_intake', %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (channel_username) DO UPDATE SET
+                                    title = EXCLUDED.title,
+                                    description = COALESCE(NULLIF(EXCLUDED.description, ''), leads.description),
+                                    member_count = CASE WHEN EXCLUDED.member_count > 0 THEN EXCLUDED.member_count ELSE leads.member_count END,
+                                    contact_username = COALESCE(NULLIF(EXCLUDED.contact_username, ''), leads.contact_username),
+                                    whatsapp = COALESCE(NULLIF(EXCLUDED.whatsapp, ''), leads.whatsapp),
+                                    outreach_priority = EXCLUDED.outreach_priority,
+                                    outreach_priority_score = EXCLUDED.outreach_priority_score,
+                                    outreach_priority_reason = EXCLUDED.outreach_priority_reason,
+                                    vip = EXCLUDED.vip,
+                                    account_management = EXCLUDED.account_management,
+                                    subscription = EXCLUDED.subscription,
+                                    forex_score = GREATEST(leads.forex_score, EXCLUDED.forex_score),
+                                    forex_intent_score = GREATEST(leads.forex_intent_score, EXCLUDED.forex_intent_score),
+                                    commercial_fit_score = GREATEST(leads.commercial_fit_score, EXCLUDED.commercial_fit_score),
+                                    discovered_at = NOW(),
+                                    last_scan = NOW()
+                                RETURNING id;
+                            """, (
+                                lead_username, cid_str, title, about,
+                                member_count, contact_user, whatsapp, website,
+                                priority, priority_score, reason,
+                                has_vip, has_acct_mgmt, has_sub,
+                                forex_score, forex_score, comm_fit
+                            ))
+                            row_ret = cur_up.fetchone()
+                            lead_db_id = row_ret[0] if row_ret else None
+
+                            # Auto-enroll into active campaign if P0 or P1
+                            if auto_campaign_id and lead_db_id and contact_user and priority in ('P0', 'P1'):
+                                cur_up.execute("""
+                                    INSERT INTO campaign_logs (
+                                        id, campaign_id, lead_id, status, priority,
+                                        priority_score, priority_reason, commercial_fit_score
+                                    )
+                                    VALUES (gen_random_uuid(), %s, %s, 'approved', %s, %s, %s, %s)
+                                    ON CONFLICT DO NOTHING;
+                                """, (auto_campaign_id, lead_db_id, priority, priority_score, reason, comm_fit))
+
+                        conn.commit()
+                        intake_new_count += 1
+                        if contact_user:
+                            intake_contacts_found += 1
+                            logging.info(f"Auto Dialog Scanner: [INTAKE] Ingested @{lead_username} ({title}) -> Contact @{contact_user} [{priority}]")
+                        else:
+                            logging.info(f"Auto Dialog Scanner: [INTAKE] Ingested @{lead_username} ({title}) -> No contact found [{priority}]")
+
+                    except Exception as ins_err:
+                        conn.rollback()
+                        logging.warning(f"Auto Dialog Scanner: Insert lead error for {lead_username}: {ins_err}")
+
+                    # Gentle delay between new channels
+                    await asyncio.sleep(1.5)
+
+                logging.info(
+                    f"Auto Dialog Scanner: Intake cycle complete! "
+                    f"Ingested {intake_new_count} new/scraped channels ({intake_contacts_found} with contacts), "
+                    f"refreshed {intake_refreshed_24h} active joined channels to 24h Discovery ledger."
+                )
+
             except Exception as scan_err:
                 logging.error(f"Auto Folder Sync: Unexpected error during sync: {scan_err}", exc_info=True)
 
-            # Sleep 2 hours before next scan (lightweight and safe from rate limits)
+            # Sleep 3 minutes before next scan (lightweight and responsive)
             try:
-                await asyncio.wait_for(self.shutdown_event.wait(), timeout=7200)
+                await asyncio.wait_for(self.shutdown_event.wait(), timeout=180)
             except asyncio.TimeoutError:
                 pass
 
