@@ -59,6 +59,7 @@ services:
     environment:
       - ENABLE_EMBEDDED_SCHEDULER=true
     volumes:
+      - .:/app
       - sessions_data:/app/sessions
       - media_data:/app/media
 
@@ -75,6 +76,7 @@ services:
     env_file:
       - .env
     volumes:
+      - .:/app
       - media_data:/app/media
     healthcheck:
       test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/docs\")' || exit 1"]

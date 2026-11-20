@@ -4056,6 +4056,8 @@ class LeadValidator:
                         priority_score = 35
                         reason = "Pending Contact: Channel joined by Tamer, awaiting owner contact discovery."
 
+                    tier_val = 'Tier_A' if priority == 'P0' else ('Tier_B' if priority == 'P1' else ('Tier_C' if priority == 'P2' else 'Tier_D'))
+
                     # Upsert into PostgreSQL leads table
                     try:
                         with conn.cursor() as cur_up:
@@ -4066,15 +4068,17 @@ class LeadValidator:
                                     status, discovered_at, last_scan, discovery_source,
                                     discovery_method, outreach_priority, outreach_priority_score,
                                     outreach_priority_reason, vip, account_management, subscription,
-                                    forex_score, forex_intent_score, commercial_fit_score
+                                    forex_score, forex_intent_score, commercial_fit_score,
+                                    language, arabic_score, arabic_ratio, tier
                                 )
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'new', NOW(), NOW(), 'tamer_joined_dialog', 'user_dialog_intake', %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'new', NOW(), NOW(), 'tamer_joined_dialog', 'user_dialog_intake', %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Arabic', 95, 80, %s)
                                 ON CONFLICT (channel_username) DO UPDATE SET
                                     title = EXCLUDED.title,
                                     description = COALESCE(NULLIF(EXCLUDED.description, ''), leads.description),
                                     member_count = CASE WHEN EXCLUDED.member_count > 0 THEN EXCLUDED.member_count ELSE leads.member_count END,
                                     contact_username = COALESCE(NULLIF(EXCLUDED.contact_username, ''), leads.contact_username),
                                     whatsapp = COALESCE(NULLIF(EXCLUDED.whatsapp, ''), leads.whatsapp),
+                                    status = CASE WHEN leads.status = 'rejected' AND EXCLUDED.outreach_priority IN ('P0', 'P1') THEN 'new' ELSE leads.status END,
                                     outreach_priority = EXCLUDED.outreach_priority,
                                     outreach_priority_score = EXCLUDED.outreach_priority_score,
                                     outreach_priority_reason = EXCLUDED.outreach_priority_reason,
@@ -4084,6 +4088,10 @@ class LeadValidator:
                                     forex_score = GREATEST(leads.forex_score, EXCLUDED.forex_score),
                                     forex_intent_score = GREATEST(leads.forex_intent_score, EXCLUDED.forex_intent_score),
                                     commercial_fit_score = GREATEST(leads.commercial_fit_score, EXCLUDED.commercial_fit_score),
+                                    language = COALESCE(leads.language, EXCLUDED.language),
+                                    arabic_score = GREATEST(COALESCE(leads.arabic_score, 0), EXCLUDED.arabic_score),
+                                    arabic_ratio = GREATEST(COALESCE(leads.arabic_ratio, 0), EXCLUDED.arabic_ratio),
+                                    tier = CASE WHEN EXCLUDED.outreach_priority = 'P0' THEN 'Tier_A'::tier_level WHEN EXCLUDED.outreach_priority = 'P1' THEN 'Tier_B'::tier_level ELSE COALESCE(leads.tier, EXCLUDED.tier) END,
                                     discovered_at = NOW(),
                                     last_scan = NOW()
                                 RETURNING id;
@@ -4092,10 +4100,11 @@ class LeadValidator:
                                 member_count, contact_user, whatsapp, website,
                                 priority, priority_score, reason,
                                 has_vip, has_acct_mgmt, has_sub,
-                                forex_score, forex_score, comm_fit
+                                forex_score, forex_score, comm_fit,
+                                tier_val
                             ))
                             row_ret = cur_up.fetchone()
-                            lead_db_id = row_ret[0] if row_ret else None
+                            lead_db_id = (row_ret.get('id') if isinstance(row_ret, dict) else row_ret[0]) if row_ret else None
 
                             # Auto-enroll into active campaign if P0 or P1
                             if auto_campaign_id and lead_db_id and contact_user and priority in ('P0', 'P1'):

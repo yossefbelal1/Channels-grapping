@@ -283,39 +283,49 @@ def get_discovered_24h(
                 SELECT 
                     COUNT(*) FILTER (WHERE (outreach_priority_reason IS NULL OR outreach_priority_reason != 'user_account') AND (entity_type IS NULL OR entity_type != 'user') AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as total_discovered,
                     COUNT(*) FILTER (
-                        WHERE status = 'new'
-                          AND COALESCE(forex_intent_score, forex_score, 0) >= 40
-                          AND (
-                              tier IN ('Tier_A', 'Tier_B', 'Tier_C')
-                              OR vip = TRUE
-                              OR account_management = TRUE
-                              OR copy_trading = TRUE
-                              OR funded_accounts = TRUE
-                              OR COALESCE(commercial_fit_score, 0) >= 40
-                          )
-                          AND (language = 'Arabic' OR COALESCE(arabic_ratio, 0) >= 15 OR COALESCE(arabic_score, 0) >= 20)
-                          AND (entity_type IS NULL OR entity_type != 'user')
-                          AND (outreach_priority_reason IS NULL OR outreach_priority_reason != 'user_account')
+                        WHERE (
+                            outreach_priority IN ('P0', 'P1')
+                            OR (
+                                status = 'new'
+                                AND COALESCE(forex_intent_score, forex_score, 0) >= 40
+                                AND (
+                                    tier IN ('Tier_A', 'Tier_B', 'Tier_C')
+                                    OR vip = TRUE
+                                    OR account_management = TRUE
+                                    OR copy_trading = TRUE
+                                    OR funded_accounts = TRUE
+                                    OR COALESCE(commercial_fit_score, 0) >= 40
+                                )
+                                AND (COALESCE(language, 'Arabic') = 'Arabic' OR COALESCE(arabic_ratio, 0) >= 15 OR COALESCE(arabic_score, 0) >= 20)
+                            )
+                        )
+                        AND (entity_type IS NULL OR entity_type != 'user')
+                        AND (outreach_priority_reason IS NULL OR outreach_priority_reason != 'user_account')
                     ) as qualified_count,
                     COUNT(*) FILTER (WHERE (member_count > 0 OR lead_score >= 10 OR (description IS NOT NULL AND description != '')) AND (outreach_priority_reason IS NULL OR outreach_priority_reason != 'user_account') AND (entity_type IS NULL OR entity_type != 'user') AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as verified_count,
                     COUNT(*) FILTER (WHERE status = 'new' AND lead_score IS NULL AND tier IS NULL AND (entity_type IS NULL OR entity_type != 'user') AND channel_username ~ '^[a-zA-Z0-9_]{4,32}$') as pending_scan_count,
                     COUNT(*) FILTER (WHERE status = 'rejected') as rejected_count,
                     COUNT(*) FILTER (WHERE ((contact_username IS NOT NULL AND contact_username != '') OR (whatsapp IS NOT NULL AND whatsapp != '')) AND (entity_type IS NULL OR entity_type != 'user')) as with_contact_count,
                     COUNT(*) FILTER (
-                        WHERE status = 'new'
-                          AND COALESCE(forex_intent_score, forex_score, 0) >= 40
-                          AND (
-                              tier IN ('Tier_A', 'Tier_B', 'Tier_C')
-                              OR vip = TRUE
-                              OR account_management = TRUE
-                              OR copy_trading = TRUE
-                              OR funded_accounts = TRUE
-                              OR COALESCE(commercial_fit_score, 0) >= 40
-                          )
-                          AND (language = 'Arabic' OR COALESCE(arabic_ratio, 0) >= 15 OR COALESCE(arabic_score, 0) >= 20)
-                          AND ((contact_username IS NOT NULL AND contact_username != '') OR (whatsapp IS NOT NULL AND whatsapp != ''))
-                          AND (entity_type IS NULL OR entity_type != 'user')
-                          AND (outreach_priority_reason IS NULL OR outreach_priority_reason != 'user_account')
+                        WHERE (
+                            outreach_priority IN ('P0', 'P1')
+                            OR (
+                                status = 'new'
+                                AND COALESCE(forex_intent_score, forex_score, 0) >= 40
+                                AND (
+                                    tier IN ('Tier_A', 'Tier_B', 'Tier_C')
+                                    OR vip = TRUE
+                                    OR account_management = TRUE
+                                    OR copy_trading = TRUE
+                                    OR funded_accounts = TRUE
+                                    OR COALESCE(commercial_fit_score, 0) >= 40
+                                )
+                                AND (COALESCE(language, 'Arabic') = 'Arabic' OR COALESCE(arabic_ratio, 0) >= 15 OR COALESCE(arabic_score, 0) >= 20)
+                            )
+                        )
+                        AND ((contact_username IS NOT NULL AND contact_username != '') OR (whatsapp IS NOT NULL AND whatsapp != ''))
+                        AND (entity_type IS NULL OR entity_type != 'user')
+                        AND (outreach_priority_reason IS NULL OR outreach_priority_reason != 'user_account')
                     ) as qualified_with_contact_count,
                     COUNT(*) FILTER (WHERE whatsapp IS NOT NULL AND whatsapp != '') as with_whatsapp_count,
                     COUNT(*) FILTER (WHERE is_group = TRUE) as groups_count,
@@ -338,18 +348,23 @@ def get_discovered_24h(
                     date_trunc('hour', discovered_at) as hour_slot,
                     COUNT(*) as total_count,
                     COUNT(*) FILTER (
-                        WHERE status = 'new'
-                          AND COALESCE(forex_intent_score, forex_score, 0) >= 40
-                          AND (
-                              tier IN ('Tier_A', 'Tier_B', 'Tier_C')
-                              OR vip = TRUE
-                              OR account_management = TRUE
-                              OR copy_trading = TRUE
-                              OR funded_accounts = TRUE
-                              OR COALESCE(commercial_fit_score, 0) >= 40
-                          )
-                          AND (language = 'Arabic' OR COALESCE(arabic_ratio, 0) >= 15 OR COALESCE(arabic_score, 0) >= 20)
-                          AND (entity_type IS NULL OR entity_type != 'user')
+                        WHERE (
+                            outreach_priority IN ('P0', 'P1')
+                            OR (
+                                status = 'new'
+                                AND COALESCE(forex_intent_score, forex_score, 0) >= 40
+                                AND (
+                                    tier IN ('Tier_A', 'Tier_B', 'Tier_C')
+                                    OR vip = TRUE
+                                    OR account_management = TRUE
+                                    OR copy_trading = TRUE
+                                    OR funded_accounts = TRUE
+                                    OR COALESCE(commercial_fit_score, 0) >= 40
+                                )
+                                AND (COALESCE(language, 'Arabic') = 'Arabic' OR COALESCE(arabic_ratio, 0) >= 15 OR COALESCE(arabic_score, 0) >= 20)
+                            )
+                        )
+                        AND (entity_type IS NULL OR entity_type != 'user')
                     ) as qualified_count,
                     COUNT(*) FILTER (WHERE status = 'rejected') as rejected_count
                 FROM leads
@@ -406,17 +421,22 @@ def get_discovered_24h(
                 st = status.lower()
                 if st in ('new', 'qualified'):
                     where_clauses.append("""
-                        l.status = 'new'
-                        AND COALESCE(l.forex_intent_score, l.forex_score, 0) >= 40
-                        AND (
-                            l.tier IN ('Tier_A', 'Tier_B', 'Tier_C')
-                            OR l.vip = TRUE
-                            OR l.account_management = TRUE
-                            OR l.copy_trading = TRUE
-                            OR l.funded_accounts = TRUE
-                            OR COALESCE(l.commercial_fit_score, 0) >= 40
+                        (
+                            l.outreach_priority IN ('P0', 'P1')
+                            OR (
+                                l.status = 'new'
+                                AND COALESCE(l.forex_intent_score, l.forex_score, 0) >= 40
+                                AND (
+                                    l.tier IN ('Tier_A', 'Tier_B', 'Tier_C')
+                                    OR l.vip = TRUE
+                                    OR l.account_management = TRUE
+                                    OR l.copy_trading = TRUE
+                                    OR l.funded_accounts = TRUE
+                                    OR COALESCE(l.commercial_fit_score, 0) >= 40
+                                )
+                                AND (COALESCE(l.language, 'Arabic') = 'Arabic' OR COALESCE(l.arabic_ratio, 0) >= 15 OR COALESCE(l.arabic_score, 0) >= 20)
+                            )
                         )
-                        AND (l.language = 'Arabic' OR COALESCE(l.arabic_ratio, 0) >= 15 OR COALESCE(l.arabic_score, 0) >= 20)
                     """)
                 elif st == 'rejected':
                     where_clauses.append("l.status = 'rejected'")
