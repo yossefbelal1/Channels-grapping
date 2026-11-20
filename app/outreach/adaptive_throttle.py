@@ -7,7 +7,7 @@ class AdaptiveThrottle:
     Adaptive throughput controller based on recent telemetry.
     """
 
-    def __init__(self, redis_conn, session_name: str, min_delay: int = 60, max_delay: int = 600, default_delay: int = 120):
+    def __init__(self, redis_conn, session_name: str, min_delay: int = 1200, max_delay: int = 3600, default_delay: int = 1800):
         self.redis = redis_conn
         self.session_name = session_name
         self.min_delay = min_delay

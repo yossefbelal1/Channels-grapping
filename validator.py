@@ -4390,6 +4390,15 @@ class LeadValidator:
                 logging.warning(f"Campaign Dispatcher: Account circuit breaker OPEN: {reason}. Sleeping 120s.")
                 await asyncio.sleep(120)
                 continue
+
+            # ── Active Human Working Hours Check (Cairo 11:00 AM - 08:00 PM) ──
+            now_utc_hour = datetime.now(timezone.utc).hour
+            active_start_utc = int(os.getenv("CAMPAIGN_ACTIVE_HOURS_START_UTC", 9))
+            active_end_utc = int(os.getenv("CAMPAIGN_ACTIVE_HOURS_END_UTC", 18))
+            if not (active_start_utc <= now_utc_hour < active_end_utc):
+                logging.info(f"Campaign Dispatcher: Outside active human hours ({active_start_utc}:00 - {active_end_utc}:00 UTC / 11:00 - 20:00 Cairo). Night silence active. Sleeping 10 minutes...")
+                await asyncio.wait_for(self.shutdown_event.wait(), timeout=600)
+                continue
             try:
                 self.db_helper.check_connection()
                 conn = self.db_helper.conn
@@ -4549,7 +4558,7 @@ class LeadValidator:
                     target_key = f"campaign_daily_target:{today_str}"
                     sent_today = int(self.redis_conn.get(campaign_sent_key) or 0)
 
-                    risk_budget = int(os.getenv("RISK_BUDGET_DAILY", os.getenv("CAMPAIGN_DAILY_LIMIT", "20")))
+                    risk_budget = int(os.getenv("RISK_BUDGET_DAILY", os.getenv("CAMPAIGN_DAILY_LIMIT", "6")))
                     hard_cap = risk_budget
                     
                     stored_target = self.redis_conn.get(target_key)
@@ -4562,23 +4571,23 @@ class LeadValidator:
                         daily_target = random.randint(max(1, int(hard_cap * 0.75)), hard_cap)
                         self.redis_conn.set(target_key, str(daily_target), ex=86400 * 2)
 
-                    jitter_min = int(os.getenv("CAMPAIGN_JITTER_MIN", 90))
-                    jitter_max = int(os.getenv("CAMPAIGN_JITTER_MAX", 210))
-                    burst_size = int(os.getenv("CAMPAIGN_BURST_SIZE", 5))
+                    jitter_min = int(os.getenv("CAMPAIGN_JITTER_MIN", 1200))
+                    jitter_max = int(os.getenv("CAMPAIGN_JITTER_MAX", 2700))
+                    burst_size = int(os.getenv("CAMPAIGN_BURST_SIZE", 2))
 
                     if sent_today >= daily_target:
                         logging.info(f"Campaign Dispatcher: Daily outreach target reached ({sent_today}/{daily_target}, hard cap={hard_cap}) for {today_str}. Sleeping for 60 minutes...")
                         await asyncio.wait_for(self.shutdown_event.wait(), timeout=3600)
                         continue
 
-                    # 1b. Human micro-break: every burst_size messages, take a 10-20 min pause
+                    # 1b. Human micro-break: every burst_size messages, take a 60-120 min pause
                     if sent_today > 0 and sent_today % burst_size == 0:
                         break_key = f"campaign_break_taken:{today_str}:{sent_today}"
                         if not self.redis_conn.get(break_key):
-                            break_min = int(os.getenv("CAMPAIGN_BREAK_MIN", 300))
-                            break_max = int(os.getenv("CAMPAIGN_BREAK_MAX", 600))
+                            break_min = int(os.getenv("CAMPAIGN_BREAK_MIN", 3600))
+                            break_max = int(os.getenv("CAMPAIGN_BREAK_MAX", 7200))
                             break_duration = random.randint(break_min, break_max)
-                            logging.info(f"Campaign Dispatcher: Short pause of {break_duration//60} minutes after sending {sent_today} messages...")
+                            logging.info(f"Campaign Dispatcher: Mandatory extended pause of {break_duration//60} minutes after sending {sent_today} messages...")
                             self.redis_conn.set(break_key, "1", ex=break_duration + 1800)
                             await asyncio.wait_for(self.shutdown_event.wait(), timeout=break_duration)
                             continue
@@ -4678,6 +4687,25 @@ class LeadValidator:
 
                     try:
                         peer = await user_client.get_entity(target_username)
+                        from telethon.tl.types import User as TelethonUser
+                        if not isinstance(peer, TelethonUser):
+                            logging.warning(f"Campaign Dispatcher: @{target_username} is not a User entity ({type(peer).__name__}). Skipping to protect account.")
+                            cur.execute(
+                                "UPDATE campaign_logs SET status = 'skipped', error_message = %s, sent_at = %s WHERE id = %s",
+                                (f"Target entity is a {type(peer).__name__}, not a user", datetime.now(), log_id)
+                            )
+                            conn.commit()
+                            continue
+
+                        if getattr(peer, 'bot', False):
+                            logging.warning(f"Campaign Dispatcher: @{target_username} is a Bot. Skipping.")
+                            cur.execute(
+                                "UPDATE campaign_logs SET status = 'skipped', error_message = 'Target is a bot', sent_at = %s WHERE id = %s",
+                                (datetime.now(), log_id)
+                            )
+                            conn.commit()
+                            continue
+
                         media_files = self._resolve_media_list(media_path)
                         if media_files:
                             try:
@@ -4812,9 +4840,9 @@ class LeadValidator:
                         
                     conn.commit()
                     
-                # 4. Safe human-like random jitter between sends (90 to 210 seconds)
+                # 4. Safe human-like random jitter between sends (20 to 45 minutes)
                 if self.adaptive_throttle:
-                    jitter_profile = int(self.adaptive_throttle.get_next_delay())
+                    jitter_profile = max(jitter_min, int(self.adaptive_throttle.get_next_delay()))
                 else:
                     jitter_profile = random.randint(jitter_min, jitter_max)
                 logging.info(f"Campaign Dispatcher: Pacing sleep: {jitter_profile}s (~{jitter_profile//60}m {jitter_profile%60}s). Daily sent: {new_sent_count if 'new_sent_count' in locals() else sent_today}/{daily_target}.")
@@ -5109,9 +5137,9 @@ class LeadValidator:
         try:
             self.outreach_metrics = OutreachMetrics(self.redis_conn, self.db_helper.conn)
             self.account_health_mgr = AccountHealthManager(self.redis_conn, self.db_helper.conn)
-            throttle_min = int(os.getenv("CAMPAIGN_JITTER_MIN", 45))
-            throttle_max = int(os.getenv("CAMPAIGN_JITTER_MAX", 120))
-            throttle_default = int(os.getenv("CAMPAIGN_DEFAULT_DELAY", 60))
+            throttle_min = int(os.getenv("CAMPAIGN_JITTER_MIN", 1200))
+            throttle_max = int(os.getenv("CAMPAIGN_JITTER_MAX", 2700))
+            throttle_default = int(os.getenv("CAMPAIGN_DEFAULT_DELAY", 1800))
             self.adaptive_throttle = AdaptiveThrottle(
                 self.redis_conn, 'user_session',
                 min_delay=throttle_min,
