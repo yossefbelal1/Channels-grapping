@@ -24,6 +24,7 @@ class TestOutreachSafetyHardening(unittest.TestCase):
                 return None
             return None
         self.redis_mock.get.side_effect = mock_get
+        self.redis_mock.sismember.return_value = False
 
     def test_helper_session_lockout(self):
         """Helper accounts must be strictly blocked by Layer 3 Single-Account Guard."""

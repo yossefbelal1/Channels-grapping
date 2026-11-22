@@ -54,7 +54,8 @@ class CampaignRepository:
                     id, campaign_id, lead_id, status, priority, priority_score,
                     priority_reason, commercial_fit_score, likely_services, intent_evidence
                 )
-                SELECT gen_random_uuid(), %s, l.id, 'pending_review',
+                SELECT DISTINCT ON (LOWER(TRIM(LEADING '@' FROM TRIM(l.contact_username))))
+                       gen_random_uuid(), %s, l.id, 'pending_review',
                        COALESCE(l.outreach_priority, 'P3'),
                        COALESCE(l.outreach_priority_score, 25),
                        l.outreach_priority_reason,
@@ -67,8 +68,24 @@ class CampaignRepository:
                   AND LOWER(l.contact_username) NOT IN ('addlist', 'share', 'joinchat', 'setlanguage', 'proxy', 'socks', 'c', 's', 'm', 'i')
                   AND (l.description IS NULL OR (l.description NOT LIKE 'Blacklisted entity%%' AND l.description NOT LIKE 'Entity does not exist%%'))
                   AND l.id NOT IN (SELECT lead_id FROM campaign_logs WHERE campaign_id = %s)
+                  AND LOWER(TRIM(LEADING '@' FROM TRIM(l.contact_username))) NOT IN (
+                      SELECT DISTINCT LOWER(TRIM(LEADING '@' FROM TRIM(l2.contact_username)))
+                      FROM campaign_logs cl2
+                      JOIN leads l2 ON cl2.lead_id = l2.id
+                      WHERE cl2.status = 'sent' AND l2.contact_username IS NOT NULL
+                  )
+                  AND LOWER(TRIM(LEADING '@' FROM TRIM(l.contact_username))) NOT IN (
+                      SELECT DISTINCT LOWER(TRIM(LEADING '@' FROM TRIM(l3.contact_username)))
+                      FROM campaign_logs cl3
+                      JOIN leads l3 ON cl3.lead_id = l3.id
+                      WHERE cl3.campaign_id = %s 
+                        AND cl3.status IN ('pending', 'pending_review', 'approved', 'processing') 
+                        AND l3.contact_username IS NOT NULL
+                  )
+                ORDER BY LOWER(TRIM(LEADING '@' FROM TRIM(l.contact_username))),
+                         COALESCE(l.outreach_priority_score, 25) DESC
                 ON CONFLICT (id) DO NOTHING
-            """, (campaign_id, campaign_id))
+            """, (campaign_id, campaign_id, campaign_id))
             return cur.rowcount
 
     @staticmethod

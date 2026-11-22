@@ -4464,8 +4464,18 @@ class LeadValidator:
                         FROM campaign_logs cl
                         JOIN campaigns c ON cl.campaign_id = c.id
                         JOIN leads l ON cl.lead_id = l.id
-                        WHERE cl.status = 'approved'
-                           OR (cl.status = 'processing' AND cl.sent_at IS NULL AND cl.last_attempt_at < NOW() - INTERVAL '15 minutes')
+                        WHERE (cl.status = 'approved'
+                           OR (cl.status = 'processing' AND cl.sent_at IS NULL AND cl.last_attempt_at < NOW() - INTERVAL '15 minutes'))
+                          AND l.contact_username IS NOT NULL
+                          AND l.contact_username != ''
+                          AND LOWER(TRIM(LEADING '@' FROM TRIM(l.contact_username))) NOT IN (
+                              SELECT DISTINCT LOWER(TRIM(LEADING '@' FROM TRIM(l2.contact_username)))
+                              FROM campaign_logs cl2
+                              JOIN leads l2 ON cl2.lead_id = l2.id
+                              WHERE cl2.status = 'sent'
+                                AND l2.contact_username IS NOT NULL
+                                AND l2.contact_username != ''
+                          )
                         ORDER BY 
                             CASE COALESCE(l.outreach_priority, cl.priority, 'P3')
                                 WHEN 'P0' THEN 0
@@ -4658,13 +4668,16 @@ class LeadValidator:
                         SELECT COUNT(*) as count
                         FROM campaign_logs cl2
                         JOIN leads l2 ON cl2.lead_id = l2.id
-                        WHERE LOWER(l2.contact_username) = LOWER(%s)
-                          AND cl2.status = 'sent'
-                    """, (target_username,))
+                        WHERE (
+                            LOWER(TRIM(LEADING '@' FROM TRIM(l2.contact_username))) = LOWER(%s)
+                            OR LOWER(l2.contact_username) = LOWER(%s)
+                            OR LOWER(l2.contact_username) = LOWER(%s)
+                        ) AND cl2.status = 'sent'
+                    """, (target_username, target_username, f"@{target_username}"))
                     already_sent_res = cur.fetchone()
                     already_sent_count = already_sent_res['count'] if already_sent_res else 0
 
-                    if already_sent_count > 0:
+                    if already_sent_count > 0 or (self.redis_conn and self.redis_conn.sismember("outreach:messaged_contacts", target_username.lower().strip())):
                         logging.info(f"Campaign Dispatcher: Contact @{target_username} was ALREADY messaged previously. Skipping duplicate log ID {log_id} (channel @{channel_username}).")
                         cur.execute(
                             "UPDATE campaign_logs SET status = 'skipped', error_message = %s, sent_at = %s WHERE id = %s",
@@ -4675,9 +4688,16 @@ class LeadValidator:
                             UPDATE campaign_logs cl_sub
                             SET status = 'skipped', error_message = 'Skipped: Contact username already messaged', sent_at = %s
                             FROM leads l_sub
-                            WHERE cl_sub.lead_id = l_sub.id AND LOWER(l_sub.contact_username) = LOWER(%s) AND cl_sub.status IN ('pending', 'pending_review', 'approved')
-                        """, (datetime.now(), target_username))
+                            WHERE cl_sub.lead_id = l_sub.id 
+                              AND (
+                                  LOWER(TRIM(LEADING '@' FROM TRIM(l_sub.contact_username))) = LOWER(%s)
+                                  OR LOWER(l_sub.contact_username) = LOWER(%s)
+                              )
+                              AND cl_sub.status IN ('pending', 'pending_review', 'approved')
+                        """, (datetime.now(), target_username, target_username))
                         conn.commit()
+                        if self.redis_conn:
+                            self.redis_conn.sadd("outreach:messaged_contacts", target_username.lower().strip())
                         continue
                         
                     # ── Comprehensive Safety Gate Enforcement ─────────────────
@@ -4824,8 +4844,17 @@ class LeadValidator:
                             UPDATE campaign_logs cl_sub
                             SET status = 'skipped', error_message = %s, sent_at = %s
                             FROM leads l_sub
-                            WHERE cl_sub.lead_id = l_sub.id AND LOWER(l_sub.contact_username) = LOWER(%s) AND cl_sub.status IN ('pending', 'pending_review', 'approved') AND cl_sub.id != %s
-                        """, (f"Skipped: Contact username messaged via channel @{channel_username}", datetime.now(), target_username, log_id))
+                            WHERE cl_sub.lead_id = l_sub.id 
+                              AND (
+                                  LOWER(TRIM(LEADING '@' FROM TRIM(l_sub.contact_username))) = LOWER(%s)
+                                  OR LOWER(l_sub.contact_username) = LOWER(%s)
+                              )
+                              AND cl_sub.status IN ('pending', 'pending_review', 'approved') 
+                              AND cl_sub.id != %s
+                        """, (f"Skipped: Contact username messaged via channel @{channel_username}", datetime.now(), target_username, target_username, log_id))
+
+                        if self.redis_conn:
+                            self.redis_conn.sadd("outreach:messaged_contacts", target_username.lower().strip())
 
                         # Increment daily sent count in Redis
                         new_sent_count = self.redis_conn.incr(campaign_sent_key)
@@ -5159,6 +5188,28 @@ class LeadValidator:
                 logging.info("No rejected groups found in database to populate.")
         except Exception as init_err:
             logging.error(f"Failed to initialize rejected_groups_set in Redis: {init_err}")
+
+        # Initialize outreach:messaged_contacts set in Redis from PostgreSQL
+        try:
+            logging.info("Initializing outreach:messaged_contacts in Redis from database...")
+            self.db_helper.check_connection()
+            with self.db_helper.conn.cursor() as cur_warm:
+                cur_warm.execute("""
+                    SELECT DISTINCT LOWER(TRIM(LEADING '@' FROM TRIM(l.contact_username))) as contact_clean
+                    FROM campaign_logs cl
+                    JOIN leads l ON cl.lead_id = l.id
+                    WHERE cl.status = 'sent' AND l.contact_username IS NOT NULL AND l.contact_username != '';
+                """)
+                messaged_rows = cur_warm.fetchall()
+            
+            if messaged_rows and self.redis_conn:
+                c_list = [r['contact_clean'] for r in messaged_rows if r.get('contact_clean')]
+                if c_list:
+                    for i in range(0, len(c_list), 500):
+                        self.redis_conn.sadd("outreach:messaged_contacts", *c_list[i:i+500])
+                logging.info(f"Successfully warmed up Redis 'outreach:messaged_contacts' with {len(c_list)} contacts.")
+        except Exception as warm_err:
+            logging.warning(f"Could not warm up outreach:messaged_contacts in Redis: {warm_err}")
         
         # ── Initialize Outreach Engine ─────────────────────────────────────
         try:

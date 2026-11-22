@@ -96,12 +96,25 @@ def check_eligibility(
         if db_cursor.fetchone():
             return "CONTACTED", "Already contacted in this campaign"
             
-        # 5. Contact username not already messaged via another lead
+        # 5. Contact username not already messaged via another lead (strict normalization)
+        cu_clean = contact_username.lower().lstrip('@').strip()
+        if redis_conn:
+            try:
+                if redis_conn.sismember("outreach:messaged_contacts", cu_clean) in (True, 1, "1"):
+                    return "CONTACTED", f"Username @{cu_clean} already messaged previously (redis cache)"
+            except Exception:
+                pass
+
         db_cursor.execute("""
             SELECT 1 FROM campaign_logs cl
             JOIN leads l ON cl.lead_id = l.id
-            WHERE (l.contact_username = %s OR l.contact_username = %s) AND cl.status = 'sent'
-        """, (contact_username, cu_clean))
+            WHERE (
+                LOWER(TRIM(LEADING '@' FROM TRIM(l.contact_username))) = %s
+                OR LOWER(l.contact_username) = %s
+                OR LOWER(l.contact_username) = %s
+            ) AND cl.status = 'sent'
+            LIMIT 1;
+        """, (cu_clean, cu_clean, f"@{cu_clean}"))
         if db_cursor.fetchone():
             return "CONTACTED", "Username already messaged via another lead"
             

@@ -683,6 +683,50 @@ def approve_discovered_leads(payload: dict = Body(default={})):
             """, (camp_id, lead_ids))
             inserted_count = cur.rowcount
 
+            # 3. Deduplication safeguard: auto-skip any approved lead if the contact was ALREADY messaged
+            cur.execute("""
+                UPDATE campaign_logs cl
+                SET status = 'skipped',
+                    error_message = 'Deduplicated: Contact already messaged previously',
+                    sent_at = NOW()
+                FROM leads l
+                WHERE cl.lead_id = l.id
+                  AND cl.lead_id = ANY(%s::uuid[])
+                  AND cl.status = 'approved'
+                  AND l.contact_username IS NOT NULL
+                  AND l.contact_username != ''
+                  AND LOWER(TRIM(LEADING '@' FROM TRIM(l.contact_username))) IN (
+                      SELECT DISTINCT LOWER(TRIM(LEADING '@' FROM TRIM(l_sent.contact_username)))
+                      FROM campaign_logs cl_sent
+                      JOIN leads l_sent ON cl_sent.lead_id = l_sent.id
+                      WHERE cl_sent.status = 'sent'
+                        AND l_sent.contact_username IS NOT NULL
+                        AND l_sent.contact_username != ''
+                  );
+            """, (lead_ids,))
+
+            # 4. Intra-batch deduplication: keep only one channel per contact among the approved batch
+            cur.execute("""
+                WITH ranked_batch AS (
+                    SELECT cl.id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY LOWER(TRIM(LEADING '@' FROM TRIM(l.contact_username)))
+                               ORDER BY COALESCE(l.outreach_priority_score, cl.priority_score, 0) DESC, cl.id ASC
+                           ) as rn
+                    FROM campaign_logs cl
+                    JOIN leads l ON cl.lead_id = l.id
+                    WHERE cl.lead_id = ANY(%s::uuid[])
+                      AND cl.status = 'approved'
+                      AND l.contact_username IS NOT NULL
+                      AND l.contact_username != ''
+                )
+                UPDATE campaign_logs
+                SET status = 'skipped',
+                    error_message = 'Deduplicated: Multiple channels share same owner in approved batch',
+                    sent_at = NOW()
+                WHERE id IN (SELECT id FROM ranked_batch WHERE rn > 1);
+            """, (lead_ids,))
+
         total_approved = updated_count + inserted_count
         logging.info(f"Discovered 24h Review: Approved {total_approved} leads for campaign {camp_id}.")
         return {

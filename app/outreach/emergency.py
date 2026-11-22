@@ -138,6 +138,14 @@ def check_outreach_safety_gate(
     ):
         return False, f"INVALID_TARGET: '{target_username}' is a bot or system alias"
 
+    # Layer 7: Global Recipient Deduplication Guard (Redis Set)
+    if redis_conn:
+        try:
+            if redis_conn.sismember("outreach:messaged_contacts", t_clean) in (True, 1, "1"):
+                return False, f"DUPLICATE_CONTACT: Recipient @{t_clean} has already received an outreach message"
+        except Exception as r_err:
+            logger.debug(f"Safety Gate Redis dedup check note: {r_err}")
+
     return True, "ALLOWED"
 
 def is_account_enabled(redis_conn: Any, session_name: str) -> bool:
