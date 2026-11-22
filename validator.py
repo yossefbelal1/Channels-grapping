@@ -4023,12 +4023,12 @@ class LeadValidator:
                             if m_text:
                                 for link_m in re.finditer(r'(?:https?://)?(?:t\.me|telegram\.me)/(?:joinchat/)?([a-zA-Z0-9_]{4,32})', m_text, re.IGNORECASE):
                                     cand = link_m.group(1).lower().strip()
-                                    if cand not in ('joinchat', 'addstickers', 'share', 'contact', 'admin', 'bot', 'support', 'tamerads1', str(ch_user or '').lower()):
+                                    if cand not in ('joinchat', 'addstickers', 'addlist', 'share', 'contact', 'admin', 'bot', 'support', 'tamerads1', str(ch_user or '').lower()):
                                         if not cand.endswith('bot'):
                                             spider_candidates.add(cand)
                                 for mention_m in re.finditer(r'@([a-zA-Z0-9_]{4,32})', m_text):
                                     cand = mention_m.group(1).lower().strip()
-                                    if cand not in ('contact', 'admin', 'bot', 'support', 'tamerads1', str(ch_user or '').lower()):
+                                    if cand not in ('contact', 'admin', 'bot', 'support', 'tamerads1', 'addlist', str(ch_user or '').lower()):
                                         if not cand.endswith('bot'):
                                             spider_candidates.add(cand)
 

@@ -66,7 +66,7 @@ class TestDiscoveryAndSchedulerIntegration(unittest.TestCase):
         رابط شريكنا: t.me/forex_arabic_signals
         """
 
-        JUNK = {'joinchat', 'share', 'bot', 'spambot'}
+        JUNK = {'joinchat', 'share', 'bot', 'spambot', 'addlist', 'addstickers'}
         discovered = set()
 
         # 1. t.me links
