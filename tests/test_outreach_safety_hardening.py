@@ -1,7 +1,6 @@
 import os
 import unittest
 from unittest.mock import MagicMock, patch
-import pytest
 
 from app.outreach.emergency import (
     is_kill_switch_active,
