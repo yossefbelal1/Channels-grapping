@@ -84,6 +84,20 @@ class TestDiscovered24hAPI(unittest.TestCase):
         self.assertEqual(len(res["channels"]), 1)
         self.assertEqual(res["channels"][0]["channel_username"], "forex_signals_vip")
 
+        # Verify hourly throughput contracts (no undefined in frontend)
+        hourly = res["summary"]["hourly_throughput"]
+        self.assertEqual(len(hourly), 1)
+        self.assertEqual(hourly[0]["total"], 25)
+        self.assertEqual(hourly[0]["count"], 25)
+        self.assertEqual(hourly[0]["hour"], "02:00")
+
+        # Verify top sources contracts (no undefined in frontend)
+        top_srcs = res["summary"]["top_sources"]
+        self.assertEqual(len(top_srcs), 1)
+        self.assertEqual(top_srcs[0]["count"], 80)
+        self.assertEqual(top_srcs[0]["discovered_count"], 80)
+        self.assertEqual(top_srcs[0]["source"], "forward_origin")
+
     @patch("dashboard.CampaignRepository.get_active_campaign")
     @patch("dashboard.get_db_cursor")
     def test_approve_discovered_leads_success(self, mock_get_cursor, mock_active_camp):

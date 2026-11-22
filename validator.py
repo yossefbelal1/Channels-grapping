@@ -3963,23 +3963,20 @@ class LeadValidator:
                     if not lead_username or lead_username == "private_":
                         continue
 
-                    # If already known with contact and description: touch discovered_at to NOW() if older than 24h
+                    # If already known with contact and description: do not re-scrape, touch last_scan and title (preserving discovered_at)
                     if match_lead and not needs_deep_scrape:
-                        disc_at = match_lead.get('discovered_at')
-                        if not disc_at or disc_at < datetime.now() - timedelta(hours=24):
-                            try:
-                                with conn.cursor() as cur_touch:
-                                    cur_touch.execute("""
-                                        UPDATE leads SET
-                                            discovered_at = NOW(),
-                                            last_scan = NOW(),
-                                            title = COALESCE(NULLIF(%s, ''), title)
-                                        WHERE id = %s;
-                                    """, (title, match_lead['id']))
-                                conn.commit()
-                                intake_refreshed_24h += 1
-                            except Exception as touch_err:
-                                logging.debug(f"Auto Dialog Scanner: Touch note: {touch_err}")
+                        try:
+                            with conn.cursor() as cur_touch:
+                                cur_touch.execute("""
+                                    UPDATE leads SET
+                                        last_scan = NOW(),
+                                        title = COALESCE(NULLIF(%s, ''), title)
+                                    WHERE id = %s;
+                                """, (title, match_lead['id']))
+                            conn.commit()
+                            intake_refreshed_24h += 1
+                        except Exception as touch_err:
+                            logging.debug(f"Auto Dialog Scanner: Touch note: {touch_err}")
                         continue
 
                     # Deep Scrape: fetch about, members, pinned message, recent posts
@@ -4007,6 +4004,7 @@ class LeadValidator:
 
                     # Sample recent 15 messages for contact hints and trading patterns
                     recent_text = ""
+                    msgs = []
                     try:
                         msgs = await self.user_client.get_messages(d.input_entity, limit=15)
                         msg_texts = [m.text for m in msgs if getattr(m, 'text', None)]
@@ -4016,6 +4014,35 @@ class LeadValidator:
                         await asyncio.sleep(fwe.seconds + 1)
                     except Exception as me:
                         logging.debug(f"Auto Dialog Scanner: get_messages note for {title}: {me}")
+
+                    # Spider-Web Channel Discovery: Harvest forwarded channels and public channel links
+                    try:
+                        spider_candidates = set()
+                        for m in (msgs or []):
+                            m_text = getattr(m, 'text', '') or ''
+                            if m_text:
+                                for link_m in re.finditer(r'(?:https?://)?(?:t\.me|telegram\.me)/(?:joinchat/)?([a-zA-Z0-9_]{4,32})', m_text, re.IGNORECASE):
+                                    cand = link_m.group(1).lower().strip()
+                                    if cand not in ('joinchat', 'addstickers', 'share', 'contact', 'admin', 'bot', 'support', 'tamerads1', str(ch_user or '').lower()):
+                                        if not cand.endswith('bot'):
+                                            spider_candidates.add(cand)
+                                for mention_m in re.finditer(r'@([a-zA-Z0-9_]{4,32})', m_text):
+                                    cand = mention_m.group(1).lower().strip()
+                                    if cand not in ('contact', 'admin', 'bot', 'support', 'tamerads1', str(ch_user or '').lower()):
+                                        if not cand.endswith('bot'):
+                                            spider_candidates.add(cand)
+
+                        for sc in list(spider_candidates)[:10]:
+                            try:
+                                stub_id = self.db_helper.insert_stub_lead(
+                                    sc, depth=1, discovery_source=f"spiderweb_from_{ch_user or 'dialog'}"
+                                )
+                                if stub_id and self.redis_conn:
+                                    self.redis_conn.rpush("queue:normal", f"https://t.me/{sc}")
+                            except Exception as sc_err:
+                                logging.debug(f"Spiderweb lead enqueue note for {sc}: {sc_err}")
+                    except Exception as spider_err:
+                        logging.debug(f"Spiderweb extraction note: {spider_err}")
 
                     # Extract contacts using comprehensive extractor
                     contact_data = _smart_extract_contacts(
@@ -4092,7 +4119,7 @@ class LeadValidator:
                                     arabic_score = GREATEST(COALESCE(leads.arabic_score, 0), EXCLUDED.arabic_score),
                                     arabic_ratio = GREATEST(COALESCE(leads.arabic_ratio, 0), EXCLUDED.arabic_ratio),
                                     tier = CASE WHEN EXCLUDED.outreach_priority = 'P0' THEN 'Tier_A'::tier_level WHEN EXCLUDED.outreach_priority = 'P1' THEN 'Tier_B'::tier_level ELSE COALESCE(leads.tier, EXCLUDED.tier) END,
-                                    discovered_at = NOW(),
+                                    discovered_at = COALESCE(leads.discovered_at, NOW()),
                                     last_scan = NOW()
                                 RETURNING id;
                             """, (
@@ -5187,9 +5214,9 @@ class LeadValidator:
         except Exception as km_err:
             logging.debug(f"Could not load initial knowledge model: {km_err}")
 
-        # Crawl Scheduling: Single source of truth is worker_scheduler (scheduler_worker.py).
-        # Only start embedded loop if explicitly enabled for single-process development.
-        if os.getenv("ENABLE_EMBEDDED_SCHEDULER", "false").lower() == "true":
+        # Crawl Scheduling: Embedded loop active by default so worker_validator
+        # continuously discovers & dispatches due leads from DB without separate worker container.
+        if os.getenv("ENABLE_EMBEDDED_SCHEDULER", "true").lower() == "true":
             logging.info("Embedded rescan scheduler ENABLED by configuration.")
             self.rescan_scheduler_task = asyncio.create_task(self.rescan_scheduler_loop())
         else:

@@ -375,11 +375,13 @@ def get_discovered_24h(
             hourly_raw = cur.fetchall()
             hourly_throughput = []
             for h in hourly_raw:
+                cnt = h.get("total_count", 0)
                 hourly_throughput.append({
                     "hour": h["hour_label"],
-                    "total": h["total_count"],
-                    "qualified": h["qualified_count"],
-                    "rejected": h["rejected_count"]
+                    "total": cnt,
+                    "count": cnt,
+                    "qualified": h.get("qualified_count", 0),
+                    "rejected": h.get("rejected_count", 0)
                 })
 
             # 3. Tier breakdown in last 24h
@@ -404,7 +406,16 @@ def get_discovered_24h(
                 ORDER BY count DESC
                 LIMIT 8;
             """)
-            top_sources = cur.fetchall()
+            top_sources_raw = cur.fetchall()
+            top_sources = []
+            for s in top_sources_raw:
+                cnt = s.get("count", 0)
+                top_sources.append({
+                    "source": s.get("source", "unknown"),
+                    "method": s.get("method", "unknown"),
+                    "count": cnt,
+                    "discovered_count": cnt
+                })
 
             # 5. Query Channels list with filters and campaign approval state
             where_clauses = [
@@ -4098,7 +4109,7 @@ DASHBOARD_PAGE_HTML = """
                             <div class="flex items-center justify-between text-xs py-1 border-b border-slate-900 last:border-0">
                                 <span class="font-mono text-indigo-300 truncate max-w-[170px]" title="${src.source}">@${src.source.replace('@','')}</span>
                                 <div class="flex items-center gap-1.5 font-mono">
-                                    <span class="font-bold text-slate-200">${src.discovered_count}</span>
+                                    <span class="font-bold text-slate-200">${src.count !== undefined ? src.count : (src.discovered_count || 0)}</span>
                                     <span class="text-[10px] text-slate-500">قناة</span>
                                 </div>
                             </div>
@@ -4438,20 +4449,26 @@ DASHBOARD_PAGE_HTML = """
                     return;
                 }
 
-                const maxCount = Math.max(...hourlyList.map(h => h.count || 0), 1);
-                const peakHour = hourlyList.reduce((max, h) => (h.count > max.count ? h : max), hourlyList[0]);
+                const maxCount = Math.max(...hourlyList.map(h => (h.count !== undefined ? h.count : (h.total || 0))), 1);
+                const peakHour = hourlyList.reduce((max, h) => {
+                    const hVal = h.count !== undefined ? h.count : (h.total || 0);
+                    const maxVal = max.count !== undefined ? max.count : (max.total || 0);
+                    return hVal > maxVal ? h : max;
+                }, hourlyList[0]);
                 if (peakSummaryElem && peakHour) {
-                    peakSummaryElem.innerText = `الذروة: ${peakHour.count} قناة/ساعة عند ${peakHour.hour}`;
+                    const pVal = peakHour.count !== undefined ? peakHour.count : (peakHour.total || 0);
+                    peakSummaryElem.innerText = `الذروة: ${pVal} قناة/ساعة عند ${peakHour.hour}`;
                 }
 
                 chartElem.innerHTML = hourlyList.map(h => {
-                    const totalH = Math.max(4, Math.round(((h.count || 0) / maxCount) * 100));
-                    const qualH = (h.count > 0 && h.qualified > 0) ? Math.round(((h.qualified || 0) / h.count) * totalH) : 0;
+                    const hVal = h.count !== undefined ? h.count : (h.total || 0);
+                    const totalH = Math.max(4, Math.round((hVal / maxCount) * 100));
+                    const qualH = (hVal > 0 && h.qualified > 0) ? Math.round(((h.qualified || 0) / hVal) * totalH) : 0;
                     const otherH = Math.max(0, totalH - qualH);
 
                     return `
-                        <div class="flex-1 flex flex-col items-center justify-end h-full group relative cursor-pointer" title="${h.hour}: ${h.count} قنوات مكتشفة (${h.qualified || 0} مؤهلة)">
-                            <div class="text-[9px] font-mono text-slate-400 mb-1 opacity-0 group-hover:opacity-100 transition whitespace-nowrap absolute -top-4">${h.count}</div>
+                        <div class="flex-1 flex flex-col items-center justify-end h-full group relative cursor-pointer" title="${h.hour}: ${hVal} قنوات مكتشفة (${h.qualified || 0} مؤهلة)">
+                            <div class="text-[9px] font-mono text-slate-400 mb-1 opacity-0 group-hover:opacity-100 transition whitespace-nowrap absolute -top-4">${hVal}</div>
                             <div class="w-full max-w-[18px] flex flex-col justify-end rounded-t overflow-hidden transition-all duration-300 group-hover:scale-y-105" style="height: ${totalH}%">
                                 ${qualH > 0 ? `<div class="bg-gradient-to-t from-emerald-600 to-teal-400 w-full" style="height: ${qualH}%"></div>` : ''}
                                 <div class="bg-slate-700/80 group-hover:bg-slate-600 w-full" style="height: ${otherH}%"></div>
